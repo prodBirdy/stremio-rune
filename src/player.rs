@@ -21,6 +21,10 @@ pub struct Playback {
     pub started: bool,
     /// Stalled waiting for the network, and how full the cache is (0–100).
     pub buffering: bool,
+    /// A seek is under way, or mpv's core is waiting (for data, or the first frame) while not
+    /// paused: both flip the moment playback stops moving, before `buffering` does.
+    pub seeking: bool,
+    pub idle: bool,
     pub cache_pct: f64,
     pub tracks: Vec<Track>,
     /// Selected subtitle track id, or `no`.
@@ -33,7 +37,9 @@ pub struct Playback {
 }
 
 impl Playback {
-    pub fn loading(&self) -> bool { !self.started || self.buffering }
+    /// Waiting: for the first frame (from `Mpv::play`), a seek, or data. Each flips the moment
+    /// playback stops moving; `buffering` (paused-for-cache) only once the cache has run dry.
+    pub fn loading(&self) -> bool { !self.started || self.buffering || self.seeking || (self.idle && !self.paused) }
 }
 
 /// mpv core, the boxed waker its wakeup callback holds, and the child window it draws in.
@@ -106,7 +112,8 @@ impl Mpv {
             if init(ctx) < 0 { return Err("mpv_initialize failed".into()) }
             // userdata ids match `pump`.
             for (id, name, format) in [(1, "time-pos", DOUBLE), (2, "duration", DOUBLE), (3, "pause", FLAG),
-                (4, "paused-for-cache", FLAG), (5, "cache-buffering-state", INT64), (6, "sid", STRING), (7, "track-list/count", INT64), (8, "aid", STRING)] {
+                (4, "paused-for-cache", FLAG), (5, "cache-buffering-state", INT64), (6, "sid", STRING), (7, "track-list/count", INT64), (8, "aid", STRING),
+                (9, "seeking", FLAG), (10, "core-idle", FLAG)] {
                 observe(ctx, id, cs(name).as_ptr(), format);
             }
         }
@@ -217,6 +224,8 @@ impl Mpv {
                             5 => p.cache_pct = *(prop.data as *const i64) as f64,
                             6 => p.sid = CStr::from_ptr(*(prop.data as *const *const c_char)).to_string_lossy().into_owned(),
                             7 => (p.tracks, p.audio) = (self.tracks("sub"), self.tracks("audio")),
+                            9 => p.seeking = *(prop.data as *const c_int) != 0,
+                            10 => p.idle = *(prop.data as *const c_int) != 0,
                             8 => p.aid = CStr::from_ptr(*(prop.data as *const *const c_char)).to_string_lossy().into_owned(),
                             _ => {}
                         }

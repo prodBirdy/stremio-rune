@@ -1038,6 +1038,43 @@ mod tests {
         drop(p);
     }
 
+    /// When mpv's waiting-related properties flip, from `Mpv::play` through a seek: what the
+    /// loader can follow. `cargo test loader_timeline -- --ignored --nocapture`, with
+    /// TEST_STREAM, else a torrent through Stremio's server.
+    #[test]
+    #[ignore = "plays a stream; opens a window briefly; prints a timeline"]
+    fn loader_timeline() {
+        let src = std::env::var("TEST_STREAM").unwrap_or_else(|_| "http://127.0.0.1:11470/dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c/-1".into());
+        let t = Instant::now();
+        let p = Mpv::play(&src, "test", None, None, vec![]).unwrap();
+        println!("{:>6.0} ms  Mpv::play returned", t.elapsed().as_secs_f64() * 1000.0);
+        let mut pb = Playback::default();
+        let key = |p: &Playback| (p.started, p.buffering, p.seeking, p.idle, p.paused, p.cache_pct as i64, p.loading());
+        let mut last = None;
+        let mut log = |pb: &Playback, what: &str| if last != Some(key(pb)) {
+            last = Some(key(pb));
+            println!("{:>6.0} ms  started {} buffering {} seeking {} idle {} paused {} cache {:>3} -> loading {}  {what}",
+                t.elapsed().as_secs_f64() * 1000.0, pb.started, pb.buffering, pb.seeking, pb.idle, pb.paused, pb.cache_pct, pb.loading());
+        };
+        let run = |pb: &mut Playback, log: &mut dyn FnMut(&Playback, &str), secs: f64, what: &str| {
+            let until = Instant::now() + Duration::from_secs_f64(secs);
+            while Instant::now() < until {
+                assert_eq!(p.pump(pb), None, "ended early");
+                log(pb, what);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        log(&pb, "before");
+        let wait_start = Instant::now();
+        while !pb.started && wait_start.elapsed().as_secs() < 60 { run(&mut pb, &mut log, 0.05, "start") }
+        run(&mut pb, &mut log, 1.5, "playing");
+        println!("{:>6.0} ms  seek +300", t.elapsed().as_secs_f64() * 1000.0);
+        p.command(&["seek", "300", "relative"]).unwrap();
+        run(&mut pb, &mut log, 4.0, "after seek");
+        p.command(&["quit"]).unwrap();
+        while p.pump(&mut pb).is_none() { std::thread::sleep(Duration::from_millis(20)) }
+    }
+
     #[test]
     #[ignore = "plays TEST_STREAM; opens a window briefly"]
     fn switching_streams_keeps_the_position() {
@@ -1086,6 +1123,21 @@ mod tests {
         p.command(&["quit"]).unwrap();
         let t = std::time::Instant::now();
         while p.pump(&mut pb).is_none() { assert!(t.elapsed().as_secs() < 10, "no shutdown"); std::thread::sleep(std::time::Duration::from_millis(50)) }
+    }
+
+    #[test]
+    fn loader_shows_from_the_click_through_seeks_and_stalls() {
+        let p = |f: fn(&mut Playback)| { let mut p = Playback { started: true, ..Default::default() }; f(&mut p); p.loading() };
+        assert!(Playback::default().loading(), "from play(), before mpv says anything");
+        assert!(!p(|_| {}), "playing");
+        assert!(p(|p| p.seeking = true), "a seek, from its first instant");
+        assert!(p(|p| p.idle = true), "the core waiting while not paused: a stall starting");
+        assert!(!p(|p| { p.idle = true; p.paused = true }), "paused isn't loading");
+        assert!(p(|p| p.buffering = true));
+        // The click's own frame shows it: the page switches and the loader is in what's pushed.
+        let mut s = state();
+        s.page = Page::Player;
+        assert!(shown(&s).playback.loading());
     }
 
     #[test]

@@ -436,7 +436,7 @@ fn loader(logo: Option<&Image>, p: &Playback) -> El {
     let art = || el().size(w, h).pixels(img.pixels());
     all(el()).key("loader").center().child(
         el().size(w, h).cycle(PULSE)
-            .child(art().opacity(0.2).absolute(0.0, 0.0))
+            .child(art().opacity(0.5).absolute(0.0, 0.0)) // plainly there from the first instant, before any cache
             .child(el().w(w * done).h(h).clip_rounded(0.0).absolute(0.0, 0.0).child(art())),
     )
 }
