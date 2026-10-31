@@ -128,6 +128,16 @@ fn cloak_briefly(h: windows_sys::Win32::Foundation::HWND) {
     let h = h as isize;
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(450));
+        // Windows keeps showing the transparent controls window's old area in white after it
+        // grows (measured: the old window rect stays white in fullscreen until the window is
+        // re-shown). Hide and re-show it, without activating, before it's seen again.
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindowVisible, SW_HIDE, SW_SHOWNA, ShowWindow};
+        unsafe {
+            if IsWindowVisible(h as _) != 0 {
+                ShowWindow(h as _, SW_HIDE);
+                ShowWindow(h as _, SW_SHOWNA);
+            }
+        }
         cloak(h as _, false);
     });
 }
@@ -191,7 +201,17 @@ pub fn selftest_front_maximized() {
         keybd_event(VK_MENU as u8, 0, 0, 0);
         keybd_event(VK_MENU as u8, 0, KEYEVENTF_KEYUP, 0);
         SetForegroundWindow(overlay::main());
-        ShowWindow(overlay::main(), SW_MAXIMIZE);
+        // STREMIO_RUNE_FSTEST_RECT=x,y,w,h: start from a normal window there instead (pixels).
+        let rect: Option<Vec<i32>> = std::env::var("STREMIO_RUNE_FSTEST_RECT").ok()
+            .map(|v| v.split(',').filter_map(|n| n.trim().parse().ok()).collect());
+        match rect.as_deref() {
+            Some(&[x, y, w, h]) => {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{SW_RESTORE, SWP_NOZORDER, SetWindowPos};
+                ShowWindow(overlay::main(), SW_RESTORE);
+                SetWindowPos(overlay::main(), std::ptr::null_mut(), x, y, w, h, SWP_NOZORDER);
+            }
+            _ => { ShowWindow(overlay::main(), SW_MAXIMIZE); }
+        }
     }
 }
 
