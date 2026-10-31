@@ -81,6 +81,7 @@ struct Icons {
     play: Image, pause: Image, back: Image, close: Image, expand: Image, shrink: Image, subs: Image, search: Image,
     // The caption buttons' glyphs, thin as Windows draws them.
     minimize: Image, maximize: Image, restore: Image, quit: Image,
+    volume: Image, muted: Image,
 }
 
 struct State {
@@ -133,6 +134,8 @@ struct State {
     caption: window::Caption,
     /// Playback controls: shown while the mouse moves (see `poll`).
     controls: bool,
+    /// Since when mpv's volume differs from the saved one (saved once it settles).
+    volume_moved: Option<Instant>,
     cursor: (i32, i32),
     last_move: Instant,
     bar_hover: bool,
@@ -229,6 +232,7 @@ fn state() -> State {
         fullscreen: false,
         caption: window::caption(),
         controls: true,
+        volume_moved: None,
         cursor: (0, 0),
         last_move: Instant::now(),
         bar_hover: false,
@@ -565,6 +569,8 @@ fn play(s: &mut State, url: &str) {
             // Arrow keys over the video: mpv's own bindings, at the chosen step.
             let step = s.settings.seek_ms as f64 / 1000.0;
             for (key, dir) in [("RIGHT", ""), ("LEFT", "-")] { let _ = p.command(&["keybind", key, &format!("seek {dir}{step}")]); }
+            // Up and down: volume, as the volume slider (mpv's own would seek a minute).
+            for (key, by) in [("UP", "5"), ("DOWN", "-5")] { let _ = p.command(&["keybind", key, &format!("add volume {by}")]); }
             s.player = Some(p);
             library::start(s);
             s.playing = url.to_string();
@@ -700,6 +706,8 @@ fn icons(cache: &ImageCache) -> Icons {
         maximize: thin("M1.5 1.5h9v9h-9z"),
         restore: thin("M1.5 3.5h7v7h-7zM3.5 3.5v-2h7v7h-2"),
         quit: thin("M1.5 1.5l9 9M10.5 1.5l-9 9"),
+        volume: icon("M4 9.5h3.5L12 6v12l-4.5-3.5H4zM15.5 9.5a3.5 3.5 0 0 1 0 5M18 7a7 7 0 0 1 0 10"),
+        muted: icon("M4 9.5h3.5L12 6v12l-4.5-3.5H4zM16 9.5l5 5M21 9.5l-5 5"),
     }
 }
 
@@ -733,6 +741,7 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
         let p = &s.playback;
         s.controls = p.paused || p.loading() || s.bar_hover || s.subs_open || s.quality_open || s.last_move.elapsed() < Duration::from_millis(s.settings.hide_ms as u64);
         player.fit();
+        remember_volume(s);
         library::tick(s);
         tx.wake_after(Duration::from_millis(200));
         for m in std::mem::take(&mut s.playback.messages) {
@@ -814,9 +823,20 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
         if on != s.overlay_on { s.overlay_on = on; window::overlay::show(win, on) }
         if on { window::overlay::keep_keys(win) }
         let v = shown(s);
-        if v != s.pushed { s.pushed = v.clone(); app.update(move |c, _| c.shown = v) }
+        if v != s.pushed { s.pushed = v.clone(); app.update(move |c, tx| ui::push(c, v, tx)) }
     }
     changed
+}
+
+/// Keep the player's volume for next time, once it has stayed put for a second: not on every
+/// step of a slider drag. Only after the first frame, when mpv has reported it.
+fn remember_volume(s: &mut State) {
+    let v = s.playback.volume.round() as u32;
+    if !s.playback.started || v == s.settings.volume { s.volume_moved = None; return }
+    if s.volume_moved.get_or_insert_with(Instant::now).elapsed() >= Duration::from_secs(1) {
+        settings::set(s, |st| st.volume = v);
+        s.volume_moved = None;
+    }
 }
 
 /// What the floating controls show, sent to their window when it changes.
@@ -926,6 +946,7 @@ fn demo_controls(c: &mut Ctl) {
         st("Some Addon", "Direct link", "e"),
     ];
     v.playing = "b".into();
+    (v.playback.volume, c.vol_drag) = (80.0, None);
 }
 
 fn main() {
@@ -1038,6 +1059,43 @@ mod tests {
         drop(p);
     }
 
+    /// When mpv's waiting-related properties flip, from `Mpv::play` through a seek: what the
+    /// loader can follow. `cargo test loader_timeline -- --ignored --nocapture`, with
+    /// TEST_STREAM, else a torrent through Stremio's server.
+    #[test]
+    #[ignore = "plays a stream; opens a window briefly; prints a timeline"]
+    fn loader_timeline() {
+        let src = std::env::var("TEST_STREAM").unwrap_or_else(|_| "http://127.0.0.1:11470/dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c/-1".into());
+        let t = Instant::now();
+        let p = Mpv::play(&src, "test", None, None, vec![]).unwrap();
+        println!("{:>6.0} ms  Mpv::play returned", t.elapsed().as_secs_f64() * 1000.0);
+        let mut pb = Playback::default();
+        let key = |p: &Playback| (p.started, p.buffering, p.seeking, p.idle, p.paused, p.cache_pct as i64, p.loading());
+        let mut last = None;
+        let mut log = |pb: &Playback, what: &str| if last != Some(key(pb)) {
+            last = Some(key(pb));
+            println!("{:>6.0} ms  started {} buffering {} seeking {} idle {} paused {} cache {:>3} -> loading {}  {what}",
+                t.elapsed().as_secs_f64() * 1000.0, pb.started, pb.buffering, pb.seeking, pb.idle, pb.paused, pb.cache_pct, pb.loading());
+        };
+        let run = |pb: &mut Playback, log: &mut dyn FnMut(&Playback, &str), secs: f64, what: &str| {
+            let until = Instant::now() + Duration::from_secs_f64(secs);
+            while Instant::now() < until {
+                assert_eq!(p.pump(pb), None, "ended early");
+                log(pb, what);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        log(&pb, "before");
+        let wait_start = Instant::now();
+        while !pb.started && wait_start.elapsed().as_secs() < 60 { run(&mut pb, &mut log, 0.05, "start") }
+        run(&mut pb, &mut log, 1.5, "playing");
+        println!("{:>6.0} ms  seek +300", t.elapsed().as_secs_f64() * 1000.0);
+        p.command(&["seek", "300", "relative"]).unwrap();
+        run(&mut pb, &mut log, 4.0, "after seek");
+        p.command(&["quit"]).unwrap();
+        while p.pump(&mut pb).is_none() { std::thread::sleep(Duration::from_millis(20)) }
+    }
+
     #[test]
     #[ignore = "plays TEST_STREAM; opens a window briefly"]
     fn switching_streams_keeps_the_position() {
@@ -1089,6 +1147,107 @@ mod tests {
     }
 
     #[test]
+    fn loader_shows_from_the_click_through_seeks_and_stalls() {
+        let p = |f: fn(&mut Playback)| { let mut p = Playback { started: true, ..Default::default() }; f(&mut p); p.loading() };
+        assert!(Playback::default().loading(), "from play(), before mpv says anything");
+        assert!(!p(|_| {}), "playing");
+        assert!(p(|p| p.seeking = true), "a seek, from its first instant");
+        assert!(p(|p| p.idle = true), "the core waiting while not paused: a stall starting");
+        assert!(!p(|p| { p.idle = true; p.paused = true }), "paused isn't loading");
+        assert!(p(|p| p.buffering = true));
+        // The click's own frame shows it: the page switches and the loader is in what's pushed.
+        let mut s = state();
+        s.page = Page::Player;
+        assert!(shown(&s).playback.loading());
+    }
+
+    #[test]
+    fn controls_land_at_once_when_the_window_resizes() {
+        // Fullscreen and back: the controls' window jumps to the new size. Nothing in it may
+        // travel there over frames, with or without a panel open.
+        for panel in [false, true] {
+            let mut rt = controls(move |c| { demo_controls(c); c.shown.subs_open = panel });
+            for _ in 0..60 { rt.frame(1.0 / 60.0); }
+            for (w, h) in [(1920.0, 1080.0), (1280.0, 800.0)] {
+                rt.set_viewport((w, h), 2.0);
+                // The app pushes its new state (the fullscreen icon) around the same frame.
+                rt.update(move |c, tx| { let v = ui::Shown { fullscreen: w > 1280.0, ..c.shown.clone() }; ui::push(c, v, tx) });
+                let mut seen = vec![];
+                for _ in 0..20 {
+                    rt.frame(1.0 / 60.0);
+                    seen.push((rt.find("toggle").unwrap(), rt.find("fullscreen").unwrap(), rt.find("back").unwrap()));
+                }
+                assert!(seen.windows(2).all(|p| p[0] == p[1]), "panel {panel}, {w}x{h}: moved over frames: {:?}", &seen[..4]);
+                let (toggle, full, _) = seen[0];
+                assert!((toggle.1 - (h - BAR / 2.0)).abs() < 1.0 && full.0 > w - 60.0 - if panel { SUBS_W } else { 0.0 }, "at the new edges at once");
+            }
+            // Showing and hiding the bars still fades.
+            rt.update(|c, tx| { let v = ui::Shown { controls: false, ..c.shown.clone() }; ui::push(c, v, tx) });
+            rt.frame(1.0 / 60.0);
+            let fading = rt.presented("controls").map(|(_, o)| o);
+            assert!(fading.is_some_and(|o| o > 0.05 && o < 1.0), "fading out, not gone at once: {fading:?}");
+            for _ in 0..30 { rt.frame(1.0 / 60.0); }
+            assert!(rt.find("bar").is_none());
+        }
+    }
+
+    #[test]
+    fn volume_slider_drags_scrolls_mutes_and_is_remembered() {
+        let mut rt = controls(demo_controls);
+        let (x, y) = rt.find("volume").expect("slider");
+        let w = ui::VOL_W;
+        rt.pointer_down(x - w / 2.0 + 1.0, y);
+        rt.pointer_move(x - w / 4.0, y);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.vol_drag.is_some_and(|v| (v - 25.0).abs() < 3.0), "follows the pointer: {:?}", rt.state.vol_drag);
+        rt.pointer_up(x - w / 4.0, y);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.vol_drag.is_none() && (rt.state.shown.playback.volume - 25.0).abs() < 3.0);
+        assert!(!rt.state.sent.is_empty(), "each step goes to mpv");
+        rt.state.sent.clear();
+        let mut wheel = rune::WheelEvent::default();
+        (wheel.x, wheel.y, wheel.dy) = (x, y, 40.0);
+        rt.wheel_event(wheel);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.sent.len(), 1, "a wheel step over the slider");
+        click(&mut rt, "mute");
+        assert_eq!(rt.state.sent.len(), 2);
+        // Saved once it has settled for a second, and handed to mpv at the next start.
+        let mut s = state();
+        s.playback = Playback { started: true, volume: 60.0, ..Default::default() };
+        remember_volume(&mut s);
+        assert_eq!(s.settings.volume, 100, "not on the first step");
+        s.volume_moved = Some(Instant::now() - Duration::from_secs(2));
+        remember_volume(&mut s);
+        assert_eq!(s.settings.volume, 60);
+        assert!(settings::mpv_options(&s.settings).contains(&("volume", "60".to_string())));
+    }
+
+    #[test]
+    #[ignore = "plays TEST_STREAM; opens a window briefly"]
+    fn volume_starts_at_the_saved_one_and_is_observed() {
+        let src = std::env::var("TEST_STREAM").expect("TEST_STREAM: a video");
+        let p = Mpv::play(&src, "test", None, None, vec![("volume", "40".into())]).unwrap();
+        let mut pb = Playback::default();
+        let wait = |pb: &mut Playback, done: &dyn Fn(&Playback) -> bool| {
+            let t = Instant::now();
+            while !done(pb) {
+                assert_eq!(p.pump(pb), None, "ended early");
+                assert!(t.elapsed().as_secs() < 20, "timed out: volume {} muted {}", pb.volume, pb.muted);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        wait(&mut pb, &|pb| pb.started && pb.volume == 40.0);
+        p.command(&["add", "volume", "5"]).unwrap();
+        wait(&mut pb, &|pb| pb.volume == 45.0);
+        p.command(&["cycle", "mute"]).unwrap();
+        wait(&mut pb, &|pb| pb.muted);
+        p.command(&["keypress", "UP"]).unwrap(); // no keybind here: mpv's own UP seeks; just mustn't break
+        p.command(&["quit"]).unwrap();
+        while p.pump(&mut pb).is_none() { std::thread::sleep(Duration::from_millis(20)) }
+    }
+
+    #[test]
     fn audio_labels() {
         assert_eq!(player::audio_label("eng", "", 6, "truehd"), "English · 5.1 · TrueHD");
         assert_eq!(player::audio_label("ger", "German", 2, "aac"), "German · Stereo · AAC");
@@ -1109,7 +1268,7 @@ mod tests {
     }
 
     /// The floating controls' window on its own, as in a scene.
-    fn controls(scene: fn(&mut Ctl)) -> rune::Runtime<Ctl> {
+    fn controls(scene: impl FnOnce(&mut Ctl)) -> rune::Runtime<Ctl> {
         let mut c = Ctl::default();
         scene(&mut c);
         let mut rt = rune::Runtime::new(c, ui::controls, (1280.0, 800.0), rune::Env { system_dark: true, scale: 2.0 });
@@ -1126,6 +1285,8 @@ mod tests {
     fn controls_float_only_while_active_and_panels_toggle() {
         let mut rt = controls(demo_controls);
         assert!(rt.find("bar").is_some() && rt.find("video").is_some() && rt.find("loader").is_none());
+        let (back, toggle) = (rt.find("back").expect("back"), rt.find("toggle").expect("play/pause"));
+        assert!(back.1 < 100.0 && toggle.1 > 700.0, "back and the title at the top, play/pause at the bottom");
         let mut s = state();
         click(&mut rt, "quality");
         apply(&mut rt, &mut s);
@@ -1141,7 +1302,7 @@ mod tests {
         // Pushed state: the bar goes when the mouse rests; the button names what plays.
         let mut rt = controls(|c| { demo_controls(c); c.shown.controls = false });
         for _ in 0..60 { rt.frame(1.0 / 60.0); }
-        assert!(rt.find("bar").is_none(), "controls hidden");
+        assert!(rt.find("bar").is_none() && rt.find("top-bar").is_none(), "controls hidden, top and bottom");
         let rt = controls(|c| { demo_controls(c); c.shown.playback.buffering = true });
         assert!(rt.find("loader").is_some(), "the loader floats over the frozen frame");
         // `shown` copies the app's state, in whole seconds.

@@ -436,7 +436,7 @@ fn loader(logo: Option<&Image>, p: &Playback) -> El {
     let art = || el().size(w, h).pixels(img.pixels());
     all(el()).key("loader").center().child(
         el().size(w, h).cycle(PULSE)
-            .child(art().opacity(0.2).absolute(0.0, 0.0))
+            .child(art().opacity(0.5).absolute(0.0, 0.0)) // plainly there from the first instant, before any cache
             .child(el().w(w * done).h(h).clip_rounded(0.0).absolute(0.0, 0.0).child(art())),
     )
 }
@@ -466,6 +466,8 @@ pub struct Ctl {
     pub shown: Shown,
     /// Seek-bar drag in progress, as a fraction of the duration.
     pub scrub: Option<f32>,
+    /// Volume-slider drag in progress, percent.
+    pub vol_drag: Option<f64>,
     pub icons: Option<Icons>,
     pub cache: Option<ImageCache>,
     pub main: Option<rune::AppHandle<State>>,
@@ -509,6 +511,15 @@ fn act(f: impl Fn(&mut State) + Clone + Send + 'static) -> impl Fn(&mut Ctl) + '
     move |c: &mut Ctl| c.send(f.clone())
 }
 
+/// What the app sends: in place at once, unless the bars show or hide (they fade) or a panel
+/// opens or closes (it slides). Above all a window resize (fullscreen) that lands in the same
+/// frame then jumps to the new layout instead of springing there.
+pub fn push(c: &mut Ctl, v: Shown, tx: &mut Tx) {
+    let moves = |v: &Shown| (v.controls, v.subs_open, v.quality_open);
+    if moves(&c.shown) == moves(&v) { tx.instant() }
+    c.shown = v;
+}
+
 pub fn ctl_setup(c: &mut Ctl, waker: Waker) {
     let cache = ImageCache::new(waker);
     c.icons = Some(icons(&cache));
@@ -542,6 +553,19 @@ fn glyph(icons: &Option<Icons>, pick: impl Fn(&Icons) -> &Image, size: f32) -> E
     match icons { Some(i) => e.pixels(pick(i).pixels()), None => e }
 }
 
+/// Width of the volume slider, in points.
+pub const VOL_W: f32 = 96.0;
+
+/// Volume drag: follows the pointer as it goes (you hear it), and unmutes.
+fn volume_drag(c: &mut Ctl, d: &mut Drag, _: &mut Tx) {
+    let v = ((d.x / d.w.max(1.0)).clamp(0.0, 1.0) * 100.0).round() as f64;
+    c.vol_drag = (d.phase != Phase::Up).then_some(v);
+    if d.cancelled() { return }
+    c.shown.playback.volume = v;
+    let v = v.to_string();
+    c.send(move |s| { mpv(s, &["set", "volume", &v]); mpv(s, &["set", "mute", "no"]) });
+}
+
 fn seek(c: &mut Ctl, d: &mut Drag, _: &mut Tx) {
     let f = (d.x / d.w.max(1.0)).clamp(0.0, 1.0);
     if d.phase != Phase::Up { c.scrub = Some(f); return }
@@ -553,8 +577,9 @@ fn seek(c: &mut Ctl, d: &mut Drag, _: &mut Tx) {
     c.send(move |s| mpv(s, &["seek", &at, "absolute"]));
 }
 
-/// The floating controls, over the whole video: the loader while it loads, the bar on a scrim
-/// along the bottom while the mouse is active, fading in and out, and the Audio & Subtitles or Quality panel on the right.
+/// The floating controls, over the whole video: the loader while it loads, and while the mouse
+/// is active, back and the title along the top and the bar along the bottom, each on a scrim,
+/// fading in and out, and the Audio & Subtitles or Quality panel on the right.
 /// Clear elsewhere; double-click toggles fullscreen, and the cursor hides with the controls.
 pub fn controls(c: &Ctl, _: &mut Cx<Ctl>) -> El {
     let v = &c.shown;
@@ -562,6 +587,14 @@ pub fn controls(c: &Ctl, _: &mut Cx<Ctl>) -> El {
         .child(el().key("video").w_full().grow(1.0).on_double_press(act(toggle_fullscreen)));
     if v.playback.loading() { stage = stage.child(loader(v.logo.as_ref().map(|l| &l.0), &v.playback)) }
     if v.controls {
+        // Back and the title along the top, on a scrim of their own; they fade with the bar.
+        stage = stage.child(row().key("top-bar").pin(Some(0.0), Some(0.0), Some(0.0), None).h(BAR + 48.0).px(14.0).pb(48.0).gap(12.0).center_y()
+            .linear_gradient(PI, [(0.0, Color::BLACK.alpha(0.75)), (1.0, Color::BLACK.alpha(0.0))])
+            .transition(Transition::opacity())
+            .on_hover_change(|c: &mut Ctl, inside, _| c.send(move |s| s.bar_hover = inside))
+            .child(tap(row().key("back").size(40.0, 40.0).radius(20.0).center().hover(ink(0.14))
+                .child(glyph(&c.icons, |i| &i.back, 20.0))).on_press(act(stop)))
+            .child(label(v.title.clone(), 17.0, 600.0, Color::WHITE).truncate().grow(1.0).min_w(0.0)));
         stage = stage.child(col().key("controls").w_full().pt(72.0)
             .linear_gradient(0.0, [(0.0, Color::BLACK.alpha(0.82)), (1.0, Color::BLACK.alpha(0.0))])
             .transition(Transition::opacity())
@@ -579,7 +612,6 @@ fn bar(c: &Ctl) -> El {
     let frac = if p.dur > 0.0 { (at / p.dur) as f32 } else { 0.0 };
     let round = |key: &str, on: bool| tap(row().key(key.to_string()).size(40.0, 40.0).radius(20.0).center()
         .fill(if on { ink(0.16) } else { Color::TRANSPARENT }).hover(ink(0.14)));
-    let back = round("back", false).child(glyph(&c.icons, |i| &i.back, 20.0)).on_press(act(stop));
     let toggle = round("toggle", false).child(glyph(&c.icons, |i| if p.paused { &i.play } else { &i.pause }, 20.0))
         .on_press(act(|s| mpv(s, &["cycle", "pause"])));
     let time = |secs: f64| label(clock(secs), 14.0, 500.0, ink(0.85)).font(TextStyle::new(14.0, 500.0).features("'tnum' 1"));
@@ -588,8 +620,21 @@ fn bar(c: &Ctl) -> El {
         .child(progress(frac, if c.scrub.is_some() { 6.0 } else { 4.0 }).w_full());
     let mut bar = row().key("bar").w_full().h(BAR).px(14.0).gap(10.0).center_y()
         .on_hover_change(|c: &mut Ctl, inside, _| c.send(move |s| s.bar_hover = inside))
-        .child(back).child(toggle)
-        .child(label(v.title.clone(), 15.0, 600.0, Color::WHITE).truncate().max_w(260.0)).child(el().w(6.0));
+        .child(toggle);
+    // Mute, and a slider: drag it, or scroll over it.
+    let vol = c.vol_drag.unwrap_or(p.volume);
+    bar = bar.child(round("mute", false).child(glyph(&c.icons, |i| if p.muted || p.volume <= 0.0 { &i.muted } else { &i.volume }, 20.0))
+            .on_press(act(|s| mpv(s, &["cycle", "mute"]))))
+        .child(row().key("volume").w(VOL_W).h(BAR).center_y().cursor(Cursor::Pointer).on_drag(volume_drag)
+            // one 5% step per wheel event; a trackpad's many small events step fast
+            .on_wheel(|c: &mut Ctl, e: rune::WheelEvent, _| {
+                if e.dy == 0.0 { return false }
+                let by = if e.dy > 0.0 { "5" } else { "-5" };
+                c.send(move |s| mpv(s, &["add", "volume", by]));
+                true
+            })
+            .child(progress(if p.muted { 0.0 } else { (vol / 100.0) as f32 }, if c.vol_drag.is_some() { 6.0 } else { 4.0 }).w_full()))
+        .child(el().w(8.0));
     if p.started && p.buffering { bar = bar.child(label(format!("Buffering {}%", p.cache_pct as u32), 13.0, 500.0, ink(0.7))) }
     bar = bar.child(time(at)).child(track).child(time(p.dur));
     if !v.streams.is_empty() {
