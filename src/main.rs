@@ -27,6 +27,8 @@ const HOME_ROWS: usize = 6;
 const ROW_CARDS: usize = 5;
 /// Titles the Home hero cycles through, and how long each stays.
 const HERO_PICKS: usize = 5;
+/// The Home row of `row_*` maps that pages through the library (others are catalog indexes).
+const UP_NEXT: usize = usize::MAX;
 const HERO_EVERY: Duration = Duration::from_secs(4);
 /// Width of the hero's current dot, which fills over `HERO_EVERY`.
 const DOT_W: f32 = 28.0;
@@ -50,6 +52,8 @@ enum Msg {
     Addons(Vec<Value>),
     Library(Vec<Value>),
     Catalog(usize, Vec<Value>),
+    /// A further page of a catalog (empty when it has no more).
+    More(usize, Vec<Value>),
     Image(String, image::RgbaImage),
     Meta(String, Value),
     Streams(String, Vec<Stream>),
@@ -72,13 +76,14 @@ enum Msg {
 #[derive(Clone, PartialEq)]
 struct Stream { name: String, title: String, url: String }
 
-struct Catalog { base: String, ty: String, id: String, name: String }
+/// `skip`: the catalog pages with the `skip` extra.
+struct Catalog { base: String, ty: String, id: String, name: String, skip: bool }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page { Login, Home, Browse(&'static str), Detail, Player, Search, Settings, Addons }
 
 struct Icons {
-    play: Image, pause: Image, back: Image, close: Image, expand: Image, shrink: Image, subs: Image, search: Image,
+    play: Image, pause: Image, back: Image, close: Image, expand: Image, shrink: Image, subs: Image, search: Image, next: Image,
     // The caption buttons' glyphs, thin as Windows draws them.
     minimize: Image, maximize: Image, restore: Image, quit: Image,
     volume: Image, muted: Image,
@@ -97,6 +102,15 @@ struct State {
     items: HashMap<usize, Vec<Value>>,
     /// Continue watching, newest first.
     library: Vec<Value>,
+    /// Home rows (catalog index, or `UP_NEXT`): the first card shown, which way the last page
+    /// turned (±1), catalogs with a further page on the way or none left, the row under the
+    /// mouse (arrow keys page it), and sideways wheel travel since the last turn.
+    row_at: HashMap<usize, usize>,
+    row_dir: f32,
+    more_loading: HashSet<usize>,
+    more_done: HashSet<usize>,
+    row_hover: Option<usize>,
+    wheel: (f32, Instant),
     hero: usize,
     /// When the hero last changed; it advances `HERO_EVERY` after.
     hero_at: Instant,
@@ -208,6 +222,12 @@ fn state() -> State {
         selected: 0,
         items: HashMap::new(),
         library: vec![],
+        row_at: HashMap::new(),
+        row_dir: 1.0,
+        more_loading: HashSet::new(),
+        more_done: HashSet::new(),
+        row_hover: None,
+        wheel: (0.0, Instant::now()),
         hero: 0,
         hero_at: Instant::now(),
         hero_fill: dot_fill(),
@@ -323,7 +343,9 @@ fn catalogs(addons: &[Value]) -> Vec<Catalog> {
             .map(move |c| {
                 let ty = c["type"].as_str().unwrap_or("").to_string();
                 let name = format!("{} {}", c["name"].as_str().unwrap_or("?"), type_label(&ty));
-                Catalog { base: b.clone(), id: c["id"].as_str().unwrap_or("").into(), ty, name }
+                let skip = c["extra"].as_array().into_iter().flatten().any(|e| e["name"] == "skip")
+                    || c["extraSupported"].as_array().is_some_and(|x| x.iter().any(|e| e == "skip"));
+                Catalog { base: b.clone(), id: c["id"].as_str().unwrap_or("").into(), ty, name, skip }
             })
     }).collect()
 }
@@ -502,6 +524,67 @@ fn fetch_catalog(s: &mut State, i: usize) {
     spawn(s, move || Ok(Msg::Catalog(i, get(&url)?["metas"].as_array().cloned().unwrap_or_default())));
 }
 
+/// The titles a Home row pages through: the library, or a catalog's (the first one's after the
+/// hero's picks).
+fn row_items(s: &State, r: usize) -> &[Value] {
+    if r == UP_NEXT { return &s.library }
+    let items = s.items.get(&r).map_or(&[][..], |v| &v[..]);
+    if r == 0 && items.len() > HERO_PICKS { &items[HERO_PICKS..] } else { items }
+}
+
+fn row_at(s: &State, r: usize) -> usize { s.row_at.get(&r).copied().unwrap_or(0).min(row_items(s, r).len()) }
+
+fn can_page(s: &State, r: usize, dir: i32) -> bool {
+    let at = row_at(s, r);
+    if dir < 0 { at > 0 } else { at + ROW_CARDS < row_items(s, r).len() }
+}
+
+/// Turn a Home row a row's width back or on (`dir` ±1), the last page flush with the end, and
+/// fetch the catalog's next page once the row nears the end of what's loaded.
+fn page_row(s: &mut State, r: usize, dir: i32) {
+    if !can_page(s, r, dir) { return }
+    let (at, len) = (row_at(s, r), row_items(s, r).len());
+    let to = if dir < 0 { at.saturating_sub(ROW_CARDS) } else { (at + ROW_CARDS).min(len - ROW_CARDS) };
+    s.row_at.insert(r, to);
+    s.row_dir = dir as f32;
+    more(s, r);
+}
+
+/// Fetch catalog `r`'s next page (`skip` = titles loaded) when its row shows within two pages
+/// of the end, if the catalog pages at all. Up Next has the whole library already.
+fn more(s: &mut State, r: usize) {
+    let Some(c) = s.catalogs.get(r) else { return };
+    if !c.skip || row_at(s, r) + 3 * ROW_CARDS < row_items(s, r).len() || s.more_loading.contains(&r) || s.more_done.contains(&r) { return }
+    let url = format!("{}/catalog/{}/{}/skip={}.json", c.base, c.ty, c.id, s.items.get(&r).map_or(0, Vec::len));
+    s.more_loading.insert(r);
+    // a failed page counts as the end; no retry until the addons reload
+    spawn(s, move || Ok(Msg::More(r, get(&url).map(|v| v["metas"].as_array().cloned().unwrap_or_default()).unwrap_or_default())));
+}
+
+/// A further page landed: append the titles not shown yet; none new means the catalog ended.
+fn more_landed(s: &mut State, r: usize, metas: Vec<Value>) {
+    s.more_loading.remove(&r);
+    let Some(items) = s.items.get_mut(&r) else { return };
+    let mut seen: HashSet<String> = items.iter().map(|m| m["id"].as_str().unwrap_or("").to_string()).collect();
+    let before = items.len();
+    items.extend(metas.into_iter().filter(|m| seen.insert(m["id"].as_str().unwrap_or("").to_string())));
+    if items.len() == before { s.more_done.insert(r); }
+}
+
+/// Shift+wheel or a sideways swipe over a Home row turns it, once per 40 pt and at most every
+/// 0.35 s (a swipe's coasting is one turn); plain vertical scrolling passes through.
+fn wheel_row(s: &mut State, r: usize, e: rune::WheelEvent) -> bool {
+    if !e.mods.shift && e.dx.abs() <= e.dy.abs() { return false }
+    let d = if e.mods.shift { e.dx + e.dy } else { e.dx };
+    if s.wheel.1.elapsed() < Duration::from_millis(350) { s.wheel.0 = 0.0; return true }
+    s.wheel.0 += d;
+    if s.wheel.0.abs() >= 40.0 {
+        page_row(s, r, if s.wheel.0 > 0.0 { -1 } else { 1 });
+        s.wheel = (0.0, Instant::now());
+    }
+    true
+}
+
 fn open_catalog(s: &mut State, i: usize) {
     s.selected = i;
     fetch_catalog(s, i);
@@ -658,6 +741,9 @@ fn on_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
             let step = s.settings.seek_ms as f64 / 1000.0 * if ev.key == Key::Left { -1.0 } else { 1.0 };
             mpv(s, &["seek", &step.to_string()])
         }
+        Key::Left | Key::Right if s.page == Page::Home && s.row_hover.is_some() => {
+            page_row(s, s.row_hover.unwrap(), if ev.key == Key::Left { -1 } else { 1 })
+        }
         Key::Escape => escape(s),
         k if playing => {
             let name = match k { Key::Text(t) => t.as_str(), Key::Left => "LEFT", Key::Right => "RIGHT", Key::Up => "UP", Key::Down => "DOWN", _ => return false };
@@ -702,6 +788,7 @@ fn icons(cache: &ImageCache) -> Icons {
         shrink: icon("M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"),
         subs: icon("M4 6h16v12H4zM7 14h3M12 14h5M7 10.5h6M15 10.5h2"),
         search: icon("M11 4a7 7 0 1 0 0 14a7 7 0 1 0 0-14zM20 20l-4.2-4.2"),
+        next: icon("M9 6l6 6-6 6"),
         minimize: thin("M1 6h10"),
         maximize: thin("M1.5 1.5h9v9h-9z"),
         restore: thin("M1.5 3.5h7v7h-7zM3.5 3.5v-2h7v7h-2"),
@@ -774,6 +861,9 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
                 s.catalogs = catalogs(&s.addons);
                 s.search.cats = search::catalogs(&s.addons);
                 s.items.clear();
+                s.row_at.clear();
+                s.more_loading.clear();
+                s.more_done.clear();
                 s.status.clear();
                 for i in 0..s.catalogs.len().min(HOME_ROWS) { fetch_catalog(s, i) }
             }
@@ -782,6 +872,7 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
             }
             // Pictures ask for their images when laid out near the viewport (`ui::picture`).
             Msg::Catalog(i, items) => { s.items.insert(i, items); }
+            Msg::More(r, metas) => more_landed(s, r, metas),
             Msg::Image(url, img) => if let Some(c) = &s.cache {
                 s.tick += 1;
                 s.lru.insert(url.clone(), (img.as_raw().len(), s.tick));
@@ -914,8 +1005,8 @@ fn show_hero(s: &mut State, i: usize) {
 fn demo(s: &mut State) {
     s.auth = None; // keep the real account from loading over the fake data
     s.catalogs = vec![
-        Catalog { base: String::new(), ty: "movie".into(), id: "top".into(), name: "Popular Movies".into() },
-        Catalog { base: String::new(), ty: "series".into(), id: "top".into(), name: "Popular Shows".into() },
+        Catalog { base: String::new(), ty: "movie".into(), id: "top".into(), name: "Popular Movies".into(), skip: false },
+        Catalog { base: String::new(), ty: "series".into(), id: "top".into(), name: "Popular Shows".into(), skip: false },
     ];
     let item = |n: usize| json!({ "id": format!("tt{n}"), "type": "movie", "name": format!("The Long Quiet {n}"), "releaseInfo": "2026",
         "genres": ["Drama", "Mystery"], "runtime": "107 min", "imdbRating": "7.5",
@@ -928,7 +1019,7 @@ fn demo(s: &mut State) {
 }
 
 fn demo_cat(ty: &str, name: &str) -> Catalog {
-    Catalog { base: String::new(), ty: ty.into(), id: "top".into(), name: name.into() }
+    Catalog { base: String::new(), ty: ty.into(), id: "top".into(), name: name.into(), skip: false }
 }
 
 /// Demo playback for the controls' scenes.
@@ -976,6 +1067,13 @@ fn main() {
                 s.search.results = HashMap::from([(0, s.items[&0].clone()), (1, s.items[&1][..3].to_vec())]);
             }),
             ("menu", |s| { demo(s); s.page = Page::Home; s.menu = true }),
+            ("rows", |s| {
+                demo(s);
+                s.page = Page::Home;
+                s.library = (1..13).map(|n| json!({ "_id": format!("tt{n}"), "type": "movie", "name": format!("Title {n}"),
+                    "state": { "timeOffset": 600000, "duration": 5400000 } })).collect();
+                s.row_at.insert(UP_NEXT, 5);
+            }),
             ("addons", |s| {
                 demo(s);
                 s.page = Page::Addons;
@@ -1538,11 +1636,75 @@ mod tests {
     }
 
     #[test]
+    fn home_rows_page_by_arrows_and_keys_and_stop_at_the_ends() {
+        // The first catalog's row, on screen under the hero: 5 hero picks, then 8 titles.
+        let mut rt = runtime(|s| {
+            demo(s);
+            s.library.clear();
+            s.items.insert(0, (1..14).map(|n| json!({ "id": format!("tt{n}"), "name": "x" })).collect());
+            s.page = Page::Home;
+        });
+        assert!(!can_page(&rt.state, 0, -1), "back is off at the start");
+        click(&mut rt, "prev-0");
+        assert_eq!(row_at(&rt.state, 0), 0);
+        assert!(rt.find("c0-tt6").is_some() && rt.find("c0-tt11").is_none(), "the row starts after the hero's picks");
+        click(&mut rt, "next-0");
+        assert_eq!(row_at(&rt.state, 0), 3, "the last page ends flush with the eighth title");
+        assert!(rt.find("c0-tt13").is_some() && rt.find("c0-tt6").is_none(), "the window moved");
+        assert!(!can_page(&rt.state, 0, 1), "and on is off at the end");
+        click(&mut rt, "prev-0");
+        assert_eq!(row_at(&rt.state, 0), 0);
+        // Up Next pages the whole library; the arrow keys turn the row under the mouse.
+        rt.state.library = (1..13).map(|n| json!({ "_id": format!("tt{n}"), "type": "movie", "name": "x", "state": {} })).collect();
+        rt.state.row_hover = Some(UP_NEXT);
+        rt.on_key = Some(on_key);
+        rt.key(KeyEvent { key: Key::Right, mods: Default::default() });
+        for _ in 0..30 { rt.frame(1.0 / 60.0); }
+        assert_eq!(row_at(&rt.state, UP_NEXT), 5);
+        assert!(rt.find("cw-tt6").is_some() && rt.find("cw-tt5").is_none());
+    }
+
+    #[test]
+    fn a_row_near_its_end_fetches_the_next_page_with_skip_and_drops_titles_it_has() {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let mut rt = runtime(|s| {
+            demo(s);
+            s.catalogs[0].base = base;
+            s.catalogs[0].skip = true;
+            s.library.clear();
+            s.items.insert(0, (1..14).map(|n| json!({ "id": format!("tt{n}"), "name": "x" })).collect()); // 5 hero picks + 8
+            s.page = Page::Home;
+        });
+        click(&mut rt, "next-0");
+        assert_eq!(row_at(&rt.state, 0), 3);
+        let (mut conn, _) = server.accept().unwrap();
+        let mut req = [0u8; 1024];
+        let n = conn.read(&mut req).unwrap();
+        let line = String::from_utf8_lossy(&req[..n]).lines().next().unwrap().to_string();
+        assert_eq!(line, "GET /catalog/movie/top/skip=13.json HTTP/1.1");
+        let body = r#"{"metas":[{"id":"tt13"},{"id":"tt14"},{"id":"tt14"},{"id":"tt15"}]}"#;
+        write!(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        drop(conn);
+        assert!(rt.state.more_loading.contains(&0), "one page at a time");
+        click(&mut rt, "next-0"); // nothing more to show yet, and no second request
+        let Ok(Msg::More(r, metas)) = rt.state.rx.recv_timeout(Duration::from_secs(5)) else { panic!("no page") };
+        more_landed(&mut rt.state, r, metas);
+        let ids: Vec<&str> = rt.state.items[&0].iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert_eq!(ids.len(), 15, "tt13 and the second tt14 dropped");
+        assert_eq!(&ids[12..], ["tt13", "tt14", "tt15"]);
+        assert!(can_page(&rt.state, 0, 1), "the new titles page on");
+        more_landed(&mut rt.state, 0, vec![json!({ "id": "tt15" })]);
+        assert!(rt.state.more_done.contains(&0), "a page with nothing new ends the catalog");
+    }
+
+    #[test]
     fn home_queues_the_hero_first_then_rows_near_the_viewport_and_drops_them_on_leaving() {
         let mut rt = runtime(|s| {
             demo(s);
             for i in 2..HOME_ROWS {
-                s.catalogs.push(Catalog { base: String::new(), ty: "movie".into(), id: format!("c{i}"), name: format!("Row {i}") });
+                s.catalogs.push(Catalog { base: String::new(), ty: "movie".into(), id: format!("c{i}"), name: format!("Row {i}"), skip: false });
                 s.items.insert(i, (i * 10..i * 10 + 5).map(|n| json!({ "id": format!("tt{n}"), "name": "x",
                     "poster": format!("https://images.metahub.space/poster/small/tt{n}/img") })).collect());
             }
