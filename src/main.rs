@@ -1197,6 +1197,81 @@ mod tests {
         assert!(rt.state.page == Page::Login && !rt.state.menu);
     }
 
+    /// ~100 streams as Torrentio sends them: multi-line titles with emoji and flags.
+    fn torrentio(n: usize) -> Vec<Stream> {
+        (0..n).map(|i| Stream {
+            name: format!("Torrentio {}", ["4k DV | HDR", "1080p", "720p", "480p"][i % 4]),
+            title: format!("The.Long.Quiet.2026.S01E02.{}p.WEB-DL.DDP5.1.Atmos.H.264-GROUP{i}\n👤 {} 💾 {}.{} GB ⚙️ ThePirateBay\n🇬🇧 / 🇩🇪 / 🇫🇷",
+                [2160, 1080, 720, 480][i % 4], 400 - i, 1 + i % 20, i % 10),
+            url: format!("http://127.0.0.1:11470/{i:040}/0"),
+        }).collect()
+    }
+
+    #[test]
+    fn streams_sheet_builds_only_the_cards_near_view() {
+        let mut rt = runtime(|s| { demo(s); s.page = Page::Detail; s.meta = Some(s.items[&0][0].clone());
+            s.stream_for = "tt1".into(); s.streams = torrentio(100); s.sheet = true });
+        for _ in 0..30 { rt.frame(1.0 / 60.0); }
+        assert!(rt.find("st-0").is_some(), "the first card shows");
+        assert!(rt.find("st-99").is_none(), "far cards aren't built");
+        // A later addon's answer appends without touching what's built.
+        rt.state.tx.send(Msg::Streams("tt1".into(), torrentio(3))).unwrap();
+        rt.update(|s, tx| { poll(s, 0.0, tx); });
+        for _ in 0..5 { rt.frame(1.0 / 60.0); }
+        assert_eq!(rt.state.streams.len(), 103);
+        assert!(rt.find("st-0").is_some());
+    }
+
+    #[test]
+    #[ignore = "timing: cargo test sheet_timing -- --ignored --nocapture"]
+    fn sheet_timing() {
+        let detail = |s: &mut State| {
+            demo(s);
+            let mut m = s.items[&0][0].clone();
+            m["type"] = "series".into();
+            m["videos"] = (1..9).map(|e| json!({ "id": format!("tt1:1:{e}"), "season": 1, "episode": e, "title": format!("Episode {e}") })).collect();
+            s.meta_id = "tt1".into();
+            s.meta = Some(m);
+            s.page = Page::Detail;
+        };
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+        let frames = |rt: &mut rune::Runtime<State>, n: usize| -> (f64, f64) {
+            let (mut total, mut worst) = (0.0, 0.0f64);
+            for _ in 0..n { let t = Instant::now(); rt.frame(1.0 / 60.0); let d = ms(t); total += d; worst = worst.max(d) }
+            (total, worst)
+        };
+        // Streams already loaded (a movie, or back on the same episode): open the sheet.
+        let mut rt = runtime(detail);
+        rt.state.stream_for = "tt1:1:2".into();
+        rt.state.streams = torrentio(100);
+        frames(&mut rt, 5);
+        let t = Instant::now();
+        rt.update(|s, _| s.season = 1); // any change: the view runs again
+        rt.frame(1.0 / 60.0);
+        println!("detail page rebuild alone: {:.0} ms", ms(t));
+        let t = Instant::now();
+        rt.update(|s, _| s.sheet = true);
+        let first = { rt.frame(1.0 / 60.0); ms(t) };
+        let (rest, worst) = frames(&mut rt, 30);
+        println!("open with 100 loaded: first frame {first:.0} ms, next 30 frames {rest:.0} ms (worst {worst:.0} ms)");
+        // Episode click: the sheet opens empty, then 5 addons answer with 20 streams each.
+        let mut rt = runtime(detail);
+        frames(&mut rt, 5);
+        let t = Instant::now();
+        rt.update(|s, _| { s.stream_for = "tt1:1:2".into(); s.sheet = true });
+        let first = { rt.frame(1.0 / 60.0); ms(t) };
+        let mut arrivals = vec![];
+        for chunk in torrentio(100).chunks(20) {
+            rt.state.tx.send(Msg::Streams("tt1:1:2".into(), chunk.to_vec())).unwrap();
+            let t = Instant::now();
+            rt.update(|s, tx| { poll(s, 0.0, tx); });
+            rt.frame(1.0 / 60.0);
+            arrivals.push(ms(t));
+        }
+        let (rest, worst) = frames(&mut rt, 30);
+        println!("open empty: first frame {first:.0} ms; each of 5 arrivals (20 streams): {arrivals:.0?} ms; next 30 frames {rest:.0} ms (worst {worst:.0} ms)");
+    }
+
     #[test]
     fn episodes_open_the_streams_sheet_and_the_scrim_closes_it() {
         let mut rt = runtime(|s| {
