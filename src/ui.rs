@@ -201,12 +201,15 @@ fn hero(s: &State) -> El {
     let kicker = s.catalogs.first().map(|c| c.name.clone());
     let info = headline(m, kicker).child(el().h(8.0))
         .child(primary(s, "watch", "Watch now").self_start().on_press(move |s: &mut State| open_meta(s, ty.clone(), id.clone())));
+    // The current dot stretches into a track that fills while its title stays up: a render-time
+    // tween, so the fill moves without rebuilding the page.
     let mut dots = row().gap(8.0).center_y();
     for i in 0..picks.len() {
         let on = i == s.hero.min(picks.len() - 1);
-        dots = dots.child(tap(el().key(format!("dot-{i}")).h(8.0).w(if on { 24.0 } else { 8.0 }).radius(4.0)
-            .fill(if on { Color::WHITE } else { ink(0.35) }).motion(motion::SNAPPY))
-            .on_press(move |s: &mut State| { s.hero = i; s.hero_at = Instant::now() }));
+        let mut dot = el().key(format!("dot-{i}")).h(8.0).w(if on { DOT_W } else { 8.0 }).radius(4.0)
+            .fill(ink(0.35)).clip_rounded(4.0).motion(motion::SNAPPY);
+        if on { dot = dot.child(el().key(format!("fill-{}", s.hero_round)).h(8.0).w(DOT_W).fill(Color::WHITE).live_rect(&s.hero_fill)) }
+        dots = dots.child(tap(dot).on_press(move |s: &mut State| show_hero(s, i)));
     }
     let [image, side, fade] = backdrop_layer(s, backdrop(m).as_deref());
     // Keyed by title so a change cross-fades: the old image fades out as the new one fades in.

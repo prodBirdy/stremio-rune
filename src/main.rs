@@ -10,7 +10,7 @@ mod window;
 
 use player::{Mpv, Playback};
 use ui::search;
-use rune::{AppSpec, Image, ImageCache, Key, KeyEvent, TextEdit, Tx, Waker};
+use rune::{AppSpec, Image, ImageCache, Key, KeyEvent, TextEdit, Tween, Tx, Waker};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -28,6 +28,8 @@ const ROW_CARDS: usize = 5;
 /// Titles the Home hero cycles through, and how long each stays.
 const HERO_PICKS: usize = 5;
 const HERO_EVERY: Duration = Duration::from_secs(4);
+/// Width of the hero's current dot, which fills over `HERO_EVERY`.
+const DOT_W: f32 = 28.0;
 
 const API: &str = "https://api.strem.io/api/";
 const SERVER: &str = "http://127.0.0.1:11470";
@@ -73,6 +75,10 @@ struct State {
     hero: usize,
     /// When the hero last changed; it advances `HERO_EVERY` after.
     hero_at: Instant,
+    /// The current dot's fill: [x, y, w, h] from empty to full over `HERO_EVERY`, and a
+    /// counter that keys it so each title's fill starts over.
+    hero_fill: Tween<[f32; 4]>,
+    hero_round: u64,
     // unbounded, ~1-4 MB per backdrop; evict by last use if long sessions bloat
     images: HashMap<String, Image>,
     requested: HashSet<String>,
@@ -151,6 +157,8 @@ fn state() -> State {
         library: vec![],
         hero: 0,
         hero_at: Instant::now(),
+        hero_fill: dot_fill(),
+        hero_round: 0,
         images: HashMap::new(),
         requested: HashSet::new(),
         meta_id: String::new(),
@@ -640,10 +648,19 @@ fn rotate_hero(s: &mut State, tx: &mut Tx) -> bool {
     if s.page != Page::Home || n < 2 { return false }
     let left = HERO_EVERY.saturating_sub(s.hero_at.elapsed());
     if !left.is_zero() { tx.wake_after(left); return false }
-    s.hero = (s.hero + 1) % n;
-    s.hero_at = Instant::now();
+    show_hero(s, (s.hero + 1) % n);
     tx.wake_after(HERO_EVERY);
     true
+}
+
+fn dot_fill() -> Tween<[f32; 4]> { Tween::linear([0.0, 0.0, 0.0, 8.0], [0.0, 0.0, DOT_W, 8.0], HERO_EVERY) }
+
+/// Show hero title `i` for a full `HERO_EVERY`, its dot filling from empty.
+fn show_hero(s: &mut State, i: usize) {
+    s.hero = i;
+    s.hero_at = Instant::now();
+    s.hero_fill = dot_fill();
+    s.hero_round += 1;
 }
 
 /// The `&'static str` a Browse page is keyed by, for the two types the nav offers.
