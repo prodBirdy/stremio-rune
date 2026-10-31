@@ -74,6 +74,8 @@ struct State {
     images: HashMap<String, Image>,
     requested: HashSet<String>,
     meta_id: String,
+    /// The page a detail page goes back to (Home, Browse or Search).
+    back_to: Page,
     meta: Option<Value>,
     season: i64,
     stream_for: String,
@@ -148,6 +150,7 @@ fn state() -> State {
         images: HashMap::new(),
         requested: HashSet::new(),
         meta_id: String::new(),
+        back_to: Page::Home,
         meta: None,
         season: 1,
         stream_for: String::new(),
@@ -372,6 +375,7 @@ fn go(s: &mut State, page: Page) {
 }
 
 fn open_meta(s: &mut State, ty: String, id: String) {
+    if matches!(s.page, Page::Home | Page::Browse(_) | Page::Search) { s.back_to = s.page }
     s.page = Page::Detail;
     s.sheet = false;
     s.meta = None;
@@ -497,7 +501,8 @@ fn escape(s: &mut State) {
     else if s.sheet && s.page == Page::Detail { s.sheet = false }
     else if s.fullscreen { toggle_fullscreen(s) }
     else if s.page == Page::Player { stop(s) }
-    else if matches!(s.page, Page::Detail | Page::Search) { s.page = Page::Home }
+    else if s.page == Page::Detail { s.page = s.back_to }
+    else if s.page == Page::Search { s.page = Page::Home }
 }
 
 fn mpv(s: &State, args: &[&str]) {
@@ -840,6 +845,9 @@ mod tests {
         assert!(rt.find("s0-stale").is_none(), "answers for older text are dropped");
         click(&mut rt, "s0-tt2");
         assert!(rt.state.page == Page::Detail && rt.state.meta_id == "tt2");
+        click(&mut rt, "back");
+        assert!(rt.state.page == Page::Search, "back returns to the results");
+        assert_eq!(rt.state.search.query.text, "long quiet", "with the query kept");
         click(&mut rt, "nav-search");
         for _ in 0..5 { rt.frame(1.0 / 60.0); }
         rt.key(KeyEvent { key: Key::Escape, mods: Default::default() }); // field focused: one press leaves

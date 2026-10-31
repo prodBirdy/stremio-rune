@@ -302,7 +302,7 @@ fn browse(s: &State, ty: &str) -> El {
 }
 
 fn detail(s: &State) -> El {
-    let back = back_button(s).on_press(|s: &mut State| s.page = Page::Home);
+    let back = back_button(s).on_press(|s: &mut State| s.page = s.back_to);
     let Some(m) = &s.meta else {
         return el().w_full().h(HERO_H).child(back.pin(Some(PAD), Some(24.0), None, None))
     };
