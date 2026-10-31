@@ -3,7 +3,7 @@
 
 use crate::*;
 use rune::tok::{TextStyle, motion};
-use rune::{Color, Cursor, Cx, Cycle, Drag, El, Phase, ScrollSpec, SurfaceFit, Transition, col, el, oklch, row, text, text_input};
+use rune::{Color, Cursor, Cx, Cycle, Drag, El, GrowthSpec, Phase, ScrollSpec, SurfaceFit, Transition, col, el, oklch, row, text, text_input};
 use std::f32::consts::PI;
 
 #[path = "search.rs"]
@@ -154,21 +154,28 @@ fn sheet(s: &State) -> [El; 2] {
             .child(label(subtitle, 14.0, 500.0, ink(0.6)).truncate()))
         .child(tap(glass(row().key("sheet-close").size(40.0, 40.0).radius(20.0).center()).hover(ink(0.16))
             .child(icon(s, |i| &i.close, 18.0))).on_press(close));
-    let mut list = col().w_full().gap(10.0).pb(24.0);
-    if s.streams.is_empty() { list = list.child(label("Finding streams…", 15.0, 500.0, ink(0.5))) }
-    for (i, st) in s.streams.iter().enumerate() {
-        let url = st.url.clone();
-        list = list.child(tap(col().key(format!("st-{i}")).w_full().px(16.0).py(14.0).gap(6.0).radius(14.0)
-            .fill(ink(0.06)).border(1.0, ink(0.08)).hover(ink(0.12))
-            .child(row().gap(10.0).center_y().child(icon(s, |i| &i.play, 14.0)).child(label(st.name.clone(), 15.0, 600.0, Color::WHITE).truncate()))
-            .child(label(st.title.clone(), 13.0, 400.0, ink(0.62)).font(TextStyle::new(13.0, 400.0).lh(19.0)).wrap().max_lines(4)))
-            .on_press(move |s: &mut State| play(s, &url)));
-    }
+    // Virtual rows: only the cards near the viewport are built, shaped and laid out, so a
+    // hundred streams open (and each addon's answer lands) as fast as a handful.
+    let list = if s.streams.is_empty() {
+        col().w_full().child(label("Finding streams…", 15.0, 500.0, ink(0.5)))
+    } else {
+        col().key("streams").w_full().growth(GrowthSpec::default()).virtual_rows(s.streams.len(), 128.0,
+            |_: &State, i| format!("st-{i}").into(),
+            |s: &State, i| {
+                let st = &s.streams[i];
+                let url = st.url.clone();
+                el().w_full().pb(10.0).child(tap(col().w_full().px(16.0).py(14.0).gap(6.0).radius(14.0)
+                    .fill(ink(0.06)).border(1.0, ink(0.08)).hover(ink(0.12))
+                    .child(row().gap(10.0).center_y().child(icon(s, |i| &i.play, 14.0)).child(label(st.name.clone(), 15.0, 600.0, Color::WHITE).truncate()))
+                    .child(label(st.title.clone(), 13.0, 400.0, ink(0.62)).font(TextStyle::new(13.0, 400.0).lh(19.0)).wrap().max_lines(4)))
+                    .on_press(move |s: &mut State| play(s, &url)))
+            })
+    };
     let panel = col().key("sheet").w(500.0).pin(None, Some(0.0), Some(0.0), Some(0.0)).pt(28.0 + top(s)).px(24.0).gap(20.0)
         .fill(bg().alpha(0.9)).backdrop_blur(30.0).border(1.0, ink(0.08)).shadow(0.0, 40.0, Color::BLACK.alpha(0.5))
         .transition(Transition::offset(500.0, 0.0).combined(Transition::opacity()))
         .child(head)
-        .child(list.scroll(ScrollSpec { stick_bottom: false }).grow(1.0).shrink().min_h(0.0));
+        .child(col().w_full().pb(14.0).scroll(ScrollSpec { stick_bottom: false }).grow(1.0).shrink().min_h(0.0).child(list));
     [scrim, panel]
 }
 
