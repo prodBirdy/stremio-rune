@@ -10,8 +10,8 @@ mod ui;
 mod window;
 
 use player::{Mpv, Playback};
-use ui::search;
-use rune::{AppSpec, Image, ImageCache, Key, KeyEvent, TextEdit, Tween, Tx, Waker};
+use ui::{Ctl, search};
+use rune::{AppHandle, AppSpec, Image, ImageCache, Key, KeyEvent, TextEdit, Tween, Tx, Waker, WindowHandle};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// Height of the control bar under the video, and width of the subtitles panel, in points.
+/// Height of the control bar, and width of the player's side panels, in points.
 const BAR: f32 = 64.0;
 const SUBS_W: f32 = 380.0;
 /// Mouse stillness after which the playback controls hide.
@@ -65,6 +65,7 @@ enum Msg {
     Search(String, usize, Vec<Value>),
 }
 
+#[derive(Clone, PartialEq)]
 struct Stream { name: String, title: String, url: String }
 
 struct Catalog { base: String, ty: String, id: String, name: String }
@@ -126,6 +127,13 @@ struct State {
     last_move: Instant,
     bar_hover: bool,
     subs_open: bool,
+    quality_open: bool,
+    /// The stream URL playing.
+    playing: String,
+    /// The floating controls' window, whether it shows, and what it was last sent.
+    overlay: Option<(AppHandle<Ctl>, WindowHandle)>,
+    overlay_on: bool,
+    pushed: ui::Shown,
     subs_for: String,
     addon_subs: Vec<(String, String)>,
     search: search::Search,
@@ -207,6 +215,11 @@ fn state() -> State {
         last_move: Instant::now(),
         bar_hover: false,
         subs_open: false,
+        quality_open: false,
+        playing: String::new(),
+        overlay: None,
+        overlay_on: false,
+        pushed: ui::Shown::default(),
         subs_for: String::new(),
         addon_subs: vec![],
         search: search::Search::default(),
@@ -528,6 +541,7 @@ fn play(s: &mut State, url: &str) {
         Ok(p) => {
             s.player = Some(p);
             library::start(s);
+            s.playing = url.to_string();
             s.page = Page::Player;
             s.status.clear();
             s.controls = true;
@@ -564,10 +578,26 @@ fn add_sub(s: &mut State, lang: &str, url: &str) {
     }
 }
 
+/// A quality pick: the same video from another stream, from the current position.
+fn switch_stream(s: &mut State, url: &str) {
+    s.quality_open = false;
+    if url == s.playing { return }
+    let Some(p) = &s.player else { return };
+    match p.switch(url, s.playback.pos) {
+        Ok(()) => {
+            s.playing = url.to_string();
+            s.playback.started = false; // the loader shows until the new stream's first frame
+        }
+        Err(e) => s.status = e,
+    }
+}
+
 fn stop(s: &mut State) {
     if s.player.is_some() { library::finish(s) }
     if s.fullscreen { toggle_fullscreen(s) }
     s.subs_open = false;
+    s.quality_open = false;
+    s.playing.clear();
     s.controls = true;
     s.player = None; // destroys mpv and its child window, uncovering the app
     s.playback = Playback::default();
@@ -584,8 +614,8 @@ fn pick(s: &mut State, ty: String, vid: String) {
     s.sheet = true;
 }
 
-/// App-wide keys. Keys pressed while the video has focus come back from mpv instead
-/// (see `player.rs`), as `fullscreen` and `escape` messages.
+/// App-wide keys. While playing, other keys go on to mpv's own bindings (arrows seek, `m`
+/// mutes…): the floating controls cover mpv's window, so it never has focus to hear them.
 fn on_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
     let playing = s.page == Page::Player;
     match &ev.key {
@@ -593,6 +623,10 @@ fn on_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
         Key::Text(t) if playing && t == "f" => toggle_fullscreen(s),
         Key::Text(t) if playing && t == " " => mpv(s, &["cycle", "pause"]),
         Key::Escape => escape(s),
+        k if playing => {
+            let name = match k { Key::Text(t) => t.as_str(), Key::Left => "LEFT", Key::Right => "RIGHT", Key::Up => "UP", Key::Down => "DOWN", _ => return false };
+            mpv(s, &["keypress", name]);
+        }
         _ => return false,
     }
     true
@@ -614,12 +648,11 @@ fn mpv(s: &State, args: &[&str]) {
 
 // ---- runtime hooks ----
 
-fn setup(s: &mut State, waker: Waker) {
-    let cache = ImageCache::new(waker.clone());
+fn icons(cache: &ImageCache) -> Icons {
     let icon = |path: &str| cache.svg(format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" d="{path}"/></svg>"##
     ).into_bytes(), 22.0, 3.0);
-    s.icons = Some(Icons {
+    Icons {
         play: icon("M7 5v14l12-7z"),
         pause: icon("M8 5v14M16 5v14"),
         back: icon("M15 18l-6-6 6-6"),
@@ -628,7 +661,12 @@ fn setup(s: &mut State, waker: Waker) {
         shrink: icon("M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"),
         subs: icon("M4 6h16v12H4zM7 14h3M12 14h5M7 10.5h6M15 10.5h2"),
         search: icon("M11 4a7 7 0 1 0 0 14a7 7 0 1 0 0-14zM20 20l-4.2-4.2"),
-    });
+    }
+}
+
+fn setup(s: &mut State, waker: Waker) {
+    let cache = ImageCache::new(waker.clone());
+    s.icons = Some(icons(&cache));
     s.search.debounce.set_waker(waker.clone());
     s.cache = Some(cache);
     s.waker = Some(waker);
@@ -645,21 +683,15 @@ fn setup(s: &mut State, waker: Waker) {
 fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
     if let Some(player) = &s.player {
-        // Redraw when a shown value changes: whole seconds, not every video frame.
-        let shown = |p: &Playback| (p.pos as u64, p.dur as u64, p.paused, p.loading(), p.cache_pct as u64, p.sid.clone(), p.tracks.clone(), p.aid.clone(), p.audio.clone());
-        let before = shown(&s.playback);
-        let ended = player.pump(&mut s.playback);
-        changed |= before != shown(&s.playback);
-        // Controls show while the mouse moves, and stay while paused, loading, scrubbing,
-        // hovered or picking subtitles. The mouse is read from the system because over the
-        // video it's in mpv's window, which Rune never hears about.
+        let ended = player.pump(&mut s.playback); // shown in the controls' window, see `shown`
+        // Controls show while the mouse moves, and stay while paused, loading, hovered or
+        // picking from a panel. The mouse is read from the system: it's over the controls'
+        // window, not this one.
         let cursor = window::cursor();
         if cursor != s.cursor { s.cursor = cursor; s.last_move = Instant::now() }
         let p = &s.playback;
-        let controls = p.paused || p.loading() || p.scrub.is_some() || s.bar_hover || s.subs_open || s.last_move.elapsed() < IDLE;
-        changed |= controls != s.controls;
-        s.controls = controls;
-        player.fit(if controls { BAR } else { 0.0 }, if s.subs_open { SUBS_W } else { 0.0 }, !p.loading());
+        s.controls = p.paused || p.loading() || s.bar_hover || s.subs_open || s.quality_open || s.last_move.elapsed() < IDLE;
+        player.fit();
         library::tick(s);
         tx.wake_after(Duration::from_millis(200));
         for m in std::mem::take(&mut s.playback.messages) {
@@ -730,7 +762,33 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
         }
     }
     changed |= rotate_hero(s, tx);
+    if let Some((app, win)) = &s.overlay {
+        let on = s.page == Page::Player;
+        if on != s.overlay_on { s.overlay_on = on; window::overlay::show(win, on) }
+        if on { window::overlay::keep_keys(win) }
+        let v = shown(s);
+        if v != s.pushed { s.pushed = v.clone(); app.update(move |c, _| c.shown = v) }
+    }
     changed
+}
+
+/// What the floating controls show, sent to their window when it changes.
+fn shown(s: &State) -> ui::Shown {
+    let mut playback = s.playback.clone();
+    // Whole seconds, so the controls redraw once a second rather than on every video frame.
+    (playback.pos, playback.cache_pct) = (playback.pos.trunc(), playback.cache_pct.trunc());
+    ui::Shown {
+        controls: s.controls,
+        playback,
+        title: s.meta.as_ref().and_then(|m| m["name"].as_str()).unwrap_or_default().to_string(),
+        fullscreen: s.fullscreen,
+        subs_open: s.subs_open,
+        quality_open: s.quality_open,
+        addon_subs: s.addon_subs.clone(),
+        logo: s.meta.as_ref().and_then(logo).and_then(|u| s.images.get(&u)).filter(|i| i.is_ready()).cloned().map(ui::Logo),
+        streams: s.streams.clone(),
+        playing: s.playing.clone(),
+    }
 }
 
 /// Advance the Home hero every `HERO_EVERY`, and schedule the next look. Only on Home.
@@ -775,8 +833,25 @@ fn demo_cat(ty: &str, name: &str) -> Catalog {
     Catalog { base: String::new(), ty: ty.into(), id: "top".into(), name: name.into() }
 }
 
+/// Demo playback for the controls' scenes.
+fn demo_controls(c: &mut Ctl) {
+    let v = &mut c.shown;
+    v.controls = true;
+    v.title = "The Long Quiet".into();
+    v.playback = Playback { pos: 1234.0, dur: 5400.0, started: true, sid: "no".into(), aid: "1".into(), ..Default::default() };
+    let st = |name: &str, title: &str, url: &str| Stream { name: name.into(), title: title.into(), url: url.into() };
+    v.streams = vec![
+        st("Torrentio 4k DV | HDR", "The.Long.Quiet.2026.2160p.WEB-DL.DV.HDR.H265\n👤 88 💾 18.2 GB", "a"),
+        st("Torrentio 1080p", "The.Long.Quiet.2026.1080p.BluRay.x264\n👤 412 💾 9.8 GB", "b"),
+        st("[RD+] Torrentio 1080p", "The.Long.Quiet.2026.1080p.WEB.h264\n👤 120 💾 2.1 GB", "c"),
+        st("Torrentio 720p", "The.Long.Quiet.2026.720p.WEBRip\n👤 64 💾 1.1 GB", "d"),
+        st("Some Addon", "Direct link", "e"),
+    ];
+    v.playing = "b".into();
+}
+
 fn main() {
-    rune::run(AppSpec {
+    let mut app = rune::App::new(AppSpec {
         setup: Some(setup),
         poll: Some(poll),
         on_key: Some(on_key),
@@ -802,30 +877,34 @@ fn main() {
                 s.search.results = HashMap::from([(0, s.items[&0].clone()), (1, s.items[&1][..3].to_vec())]);
             }),
             ("menu", |s| { demo(s); s.page = Page::Home; s.menu = true }),
-            ("player", |s| { demo(s); s.page = Page::Player; s.playback = Playback { pos: 1234.0, dur: 5400.0, started: true, ..Default::default() } }),
-            ("loading", |s| { demo(s); s.page = Page::Player; s.playback = Playback { cache_pct: 40.0, ..Default::default() } }),
-            ("audio", |s| {
-                demo(s);
-                s.page = Page::Player;
-                s.subs_open = true;
-                s.playback = Playback { pos: 1234.0, dur: 5400.0, started: true, sid: "no".into(), aid: "1".into(), ..Default::default() };
-                let t = |id: &str, label: String| player::Track { id: id.into(), label, external: String::new() };
-                s.playback.audio = vec![t("1", player::audio_label("eng", "", 6, "truehd")), t("2", player::audio_label("ger", "", 2, "aac")),
-                    t("3", player::audio_label("eng", "Commentary", 2, "ac3"))];
-                s.playback.tracks = vec![t("4", "ENG · SDH".into())];
-                s.addon_subs = vec![("ger".into(), "u1".into())];
-            }),
-            ("subtitles", |s| {
-                demo(s);
-                s.page = Page::Player;
-                s.subs_open = true;
-                s.playback = Playback { pos: 1234.0, dur: 5400.0, started: true, sid: "1".into(), ..Default::default() };
-                s.playback.tracks = vec![player::Track { id: "1".into(), label: "ENG · SDH".into(), external: String::new() }];
-                s.addon_subs = vec![("ger".into(), "u1".into()), ("ger".into(), "u2".into()), ("fre".into(), "u3".into())];
-            }),
         ],
         ..AppSpec::new("Stremio", (1280.0, 800.0), state, ui::view)
-    });
+    }).on_window(window::overlay::set_main);
+    // The playback controls float over the video in a transparent window of their own (mpv's
+    // window covers the app's), shown while playing. Snaps: `--window controls --scene quality`.
+    let main = app.handle();
+    let controls = rune::WindowSpec::new("controls", AppSpec {
+        setup: Some(ui::ctl_setup),
+        scenes: &[
+            ("player", demo_controls),
+            ("loading", |c| { demo_controls(c); c.shown.playback = Playback { cache_pct: 40.0, ..Default::default() } }),
+            ("quality", |c| { demo_controls(c); c.shown.quality_open = true }),
+            ("audio", |c| {
+                demo_controls(c);
+                c.shown.subs_open = true;
+                let p = &mut c.shown.playback;
+                let t = |id: &str, label: String| player::Track { id: id.into(), label, external: String::new() };
+                p.audio = vec![t("1", player::audio_label("eng", "", 6, "truehd")), t("2", player::audio_label("ger", "", 2, "aac")),
+                    t("3", player::audio_label("eng", "Commentary", 2, "ac3"))];
+                p.tracks = vec![t("4", "ENG · SDH".into())];
+                c.shown.addon_subs = vec![("ger".into(), "u1".into()), ("ger".into(), "u2".into()), ("fre".into(), "u3".into())];
+            }),
+        ],
+        ..AppSpec::new("Stremio controls", (1280.0, 800.0), Ctl::default, ui::controls)
+    }).state(Ctl { main: Some(main), ..Default::default() })
+        .options(rune::WindowOptions { transparent: true, borderless: true, visible: false, min_size: Some((0.0, 0.0)), ..Default::default() });
+    let overlay = app.window(controls);
+    app.init(move || State { overlay: Some(overlay), ..state() }).run();
 }
 
 #[cfg(test)]
@@ -859,6 +938,27 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "plays TEST_STREAM; opens a window briefly"]
+    fn switching_streams_keeps_the_position() {
+        let src = std::env::var("TEST_STREAM").expect("TEST_STREAM: a 10+ minute video");
+        let p = Mpv::play(&src, "test", None, Some(120.0)).unwrap();
+        let mut pb = Playback::default();
+        let wait = |pb: &mut Playback, done: &dyn Fn(&Playback) -> bool| {
+            let t = std::time::Instant::now();
+            while !done(pb) {
+                assert_eq!(p.pump(pb), None, "ended early");
+                assert!(t.elapsed().as_secs() < 20, "timed out at {}", pb.pos);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+        wait(&mut pb, &|pb| pb.started && pb.pos >= 120.0);
+        pb.started = false;
+        p.switch(&src, pb.pos).unwrap(); // the replaced file's end isn't the end of playback
+        wait(&mut pb, &|pb| pb.started && pb.pos >= 120.0);
+        assert!(pb.pos < 130.0, "picked up where it was, not later: {}", pb.pos);
+    }
+
+    #[test]
     #[ignore = "plays a clip with two audio tracks; opens a window briefly"]
     fn audio_tracks_are_listed_and_switch() {
         // TEST_AUDIO_STREAM: a clip whose audio tracks are eng then ger (see BRIEF: target	wo-audio.mkv).
@@ -877,6 +977,11 @@ mod tests {
         assert!(pb.audio[0].label.starts_with("English") && pb.audio[1].label.starts_with("German · Commentary"), "{:?}", pb.audio);
         p.command(&["set", "aid", "2"]).unwrap();
         wait(&mut pb, &|pb| pb.aid == "2");
+        // A quality switch keeps the language: track 2 (German) again, chosen by language.
+        p.command(&["set", "aid", "2"]).unwrap();
+        (pb.started, pb.aid) = (false, String::new());
+        p.switch(&src, pb.pos).unwrap();
+        wait(&mut pb, &|pb| pb.started && pb.aid == "2");
         p.command(&["quit"]).unwrap();
         let t = std::time::Instant::now();
         while p.pump(&mut pb).is_none() { assert!(t.elapsed().as_secs() < 10, "no shutdown"); std::thread::sleep(std::time::Duration::from_millis(50)) }
@@ -891,13 +996,79 @@ mod tests {
 
     #[test]
     fn panel_lists_audio_above_subtitles() {
-        let mut rt = runtime(|s| { s.page = Page::Player; s.subs_open = true;
-            s.playback.audio = vec![player::Track { id: "1".into(), label: "English".into(), external: String::new() }];
-            s.playback.tracks = vec![player::Track { id: "2".into(), label: "ENG".into(), external: String::new() }] });
+        let mut rt = controls(|c| { c.shown.subs_open = true;
+            c.shown.playback.audio = vec![player::Track { id: "1".into(), label: "English".into(), external: String::new() }];
+            c.shown.playback.tracks = vec![player::Track { id: "2".into(), label: "ENG".into(), external: String::new() }] });
         let (a, sub) = (rt.find("aud-1").expect("audio row"), rt.find("sub-2").expect("subtitle row"));
         assert!(a.1 < sub.1, "audio above subtitles");
-        click(&mut rt, "subs-close");
-        assert!(!rt.state.subs_open);
+        let mut s = State { subs_open: true, ..state() };
+        click(&mut rt, "panel-close");
+        apply(&mut rt, &mut s);
+        assert!(!s.subs_open);
+    }
+
+    /// The floating controls' window on its own, as in a scene.
+    fn controls(scene: fn(&mut Ctl)) -> rune::Runtime<Ctl> {
+        let mut c = Ctl::default();
+        scene(&mut c);
+        let mut rt = rune::Runtime::new(c, ui::controls, (1280.0, 800.0), rune::Env { system_dark: true, scale: 2.0 });
+        rt.frame(0.0);
+        rt
+    }
+
+    /// Run the presses the controls sent on the app's state.
+    fn apply(rt: &mut rune::Runtime<Ctl>, s: &mut State) {
+        for f in std::mem::take(&mut rt.state.sent) { f(s) }
+    }
+
+    #[test]
+    fn controls_float_only_while_active_and_panels_toggle() {
+        let mut rt = controls(demo_controls);
+        assert!(rt.find("bar").is_some() && rt.find("video").is_some() && rt.find("loader").is_none());
+        let mut s = state();
+        click(&mut rt, "quality");
+        apply(&mut rt, &mut s);
+        assert!(s.quality_open && !s.subs_open);
+        s.subs_open = true; // opening one panel closes the other
+        click(&mut rt, "quality");
+        apply(&mut rt, &mut s);
+        assert!(!s.quality_open && !s.subs_open);
+        s.quality_open = true;
+        click(&mut rt, "subs");
+        apply(&mut rt, &mut s);
+        assert!(s.subs_open && !s.quality_open);
+        // Pushed state: the bar goes when the mouse rests; the button names what plays.
+        let mut rt = controls(|c| { demo_controls(c); c.shown.controls = false });
+        for _ in 0..60 { rt.frame(1.0 / 60.0); }
+        assert!(rt.find("bar").is_none(), "controls hidden");
+        let rt = controls(|c| { demo_controls(c); c.shown.playback.buffering = true });
+        assert!(rt.find("loader").is_some(), "the loader floats over the frozen frame");
+        // `shown` copies the app's state, in whole seconds.
+        let mut s = state();
+        (s.controls, s.playback.pos, s.quality_open) = (true, 12.7, true);
+        let v = shown(&s);
+        assert!(v.controls && v.quality_open && v.playback.pos == 12.0);
+    }
+
+    #[test]
+    fn quality_groups_streams_by_resolution_and_picks_switch() {
+        let st = |name: &str, title: &str| Stream { name: name.into(), title: title.into(), url: format!("{name}|{title}") };
+        assert_eq!(ui::resolution(&st("Torrentio 4k DV | HDR", "x.1080p.y")), "4K", "the name wins over the title");
+        assert_eq!(ui::resolution(&st("Torrentio", "Movie.2026.2160p.WEB-DL")), "4K");
+        assert_eq!(ui::resolution(&st("[RD+] Torrentio 1080p", "")), "1080p");
+        assert_eq!(ui::resolution(&st("Addon", "Movie 720p\n👤 3")), "720p");
+        assert_eq!(ui::resolution(&st("Addon", "Movie.576p.DVDRip")), "480p");
+        assert_eq!(ui::resolution(&st("4kids TV", "Direct")), "Other", "whole words only");
+        let streams = vec![st("A 720p", ""), st("B", "x.2160p"), st("C", ""), st("D 1080p", ""), st("E 4K", "")];
+        let groups: Vec<_> = ui::qualities(&streams).into_iter().map(|(r, g)| (r, g.iter().map(|(i, _)| *i).collect::<Vec<_>>())).collect();
+        assert_eq!(groups, [("4K", vec![1, 4]), ("1080p", vec![3]), ("720p", vec![0]), ("Other", vec![2])]);
+
+        let mut rt = controls(|c| { demo_controls(c); c.shown.quality_open = true });
+        assert!(rt.find("q-0").unwrap().1 < rt.find("q-1").unwrap().1, "4K first");
+        let mut s = State { quality_open: true, playing: "b".into(), ..state() };
+        click(&mut rt, "q-1"); // the stream playing: nothing to switch, the panel closes
+        apply(&mut rt, &mut s);
+        assert!(!s.quality_open && s.playing == "b");
     }
 
     fn runtime(scene: fn(&mut State)) -> rune::Runtime<State> {
@@ -908,7 +1079,7 @@ mod tests {
         rt
     }
 
-    fn click(rt: &mut rune::Runtime<State>, key: &str) {
+    fn click<S: 'static>(rt: &mut rune::Runtime<S>, key: &str) {
         let (x, y) = rt.find(key).unwrap_or_else(|| panic!("no element {key}"));
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);

@@ -1,5 +1,5 @@
 //! Views: a dark, cinematic layout with a floating glass nav, a full-bleed hero, and rows of
-//! landscape cards. Playback controls sit under the video (mpv's window covers the top).
+//! landscape cards. Playback controls float over the video in a window of their own.
 
 use crate::*;
 use rune::tok::{TextStyle, motion};
@@ -53,10 +53,7 @@ pub fn poster_img(url: Option<&str>) -> Option<String> {
     url.map(|u| sized(u, (window::screen_w() - 2.0 * PAD - 6.0 * GAP) / 7.0))
 }
 
-fn icon(s: &State, pick: impl Fn(&Icons) -> &Image, size: f32) -> El {
-    let e = el().size(size, size);
-    match &s.icons { Some(i) => e.pixels(pick(i).pixels()), None => e }
-}
+fn icon(s: &State, pick: impl Fn(&Icons) -> &Image, size: f32) -> El { glyph(&s.icons, pick, size) }
 
 /// A thin bar; the caller sets its width (`w_full`, or pinned edges).
 fn progress(frac: f32, h: f32) -> El {
@@ -393,15 +390,6 @@ fn login(s: &State) -> El {
 
 // ---- player ----
 
-fn seek(s: &mut State, d: &mut Drag, _: &mut Tx) {
-    let f = (d.x / d.w.max(1.0)).clamp(0.0, 1.0);
-    if d.phase != Phase::Up { s.playback.scrub = Some(f); return }
-    s.playback.scrub = None;
-    if d.cancelled() || s.playback.dur <= 0.0 { return }
-    s.playback.pos = f as f64 * s.playback.dur;
-    mpv(s, &["seek", &s.playback.pos.to_string(), "absolute"]);
-}
-
 /// Stremio's loader breathing: 0.4 → 1 → 0.4 opacity over two seconds.
 const PULSE: Cycle = Cycle { period: 2.0, phase: 0.0, stops: &[(0.0, 0.4), (0.5, 1.0), (1.0, 0.4)], still: 1.0, fps: 30.0 };
 
@@ -418,18 +406,17 @@ fn spinner() -> El {
     ring
 }
 
-/// What shows while the stream loads (mpv's window stays hidden until the first frame): the
-/// title's logo pulsing, its bright copy uncovered left to right as the cache fills over a dim
-/// one, as Stremio does. No logo: a spinner.
-fn loader(s: &State) -> El {
-    let img = s.meta.as_ref().and_then(logo).and_then(|u| s.images.get(&u)).filter(|i| i.is_ready());
-    let Some(img) = img else { return all(el()).center().child(spinner()) };
+/// What shows over the video while the stream loads or buffers (black before the first frame,
+/// the frozen frame after): the title's logo pulsing, its bright copy uncovered left to right as
+/// the cache fills over a dim one, as Stremio does. No logo: a spinner.
+fn loader(logo: Option<&Image>, p: &Playback) -> El {
+    let Some(img) = logo else { return all(el()).key("loader").center().child(spinner()) };
     let [iw, ih] = img.size().unwrap_or([400, 160]);
     let k = (420.0 / iw as f32).min(180.0 / ih as f32);
     let (w, h) = (iw as f32 * k, ih as f32 * k);
-    let done = if s.playback.started { 1.0 } else { (s.playback.cache_pct / 100.0).clamp(0.0, 1.0) as f32 };
+    let done = if p.started { 1.0 } else { (p.cache_pct / 100.0).clamp(0.0, 1.0) as f32 };
     let art = || el().size(w, h).pixels(img.pixels());
-    all(el()).center().child(
+    all(el()).key("loader").center().child(
         el().size(w, h).cycle(PULSE)
             .child(art().opacity(0.2).absolute(0.0, 0.0))
             .child(el().w(w * done).h(h).clip_rounded(0.0).absolute(0.0, 0.0).child(art())),
@@ -450,84 +437,227 @@ pub fn language(code: &str) -> &str {
     }
 }
 
-/// Audio & subtitle choices, beside the video: the file's audio tracks, then subtitles (off,
-/// the file's own tracks, then the addons').
-fn subtitles(s: &State) -> El {
-    let p = &s.playback;
-    let option = |key: String, words: String, on: bool| tap(row().key(key).w_full().h(44.0).px(14.0).gap(12.0).radius(10.0).center_y()
+/// The video's place, under mpv's window. The loader and controls float above it in their own
+/// window (`controls`), so the video never resizes.
+fn player(_: &State) -> El { el().w_full().h_full().fill(Color::BLACK) }
+
+/// The floating controls' window: a copy of what they show, pushed from the app's state when it
+/// changes (`shown` in main.rs), and the app's handle their presses go back through.
+#[derive(Default)]
+pub struct Ctl {
+    pub shown: Shown,
+    /// Seek-bar drag in progress, as a fraction of the duration.
+    pub scrub: Option<f32>,
+    pub icons: Option<Icons>,
+    pub cache: Option<ImageCache>,
+    pub main: Option<rune::AppHandle<State>>,
+    /// Presses waiting for the app, when there's no `main` (headless tests).
+    pub sent: Vec<Box<dyn FnOnce(&mut State) + Send>>,
+}
+
+#[derive(Clone, Default, PartialEq)]
+pub struct Shown {
+    /// The mouse moved lately (or something keeps the controls up): bar and scrim show.
+    pub controls: bool,
+    pub playback: Playback,
+    pub title: String,
+    pub fullscreen: bool,
+    pub subs_open: bool,
+    pub quality_open: bool,
+    pub addon_subs: Vec<(String, String)>,
+    /// The title's logo for the loader, once decoded.
+    pub logo: Option<Logo>,
+    /// The playing video's streams, and the URL playing.
+    pub streams: Vec<Stream>,
+    pub playing: String,
+}
+
+/// An image compared by identity, so `Shown` can tell whether to send.
+#[derive(Clone)]
+pub struct Logo(pub Image);
+
+impl PartialEq for Logo {
+    fn eq(&self, other: &Self) -> bool { self.0.id() == other.0.id() }
+}
+
+impl Ctl {
+    fn send(&mut self, f: impl FnOnce(&mut State) + Send + 'static) {
+        match &self.main { Some(m) => m.update(move |s, _| f(s)), None => self.sent.push(Box::new(f)) }
+    }
+}
+
+/// A press handler that runs `f` on the app's state.
+fn act(f: impl Fn(&mut State) + Clone + Send + 'static) -> impl Fn(&mut Ctl) + 'static {
+    move |c: &mut Ctl| c.send(f.clone())
+}
+
+pub fn ctl_setup(c: &mut Ctl, waker: Waker) {
+    let cache = ImageCache::new(waker);
+    c.icons = Some(icons(&cache));
+    c.cache = Some(cache);
+}
+
+/// Resolutions in the order the quality list shows them.
+const RESOLUTIONS: [&str; 5] = ["4K", "1080p", "720p", "480p", "Other"];
+
+/// A stream's resolution, from a word in its name, else its title: `4K`, `1080p`, `720p`,
+/// `480p` or `Other`.
+pub fn resolution(st: &Stream) -> &'static str {
+    let find = |t: &str| t.split(|c: char| !c.is_ascii_alphanumeric()).find_map(|w| match w.to_ascii_lowercase().as_str() {
+        "2160p" | "4k" | "uhd" => Some("4K"),
+        "1080p" | "1080i" => Some("1080p"),
+        "720p" => Some("720p"),
+        "480p" | "576p" => Some("480p"),
+        _ => None,
+    });
+    find(&st.name).or_else(|| find(&st.title)).unwrap_or("Other")
+}
+
+/// Streams grouped by resolution, best first, with their index in `streams`.
+pub fn qualities(streams: &[Stream]) -> Vec<(&'static str, Vec<(usize, &Stream)>)> {
+    RESOLUTIONS.iter().map(|&r| (r, streams.iter().enumerate().filter(|(_, st)| resolution(st) == r).collect::<Vec<_>>()))
+        .filter(|(_, g)| !g.is_empty()).collect()
+}
+
+fn glyph(icons: &Option<Icons>, pick: impl Fn(&Icons) -> &Image, size: f32) -> El {
+    let e = el().size(size, size);
+    match icons { Some(i) => e.pixels(pick(i).pixels()), None => e }
+}
+
+fn seek(c: &mut Ctl, d: &mut Drag, _: &mut Tx) {
+    let f = (d.x / d.w.max(1.0)).clamp(0.0, 1.0);
+    if d.phase != Phase::Up { c.scrub = Some(f); return }
+    c.scrub = None;
+    let p = &mut c.shown.playback;
+    if d.cancelled() || p.dur <= 0.0 { return }
+    p.pos = f as f64 * p.dur;
+    let at = p.pos.to_string();
+    c.send(move |s| mpv(s, &["seek", &at, "absolute"]));
+}
+
+/// The floating controls, over the whole video: the loader while it loads, the bar on a scrim
+/// along the bottom while the mouse is active, fading in and out, and the Audio & Subtitles or Quality panel on the right.
+/// Clear elsewhere; double-click toggles fullscreen, and the cursor hides with the controls.
+pub fn controls(c: &Ctl, _: &mut Cx<Ctl>) -> El {
+    let v = &c.shown;
+    let mut stage = col().grow(1.0).min_w(0.0).h_full()
+        .child(el().key("video").w_full().grow(1.0).on_double_press(act(toggle_fullscreen)));
+    if v.playback.loading() { stage = stage.child(loader(v.logo.as_ref().map(|l| &l.0), &v.playback)) }
+    if v.controls {
+        stage = stage.child(col().key("controls").w_full().pt(72.0)
+            .linear_gradient(0.0, [(0.0, Color::BLACK.alpha(0.82)), (1.0, Color::BLACK.alpha(0.0))])
+            .transition(Transition::opacity())
+            .child(bar(c)));
+    }
+    let mut root = row().w_full().h_full().cursor(if v.controls { Cursor::Default } else { Cursor::Hidden }).child(stage);
+    if v.subs_open { root = root.child(subtitles(c)) } else if v.quality_open { root = root.child(quality(c)) }
+    root
+}
+
+fn bar(c: &Ctl) -> El {
+    let v = &c.shown;
+    let p = &v.playback;
+    let at = c.scrub.map_or(p.pos, |f| f as f64 * p.dur);
+    let frac = if p.dur > 0.0 { (at / p.dur) as f32 } else { 0.0 };
+    let round = |key: &str, on: bool| tap(row().key(key.to_string()).size(40.0, 40.0).radius(20.0).center()
+        .fill(if on { ink(0.16) } else { Color::TRANSPARENT }).hover(ink(0.14)));
+    let back = round("back", false).child(glyph(&c.icons, |i| &i.back, 20.0)).on_press(act(stop));
+    let toggle = round("toggle", false).child(glyph(&c.icons, |i| if p.paused { &i.play } else { &i.pause }, 20.0))
+        .on_press(act(|s| mpv(s, &["cycle", "pause"])));
+    let time = |secs: f64| label(clock(secs), 14.0, 500.0, ink(0.85)).font(TextStyle::new(14.0, 500.0).features("'tnum' 1"));
+    // The whole bar height is the drag target; the thin track is just its picture.
+    let track = row().key("seek").grow(1.0).min_w(0.0).h(BAR).center_y().cursor(Cursor::Pointer).on_drag(seek)
+        .child(progress(frac, if c.scrub.is_some() { 6.0 } else { 4.0 }).w_full());
+    let mut bar = row().key("bar").w_full().h(BAR).px(14.0).gap(10.0).center_y()
+        .on_hover_change(|c: &mut Ctl, inside, _| c.send(move |s| s.bar_hover = inside))
+        .child(back).child(toggle)
+        .child(label(v.title.clone(), 15.0, 600.0, Color::WHITE).truncate().max_w(260.0)).child(el().w(6.0));
+    if p.started && p.buffering { bar = bar.child(label(format!("Buffering {}%", p.cache_pct as u32), 13.0, 500.0, ink(0.7))) }
+    bar = bar.child(time(at)).child(track).child(time(p.dur));
+    if !v.streams.is_empty() {
+        let now = v.streams.iter().find(|st| st.url == v.playing).map_or("Quality", resolution);
+        bar = bar.child(tap(row().key("quality").h(32.0).px(12.0).radius(16.0).center().border(1.0, ink(0.35))
+            .fill(if v.quality_open { ink(0.16) } else { Color::TRANSPARENT }).hover(ink(0.14))
+            .child(label(now, 13.0, 650.0, Color::WHITE)))
+            .on_press(act(|s| { s.quality_open = !s.quality_open; s.subs_open = false })));
+    }
+    bar.child(round("subs", v.subs_open).child(glyph(&c.icons, |i| &i.subs, 20.0))
+            .on_press(act(|s| { s.subs_open = !s.subs_open; s.quality_open = false })))
+        .child(round("fullscreen", false).child(glyph(&c.icons, |i| if v.fullscreen { &i.shrink } else { &i.expand }, 18.0))
+            .on_press(act(toggle_fullscreen)))
+}
+
+/// A choice in a side panel: a dot when it's the current one, and an optional second line.
+fn option(key: String, words: String, under: &str, on: bool) -> El {
+    let mut words = col().grow(1.0).min_w(0.0).gap(2.0)
+        .child(label(words, 15.0, if on { 600.0 } else { 500.0 }, if on { Color::WHITE } else { ink(0.8) }).truncate());
+    if !under.is_empty() { words = words.child(label(under.to_string(), 12.0, 500.0, ink(0.5)).truncate()) }
+    tap(row().key(key).w_full().min_h(44.0).py(6.0).px(14.0).gap(12.0).radius(10.0).center_y()
         .fill(if on { ink(0.12) } else { Color::TRANSPARENT }).hover(ink(0.08))
         .child(el().size(8.0, 8.0).radius(4.0).fill(if on { Color::WHITE } else { Color::TRANSPARENT }))
-        .child(label(words, 15.0, if on { 600.0 } else { 500.0 }, if on { Color::WHITE } else { ink(0.8) }).truncate().grow(1.0).min_w(0.0)));
-    let heading = |t: &str| label(t, 12.0, 600.0, ink(0.45)).pt(12.0).px(14.0);
-    let section = |t: &str| label(t, 16.0, 700.0, ink(0.9)).pt(16.0).pb(4.0).px(14.0);
-    let mut list = col().w_full().gap(2.0).pb(24.0);
-    if !p.audio.is_empty() { list = list.child(section("Audio")) }
+        .child(words))
+}
+
+fn heading(t: &str) -> El { label(t, 12.0, 600.0, ink(0.45)).pt(12.0).px(14.0) }
+fn section_title(t: &str) -> El { label(t, 16.0, 700.0, ink(0.9)).pt(16.0).pb(4.0).px(14.0) }
+
+/// A panel floating over the video's right edge.
+fn panel(c: &Ctl, key: &str, title: &str, list: El) -> El {
+    col().key(key.to_string()).w(SUBS_W).h_full().pt(22.0).px(14.0).gap(12.0).fill(bg().alpha(0.94)).border(1.0, ink(0.06))
+        .transition(Transition::offset(SUBS_W, 0.0).combined(Transition::opacity()))
+        .child(row().w_full().px(6.0).center_y()
+            .child(label(title.to_string(), 22.0, 700.0, Color::WHITE).grow(1.0))
+            .child(tap(row().key("panel-close").size(36.0, 36.0).radius(18.0).center().hover(ink(0.12))
+                .child(glyph(&c.icons, |i| &i.close, 16.0))).on_press(act(|s| { s.subs_open = false; s.quality_open = false }))))
+        .child(list.w_full().gap(2.0).pb(24.0).scroll(ScrollSpec { stick_bottom: false }).grow(1.0).shrink().min_h(0.0))
+}
+
+/// Audio & subtitle choices: the file's audio tracks, then subtitles (off, the file's own
+/// tracks, then the addons').
+fn subtitles(c: &Ctl) -> El {
+    let (v, p) = (&c.shown, &c.shown.playback);
+    let mut list = col();
+    if !p.audio.is_empty() { list = list.child(section_title("Audio")) }
     for t in &p.audio {
         let id = t.id.clone();
-        list = list.child(option(format!("aud-{id}"), t.label.clone(), p.aid == t.id).on_press(move |s: &mut State| mpv(s, &["set", "aid", &id])));
+        list = list.child(option(format!("aud-{id}"), t.label.clone(), "", p.aid == t.id).on_press(act(move |s| mpv(s, &["set", "aid", &id]))));
     }
-    list = list.child(section("Subtitles"))
-        .child(option("sub-off".into(), "Off".into(), p.sid.is_empty() || p.sid == "no").on_press(|s: &mut State| mpv(s, &["set", "sid", "no"])));
+    list = list.child(section_title("Subtitles"))
+        .child(option("sub-off".into(), "Off".into(), "", p.sid.is_empty() || p.sid == "no").on_press(act(|s| mpv(s, &["set", "sid", "no"]))));
     let embedded: Vec<_> = p.tracks.iter().filter(|t| t.external.is_empty()).collect();
     if !embedded.is_empty() { list = list.child(heading("IN THIS VIDEO")) }
     for t in embedded {
         let id = t.id.clone();
-        list = list.child(option(format!("sub-{id}"), t.label.clone(), p.sid == t.id).on_press(move |s: &mut State| mpv(s, &["set", "sid", &id])));
+        list = list.child(option(format!("sub-{id}"), t.label.clone(), "", p.sid == t.id).on_press(act(move |s| mpv(s, &["set", "sid", &id]))));
     }
-    if !s.addon_subs.is_empty() { list = list.child(heading("FROM YOUR ADDONS")) }
-    let mut subs: Vec<&(String, String)> = s.addon_subs.iter().collect();
-    subs.sort_by_key(|(lang, _)| language(lang));
+    if !v.addon_subs.is_empty() { list = list.child(heading("FROM YOUR ADDONS")) }
+    let mut subs: Vec<(usize, &(String, String))> = v.addon_subs.iter().enumerate().collect();
+    subs.sort_by_key(|(_, (lang, _))| language(lang));
     let mut seen: HashMap<&str, usize> = HashMap::new();
-    for (lang, url) in subs {
+    for (i, (lang, url)) in subs {
         let n = seen.entry(language(lang)).and_modify(|n| *n += 1).or_insert(1);
         let on = p.tracks.iter().any(|t| t.external == *url && t.id == p.sid);
         let (l, u) = (lang.clone(), url.clone());
-        list = list.child(option(format!("asub-{url}"), format!("{} {n}", language(lang)), on).on_press(move |s: &mut State| add_sub(s, &l, &u)));
+        list = list.child(option(format!("asub-{i}"), format!("{} {n}", language(lang)), "", on).on_press(act(move |s| add_sub(s, &l, &u))));
     }
-    col().key("subtitles").w(SUBS_W).h_full().pt(22.0).px(14.0).gap(12.0).fill(bg()).border(1.0, ink(0.06))
-        .transition(Transition::offset(SUBS_W, 0.0).combined(Transition::opacity()))
-        .child(row().w_full().px(6.0).center_y()
-            .child(label("Audio & Subtitles", 22.0, 700.0, Color::WHITE).grow(1.0))
-            .child(tap(row().key("subs-close").size(36.0, 36.0).radius(18.0).center().hover(ink(0.12))
-                .child(icon(s, |i| &i.close, 16.0))).on_press(|s: &mut State| s.subs_open = false)))
-        .child(list.scroll(ScrollSpec { stick_bottom: false }).grow(1.0).shrink().min_h(0.0))
+    panel(c, "subtitles", "Audio & Subtitles", list)
 }
 
-/// The video (mpv's child window covers that area once playing), the audio & subtitles panel when
-/// open, and the controls under them while the mouse is active.
-fn player(s: &State) -> El {
-    let p = &s.playback;
-    let mut video = el().grow(1.0).min_w(0.0).fill(Color::BLACK);
-    if p.loading() { video = video.child(loader(s)) }
-    let mut stage = row().w_full().grow(1.0).min_h(0.0).child(video);
-    if s.subs_open { stage = stage.child(subtitles(s)) }
-    let mut root = col().w_full().h_full().fill(Color::BLACK).child(stage);
-    if s.controls { root = root.child(bar(s)) }
-    root
-}
-
-fn bar(s: &State) -> El {
-    let p = &s.playback;
-    let at = p.scrub.map_or(p.pos, |f| f as f64 * p.dur);
-    let frac = if p.dur > 0.0 { (at / p.dur) as f32 } else { 0.0 };
-    let round = |key: &str, on: bool| tap(row().key(key.to_string()).size(40.0, 40.0).radius(20.0).center()
-        .fill(if on { ink(0.14) } else { Color::TRANSPARENT }).hover(ink(0.12)));
-    let back = round("back", false).child(icon(s, |i| &i.back, 20.0)).on_press(stop);
-    let toggle = round("toggle", false).child(icon(s, |i| if p.paused { &i.play } else { &i.pause }, 20.0))
-        .on_press(|s: &mut State| mpv(s, &["cycle", "pause"]));
-    let time = |secs: f64| label(clock(secs), 14.0, 500.0, ink(0.8)).font(TextStyle::new(14.0, 500.0).features("'tnum' 1"));
-    let title = s.meta.as_ref().map(|m| s_(&m["name"]).to_string()).unwrap_or_default();
-    // The whole bar height is the drag target; the thin track is just its picture.
-    let track = row().key("seek").grow(1.0).min_w(0.0).h(BAR).center_y().cursor(Cursor::Pointer).on_drag(seek)
-        .child(progress(frac, if p.scrub.is_some() { 6.0 } else { 4.0 }).w_full());
-    let mut bar = row().key("bar").w_full().h(BAR).px(14.0).gap(10.0).center_y().fill(Color::BLACK)
-        .on_hover_change(|s: &mut State, inside, _| s.bar_hover = inside)
-        .child(back).child(toggle)
-        .child(label(title, 15.0, 600.0, Color::WHITE).truncate().max_w(260.0)).child(el().w(6.0));
-    if p.started && p.buffering { bar = bar.child(label(format!("Buffering {}%", p.cache_pct as u32), 13.0, 500.0, ink(0.6))) }
-    bar.child(time(at)).child(track).child(time(p.dur))
-        .child(round("subs", s.subs_open).child(icon(s, |i| &i.subs, 20.0)).on_press(|s: &mut State| s.subs_open = !s.subs_open))
-        .child(round("fullscreen", false).child(icon(s, |i| if s.fullscreen { &i.shrink } else { &i.expand }, 18.0)).on_press(toggle_fullscreen))
+/// The video's streams by resolution, each with its source line; a pick switches to it at the
+/// same position.
+fn quality(c: &Ctl) -> El {
+    let v = &c.shown;
+    let mut list = col();
+    for (res, group) in qualities(&v.streams) {
+        list = list.child(section_title(res));
+        for (i, st) in group {
+            let url = st.url.clone();
+            let source = st.title.lines().next().unwrap_or("");
+            list = list.child(option(format!("q-{i}"), st.name.clone(), source, st.url == v.playing)
+                .on_press(act(move |s| switch_stream(s, &url))));
+        }
+    }
+    panel(c, "quality", "Quality", list)
 }
 
 // ---- root ----

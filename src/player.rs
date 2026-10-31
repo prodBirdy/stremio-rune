@@ -1,6 +1,6 @@
-//! Playback through the libmpv Stremio ships. On Windows mpv draws into a child window of the
-//! app sized to everything outside the app's own controls (bar below, subtitles panel to the
-//! right), and stays hidden while loading so the app's loader shows; the app reads [`Playback`].
+//! Playback through the libmpv Stremio ships. On Windows mpv draws into a child window covering
+//! the app window; the loader and controls float above it in their own window (`ui::Ctl`), and
+//! read [`Playback`].
 
 use rune::Waker;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
@@ -12,13 +12,11 @@ use std::sync::OnceLock;
 pub struct Track { pub id: String, pub label: String, pub external: String }
 
 /// What the controls show, kept current from mpv's events.
-#[derive(Default)]
+#[derive(Clone, Default, PartialEq)]
 pub struct Playback {
     pub pos: f64,
     pub dur: f64,
     pub paused: bool,
-    /// Seek-bar drag in progress, as a fraction of the duration.
-    pub scrub: Option<f32>,
     /// The first frame is up; until then the app shows its loader.
     pub started: bool,
     /// Stalled waiting for the network, and how full the cache is (0–100).
@@ -129,6 +127,24 @@ impl Mpv {
         Ok(())
     }
 
+    /// Play `url` instead, from `at` seconds, keeping the audio and subtitle languages. Track ids
+    /// belong to the old file, so the new one picks by language; an addon subtitle comes along.
+    pub fn switch(&self, url: &str, at: f64) -> Result<(), String> {
+        let lang = |kind: &str| self.get(&format!("current-tracks/{kind}/lang"));
+        if let Some(l) = lang("audio") { self.command(&["set", "alang", &l])? }
+        self.command(&["change-list", "sub-files", "clr", ""])?;
+        match (self.get("current-tracks/sub/external-filename"), lang("sub")) {
+            (Some(file), _) => self.command(&["change-list", "sub-files", "append", &file])?,
+            (None, Some(l)) => self.command(&["set", "slang", &l])?,
+            _ => {}
+        }
+        let sub_on = self.get("current-tracks/sub/id").is_some();
+        self.command(&["set", "aid", "auto"])?;
+        self.command(&["set", "sid", if sub_on { "auto" } else { "no" }])?;
+        self.command(&["set", "start", &at.to_string()])?;
+        self.command(&["loadfile", url, "replace"]).map_err(|_| "mpv couldn't load that stream".to_string())
+    }
+
     fn get(&self, name: &str) -> Option<String> {
         let get: unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_char = sym(b"mpv_get_property_string\0").ok()?;
         let free: unsafe extern "C" fn(*mut c_void) = sym(b"mpv_free\0").ok()?;
@@ -154,11 +170,10 @@ impl Mpv {
         }).collect()
     }
 
-    /// Size mpv's window to the room the app's controls leave (points), and show it once there
-    /// is a picture. Cheap when nothing changed; call every poll.
-    pub fn fit(&self, _bottom_pt: f32, _right_pt: f32, _visible: bool) {
+    /// Size mpv's window to the app window. Cheap when nothing changed; call every poll.
+    pub fn fit(&self) {
         #[cfg(windows)]
-        if let Some(h) = &self.host { h.fit(_bottom_pt, _right_pt, _visible) }
+        if let Some(h) = &self.host { h.fit() }
     }
 
     /// Drain mpv's events into `p`. `Some(error)` once playback is over: Esc or `q`, end of
@@ -178,6 +193,7 @@ impl Mpv {
                 1 => ended = Some(None), // SHUTDOWN: q, or the window closed
                 7 => {                   // END_FILE
                     let end = unsafe { &*(e.data as *const EndFile) };
+                    if end.reason == 2 { continue } // STOP: `switch` replaced the file
                     let msg = (end.reason == 4).then(|| unsafe { CStr::from_ptr(describe(end.error)) });
                     ended = Some(msg.map(|m| format!("Playback failed: {}", m.to_string_lossy())));
                 }
@@ -237,16 +253,18 @@ impl Drop for Mpv {
 mod win {
     use std::cell::Cell;
     use windows_sys::Win32::Foundation::{HWND, RECT};
-    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, GetClientRect, GetParent, MoveWindow, SW_HIDE, SW_SHOWNA, ShowWindow, WS_CHILD,
+        CreateWindowExW, DestroyWindow, GetClientRect, GetParent, MoveWindow, SW_SHOWNA, ShowWindow, WS_CHILD,
         WS_CLIPCHILDREN,
     };
 
+    /// Black until mpv's own window paints (the STATIC class's SS_BLACKRECT).
+    const SS_BLACKRECT: u32 = 0x4;
+
     /// A child of the app window that mpv draws into. Created and destroyed on the UI thread.
     /// Starts hidden; `fit` remembers what it last applied so repeat calls do nothing.
-    pub struct Host(pub HWND, Cell<Option<(i32, i32, bool)>>);
+    pub struct Host(pub HWND, Cell<Option<(i32, i32)>>);
 
     impl Host {
         /// Under the window that was just clicked, which is ours: handlers run on the UI thread.
@@ -256,23 +274,21 @@ mod win {
             if parent.is_null() { return None }
             let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
             let hwnd = unsafe {
-                CreateWindowExW(0, class.as_ptr(), std::ptr::null(), WS_CHILD | WS_CLIPCHILDREN, 0, 0, 0, 0, parent,
+                CreateWindowExW(0, class.as_ptr(), std::ptr::null(), WS_CHILD | WS_CLIPCHILDREN | SS_BLACKRECT, 0, 0, 0, 0, parent,
                     std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null())
             };
             (!hwnd.is_null()).then(|| Host(hwnd, Cell::new(None)))
         }
 
-        /// Cover the parent's client area except `bottom_pt` and `right_pt` points.
-        pub fn fit(&self, bottom_pt: f32, right_pt: f32, visible: bool) {
+        /// Cover the parent's client area, and show.
+        pub fn fit(&self) {
             unsafe {
-                let parent = GetParent(self.0);
                 let mut r: RECT = std::mem::zeroed();
-                GetClientRect(parent, &mut r);
-                let px = |pt: f32| (pt * GetDpiForWindow(parent) as f32 / 96.0).round() as i32;
-                let (w, h) = ((r.right - px(right_pt)).max(0), (r.bottom - px(bottom_pt)).max(0));
-                if self.1.replace(Some((w, h, visible))) == Some((w, h, visible)) { return }
+                GetClientRect(GetParent(self.0), &mut r);
+                let (w, h) = (r.right, r.bottom);
+                if self.1.replace(Some((w, h))) == Some((w, h)) { return }
                 MoveWindow(self.0, 0, 0, w, h, 1);
-                ShowWindow(self.0, if visible { SW_SHOWNA } else { SW_HIDE });
+                ShowWindow(self.0, SW_SHOWNA);
             }
         }
     }
