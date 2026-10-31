@@ -30,7 +30,7 @@ pub fn toggle_fullscreen() -> bool {
             SetWindowPlacement(hwnd, &place);
             SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-            mark_fullscreen(hwnd, false);
+            for h in [hwnd, overlay::window()] { taskbar::mark_fullscreen(h, false) }
             return false;
         }
         let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
@@ -44,22 +44,23 @@ pub fn toggle_fullscreen() -> bool {
         let r = mi.rcMonitor;
         SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_OVERLAPPEDWINDOW as isize));
         SetWindowPos(hwnd, HWND_TOP, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-        mark_fullscreen(hwnd, true);
+        for h in [hwnd, overlay::window()] { taskbar::mark_fullscreen(h, true) }
+        // The fullscreen window has to be the one in front, not the controls that were clicked.
+        windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
         *saved = Some((style, place));
         true
     }
 }
 
-/// Tell the taskbar the window is (or no longer is) fullscreen, so it steps aside. The shell's
-/// own detection misses it: the window is cloaked at the moment it covers the monitor.
-/// `ITaskbarList2::MarkFullscreenWindow`, called through its vtable (windows-sys has no COM
-/// wrappers).
+/// The taskbar, through `ITaskbarList2`'s vtable (windows-sys has no COM wrappers).
 #[cfg(windows)]
-fn mark_fullscreen(hwnd: windows_sys::Win32::Foundation::HWND, on: bool) {
+mod taskbar {
     use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx};
     use windows_sys::Win32::UI::Shell::TaskbarList;
     const IID_ITASKBARLIST2: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0x602d4995_b13a_429b_a66e_1935e44f4317);
+
     #[repr(C)]
     struct Vtbl {
         _query_interface: usize,
@@ -67,18 +68,32 @@ fn mark_fullscreen(hwnd: windows_sys::Win32::Foundation::HWND, on: bool) {
         release: unsafe extern "system" fn(*mut c_void) -> u32,
         hr_init: unsafe extern "system" fn(*mut c_void) -> i32,
         _add_tab: usize,
-        _delete_tab: usize,
+        delete_tab: unsafe extern "system" fn(*mut c_void, HWND) -> i32,
         _activate_tab: usize,
         _set_active_alt: usize,
-        mark_fullscreen_window: unsafe extern "system" fn(*mut c_void, windows_sys::Win32::Foundation::HWND, i32) -> i32,
+        mark_fullscreen_window: unsafe extern "system" fn(*mut c_void, HWND, i32) -> i32,
     }
-    unsafe {
-        CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32); // already initialized by winit: harmless
-        let mut list: *mut c_void = std::ptr::null_mut();
-        if CoCreateInstance(&TaskbarList, std::ptr::null_mut(), CLSCTX_INPROC_SERVER, &IID_ITASKBARLIST2, &mut list) < 0 || list.is_null() { return }
-        let vtbl = &**(list as *const *const Vtbl);
-        if (vtbl.hr_init)(list) >= 0 { (vtbl.mark_fullscreen_window)(list, hwnd, on as i32); }
-        (vtbl.release)(list);
+
+    fn with(f: impl FnOnce(&Vtbl, *mut c_void)) {
+        unsafe {
+            CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32); // winit already did: harmless
+            let mut list: *mut c_void = std::ptr::null_mut();
+            if CoCreateInstance(&TaskbarList, std::ptr::null_mut(), CLSCTX_INPROC_SERVER, &IID_ITASKBARLIST2, &mut list) < 0 || list.is_null() { return }
+            let vtbl = &**(list as *const *const Vtbl);
+            if (vtbl.hr_init)(list) >= 0 { f(vtbl, list) }
+            (vtbl.release)(list);
+        }
+    }
+
+    /// The shell's own fullscreen detection misses the window (it's cloaked at the moment it
+    /// covers the monitor, and the controls' window may be the one in front), so say it.
+    pub fn mark_fullscreen(hwnd: HWND, on: bool) {
+        if !hwnd.is_null() { with(|v, l| unsafe { (v.mark_fullscreen_window)(l, hwnd, on as i32); }) }
+    }
+
+    /// No taskbar button for this window (the controls': one app, one button).
+    pub fn drop_tab(hwnd: HWND) {
+        if !hwnd.is_null() { with(|v, l| unsafe { (v.delete_tab)(l, hwnd); }) }
     }
 }
 
@@ -234,6 +249,12 @@ pub mod overlay {
     pub fn show(w: &rune::WindowHandle, on: bool) {
         if let (true, Some(o)) = (on, hwnd(w)) { if !main().is_null() { attach(main(), o) } }
         w.set_visible(on);
+        // Showing can restyle the window (winit applies its own flags) and give it a taskbar
+        // button; own it and drop the button again so the app shows as one window.
+        if let (true, Some(o)) = (on, hwnd(w)) {
+            if !main().is_null() { attach(main(), o) }
+            super::taskbar::drop_tab(o);
+        }
     }
 
     /// Hand activation back to the app window if showing the controls took it: keys go there.
