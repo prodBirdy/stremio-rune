@@ -267,10 +267,9 @@ mod win {
     pub struct Host(pub HWND, Cell<Option<(i32, i32)>>);
 
     impl Host {
-        /// Under the window that was just clicked, which is ours: handlers run on the UI thread.
-        /// ask Rune for its HWND if GetActiveWindow ever picks the wrong one
+        /// Under the app window (its handle from Rune at start-up; else the active window).
         pub fn new() -> Option<Host> {
-            let parent = unsafe { GetActiveWindow() };
+            let parent = Some(crate::window::overlay::main()).filter(|h| !h.is_null()).unwrap_or_else(|| unsafe { GetActiveWindow() });
             if parent.is_null() { return None }
             let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
             let hwnd = unsafe {

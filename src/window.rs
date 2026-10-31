@@ -18,7 +18,9 @@ pub fn toggle_fullscreen() -> bool {
 
     let mut saved = SAVED.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
-        let hwnd = GetAncestor(GetActiveWindow(), GA_ROOT);
+        // The app window itself: with the controls in their own window, the active window can be
+        // that one, and fullscreening it would leave the app as it was.
+        let hwnd = Some(overlay::main()).filter(|h| !h.is_null()).unwrap_or_else(|| GetAncestor(GetActiveWindow(), GA_ROOT));
         if hwnd.is_null() { return saved.is_some() }
         if let Some((style, place)) = saved.take() {
             SetWindowLongPtrW(hwnd, GWL_STYLE, style);
@@ -96,7 +98,8 @@ pub mod overlay {
         if let Some(h) = hwnd(w) { MAIN.store(h as isize, Ordering::Relaxed) }
     }
 
-    fn main() -> HWND { MAIN.load(Ordering::Relaxed) as HWND }
+    /// The app window (null until Rune reports it).
+    pub fn main() -> HWND { MAIN.load(Ordering::Relaxed) as HWND }
 
     /// Show the controls' window over the app window, or hide it.
     pub fn show(w: &rune::WindowHandle, on: bool) {
