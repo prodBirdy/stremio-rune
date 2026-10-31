@@ -1821,6 +1821,16 @@ mod tests {
     }
 
     #[test]
+    fn a_click_on_the_video_closes_an_open_panel_before_it_pauses() {
+        let mut rt = runtime(|s| { demo(s); s.page = Page::Player; s.controls = true; s.subs_open = true });
+        click(&mut rt, "video");
+        assert!(!rt.state.subs_open, "the first click closes the panel");
+        rt.state.quality_open = true;
+        click(&mut rt, "video");
+        assert!(!rt.state.quality_open);
+    }
+
+    #[test]
     fn hero_advances_every_few_seconds_and_wraps() {
         let mut rt = runtime(|s| { demo(s); s.page = Page::Home });
         let tick = |rt: &mut rune::Runtime<State>| rt.update(|s, tx| { rotate_hero(s, tx); });

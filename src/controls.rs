@@ -87,6 +87,16 @@ fn fullscreen(s: &mut State, tx: &mut Tx) {
     toggle_fullscreen(s);
 }
 
+/// A click on the video plays or pauses; with a side panel open it closes the panel instead.
+/// A double-click toggles pause twice (no change) and switches fullscreen.
+fn click_video(s: &mut State) {
+    if s.subs_open || s.quality_open {
+        (s.subs_open, s.quality_open) = (false, false);
+        return;
+    }
+    mpv(s, &["cycle", "pause"]);
+}
+
 /// Volume drag: follows the pointer as it goes (you hear it), and unmutes.
 fn volume_drag(s: &mut State, d: &mut Drag, _: &mut Tx) {
     let v = ((d.x / d.w.max(1.0)).clamp(0.0, 1.0) * 100.0).round() as f64;
@@ -109,7 +119,7 @@ fn seek(s: &mut State, d: &mut Drag, _: &mut Tx) {
 pub(super) fn player(s: &State) -> El {
     let p = &s.playback;
     let mut stage = col().grow(1.0).min_w(0.0).h_full()
-        .child(el().key("video").w_full().grow(1.0).on_double_press_tx(fullscreen));
+        .child(el().key("video").w_full().grow(1.0).on_press(click_video).on_double_press_tx(fullscreen));
     if p.loading() { stage = stage.child(loader(s)) }
     if s.controls {
         // Back and the title along the top, below the title strip, on a scrim of their own.
