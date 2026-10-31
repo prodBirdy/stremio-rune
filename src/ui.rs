@@ -662,7 +662,29 @@ fn quality(c: &Ctl) -> El {
 
 // ---- root ----
 
+/// Every page under the app's title strip, which takes the place of the system's title bar
+/// (gone, see `window::caption`): the app's background, the system's drag region, and caption
+/// buttons at the right. Fullscreen has none.
 pub fn view(s: &State, _: &mut Cx<State>) -> El {
+    if s.fullscreen || s.caption.h <= 0.0 { return page(s) }
+    col().w_full().h_full().fill(bg()).child(title_bar(s)).child(el().w_full().grow(1.0).min_h(0.0).child(page(s)))
+}
+
+fn title_bar(s: &State) -> El {
+    let c = &s.caption;
+    // Hover only: the system hit-tests the strip, so these act on release like its own.
+    let button = |key: &str, glyph: fn(&Icons) -> &Image, hover: Color| row().key(key.to_string())
+        .w(window::CAPTION_BUTTON_W).h_full().center().hover(hover).child(icon(s, glyph, 10.0));
+    row().key("title-bar").w_full().h(c.h).justify_end()
+        .child(button("caption-min", |i| &i.minimize, ink(0.08)).on_press(|_: &mut State| window::syscommand(window::SC_MINIMIZE)))
+        // Maximize is the system's to hit-test (Windows 11 snap layouts), so its hover comes from there.
+        .child(button("caption-max", if c.zoomed { |i| &i.restore } else { |i| &i.maximize }, ink(0.08))
+            .fill(if c.max_hover { ink(0.08) } else { Color::TRANSPARENT })
+            .on_press(|s: &mut State| window::syscommand(if s.caption.zoomed { window::SC_RESTORE } else { window::SC_MAXIMIZE })))
+        .child(button("caption-close", |i| &i.quit, oklch(0.55, 0.2, 27.0)).on_press(|_: &mut State| window::syscommand(window::SC_CLOSE)))
+}
+
+fn page(s: &State) -> El {
     let body = match s.page {
         Page::Player => return player(s),
         Page::Login => return login(s).child(if s.status.is_empty() { el() } else { toast(s) }),

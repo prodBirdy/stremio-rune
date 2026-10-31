@@ -76,27 +76,100 @@ pub fn scale() -> f32 { 2.0 }
 #[cfg(not(windows))]
 pub fn screen_w() -> f32 { 1920.0 }
 
-/// The floating controls: a transparent Rune window owned by the app window, so it stays above
-/// it (and mpv's child window), hides with it when minimized, and gets no taskbar entry. The
-/// app window's moves and resizes, fullscreen included, carry it along.
+/// Width of each caption button (minimize, maximize, close), in points, as Windows 11 draws them.
+pub const CAPTION_BUTTON_W: f32 = 46.0;
+
+/// The app's own title strip, where the system title bar was.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Caption {
+    /// Its height in points: the system caption's (0 in fullscreen).
+    pub h: f32,
+    pub zoomed: bool,
+    /// The pointer is over the maximize button, which the system hit-tests (snap layouts), so
+    /// Rune doesn't see it.
+    pub max_hover: bool,
+}
+
+/// The app window's title strip, and the window behind it: the system draws no title bar (see
+/// `overlay::frame`); the app draws the strip and its buttons, and the system still drags,
+/// snaps, double-click maximizes and resizes from every edge.
+#[cfg(windows)]
+pub fn caption() -> Caption {
+    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsZoomed;
+    let main = overlay::main();
+    let dpi = if main.is_null() { 96 } else { unsafe { GetDpiForWindow(main) } };
+    Caption {
+        h: overlay::strip_px(main, dpi) as f32 * 96.0 / dpi as f32,
+        zoomed: !main.is_null() && unsafe { IsZoomed(main) } != 0,
+        max_hover: overlay::MAX_HOVER.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+#[cfg(not(windows))]
+pub fn caption() -> Caption { Caption { h: 32.0, ..Default::default() } }
+
+/// A caption button's command (`SC_MINIMIZE`, `SC_CLOSE`…) to the app window, as the system's
+/// own buttons send it.
+#[cfg(windows)]
+pub fn syscommand(sc: u32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_SYSCOMMAND};
+    unsafe { PostMessageW(overlay::main(), WM_SYSCOMMAND, sc as usize, 0) };
+}
+
+#[cfg(windows)]
+pub use windows_sys::Win32::UI::WindowsAndMessaging::{SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE};
+
+#[cfg(not(windows))]
+pub fn syscommand(_: u32) {}
+#[cfg(not(windows))]
+pub const SC_CLOSE: u32 = 0; #[cfg(not(windows))]
+pub const SC_MAXIMIZE: u32 = 0; #[cfg(not(windows))]
+pub const SC_MINIMIZE: u32 = 0; #[cfg(not(windows))]
+pub const SC_RESTORE: u32 = 0;
+
+/// The app window's frame (title bar removed, see `frame`), and the floating controls: a
+/// transparent Rune window owned by the app window, so it stays above it (and mpv's child
+/// window), hides with it when minimized, and gets no taskbar entry. The app window's moves and
+/// resizes, fullscreen included, carry it along.
 #[cfg(windows)]
 pub mod overlay {
-    use std::sync::atomic::{AtomicIsize, Ordering};
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
+    use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent};
     use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GWLP_HWNDPARENT, GetClientRect, GetForegroundWindow, GetWindowLongPtrW, SWP_NOACTIVATE, SWP_NOZORDER,
-        SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WM_WINDOWPOSCHANGED, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW,
+        GWL_EXSTYLE, GWL_STYLE, GWLP_HWNDPARENT, GetClientRect, GetForegroundWindow, GetWindowLongPtrW, HTCAPTION, HTCLIENT,
+        HTMAXBUTTON, HTTOP, HTTOPLEFT, HTTOPRIGHT, IsZoomed, NCCALCSIZE_PARAMS, SM_CXPADDEDBORDER, SM_CYCAPTION,
+        SM_CYSIZEFRAME, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
+        SetWindowLongPtrW, SetWindowPos, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
+        WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_SIZE, WM_SYSCOMMAND, WM_WINDOWPOSCHANGED, WS_CAPTION, WS_EX_APPWINDOW,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     };
 
-    /// The app window, from `App::on_window`.
+    /// The app window, from `App::on_window`, and the controls' window once shown.
     static MAIN: AtomicIsize = AtomicIsize::new(0);
+    static OVERLAY: AtomicIsize = AtomicIsize::new(0);
+    pub(super) static MAX_HOVER: AtomicBool = AtomicBool::new(false);
+    /// Wakes the app's `poll` when the caption changes behind Rune's back.
+    static WAKE: OnceLock<rune::Waker> = OnceLock::new();
 
+    /// The app window was created: take over its frame.
     pub fn set_main(w: &rune::WindowHandle) {
-        if let Some(h) = hwnd(w) { MAIN.store(h as isize, Ordering::Relaxed) }
+        let Some(h) = hwnd(w) else { return };
+        MAIN.store(h as isize, Ordering::Relaxed);
+        unsafe {
+            SetWindowSubclass(h, Some(frame), 0x5354, 0); // same id: replaces, no stacking
+            SetWindowPos(h, std::ptr::null_mut(), 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
     }
+
+    pub fn set_waker(w: rune::Waker) { let _ = WAKE.set(w); }
+
+    fn wake() { if let Some(w) = WAKE.get() { w() } }
 
     /// The app window (null until Rune reports it).
     pub fn main() -> HWND { MAIN.load(Ordering::Relaxed) as HWND }
@@ -120,37 +193,115 @@ pub mod overlay {
         }).ok().flatten()
     }
 
-    /// Own `overlay` by `main` (the app window) and keep it over `main`'s client area.
+    /// Own `overlay` by `main` (the app window) and keep it over `main`'s video area.
     /// Idempotent; call on the UI thread while `overlay` is hidden (the style change needs it).
     pub fn attach(main: HWND, overlay: HWND) {
         unsafe {
             SetWindowLongPtrW(overlay, GWLP_HWNDPARENT, main as isize);
             let ex = GetWindowLongPtrW(overlay, GWL_EXSTYLE);
             SetWindowLongPtrW(overlay, GWL_EXSTYLE, (ex | (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) as isize) & !(WS_EX_APPWINDOW as isize));
-            SetWindowSubclass(main, Some(follow), 0x5354, overlay as usize); // same id: replaces, no stacking
         }
+        OVERLAY.store(overlay as isize, Ordering::Relaxed);
         place(main, overlay);
     }
 
+    /// Cover `main`'s client area below the title strip.
     fn place(main: HWND, overlay: HWND) {
         unsafe {
             let mut r: RECT = std::mem::zeroed();
             GetClientRect(main, &mut r);
-            let mut at = POINT { x: 0, y: 0 };
+            let top = strip_px(main, GetDpiForWindow(main));
+            let mut at = POINT { x: 0, y: top };
             ClientToScreen(main, &mut at);
-            SetWindowPos(overlay, std::ptr::null_mut(), at.x, at.y, r.right, r.bottom, SWP_NOZORDER | SWP_NOACTIVATE);
+            SetWindowPos(overlay, std::ptr::null_mut(), at.x, at.y, r.right, (r.bottom - top).max(0), SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
 
-    unsafe extern "system" fn follow(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _: usize, overlay: usize) -> LRESULT {
-        if msg == WM_WINDOWPOSCHANGED { place(hwnd, overlay as HWND) }
-        unsafe { DefSubclassProc(hwnd, msg, wp, lp) }
+    /// The resize border the system keeps above the caption, at `dpi`.
+    fn frame_px(dpi: u32) -> i32 {
+        unsafe { GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi) }
+    }
+
+    fn captioned(hwnd: HWND) -> bool {
+        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
+        style & WS_CAPTION as isize == WS_CAPTION as isize
+    }
+
+    /// Height of the app's title strip in `hwnd`'s pixels: where the system's title bar and top
+    /// border were (only the caption when maximized, where the border is off screen), 0 without
+    /// a title bar (fullscreen). A null `hwnd` (headless) gets the windowed height.
+    pub fn strip_px(hwnd: HWND, dpi: u32) -> i32 {
+        if !hwnd.is_null() && !captioned(hwnd) { return 0 }
+        let caption = unsafe { GetSystemMetricsForDpi(SM_CYCAPTION, dpi) };
+        if !hwnd.is_null() && unsafe { IsZoomed(hwnd) } != 0 { caption } else { caption + frame_px(dpi) }
+    }
+
+    fn set_max_hover(on: bool) {
+        if MAX_HOVER.swap(on, Ordering::Relaxed) != on { wake() }
+    }
+
+    /// The app window's frame without the title bar: the client area grows over it (the app
+    /// draws the strip), the sides and bottom keep the system's resize borders, and hit-testing
+    /// gives the strip back to the system (drag, snap, double-click) except the caption
+    /// buttons; maximize answers as the system's own, for Windows 11's snap layouts.
+    unsafe extern "system" fn frame(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _: usize, _: usize) -> LRESULT {
+        let def = || unsafe { DefSubclassProc(hwnd, msg, wp, lp) };
+        let custom = captioned(hwnd);
+        match msg {
+            WM_WINDOWPOSCHANGED => {
+                let o = OVERLAY.load(Ordering::Relaxed) as HWND;
+                if !o.is_null() { place(hwnd, o) }
+            }
+            WM_SIZE => wake(), // maximized or restored: the strip's height and icon change
+            WM_NCCALCSIZE if custom && wp != 0 => unsafe {
+                let p = lp as *mut NCCALCSIZE_PARAMS;
+                let top = (*p).rgrc[0].top;
+                let r = def();
+                // Maximized windows hang their border off screen; keep the content on it.
+                (*p).rgrc[0].top = top + if IsZoomed(hwnd) != 0 { frame_px(GetDpiForWindow(hwnd)) } else { 0 };
+                return r;
+            },
+            WM_NCHITTEST if custom => {
+                let hit = def();
+                if hit != HTCLIENT as LRESULT { return hit }
+                let mut pt = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
+                let mut r: RECT = unsafe { std::mem::zeroed() };
+                let dpi = unsafe { ScreenToClient(hwnd, &mut pt); GetClientRect(hwnd, &mut r); GetDpiForWindow(hwnd) };
+                let edge = frame_px(dpi);
+                if unsafe { IsZoomed(hwnd) } == 0 && pt.y < edge {
+                    return (if pt.x < 2 * edge { HTTOPLEFT } else if pt.x >= r.right - 2 * edge { HTTOPRIGHT } else { HTTOP }) as LRESULT;
+                }
+                if pt.y < strip_px(hwnd, dpi) {
+                    let button = (super::CAPTION_BUTTON_W * dpi as f32 / 96.0).round() as i32;
+                    return match (r.right - 1 - pt.x) / button.max(1) { 0 | 2 => HTCLIENT, 1 => HTMAXBUTTON, _ => HTCAPTION } as LRESULT;
+                }
+                return hit;
+            }
+            WM_NCMOUSEMOVE => {
+                let on = wp == HTMAXBUTTON as usize;
+                if on && !MAX_HOVER.load(Ordering::Relaxed) {
+                    let mut t = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE | TME_NONCLIENT, hwndTrack: hwnd, dwHoverTime: 0 };
+                    unsafe { TrackMouseEvent(&mut t) };
+                }
+                set_max_hover(on);
+            }
+            WM_NCMOUSELEAVE => set_max_hover(false),
+            // The maximize button is ours to draw: the system's would paint its own over it.
+            WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK if wp == HTMAXBUTTON as usize => return 0,
+            WM_NCLBUTTONUP if wp == HTMAXBUTTON as usize => {
+                let sc = if unsafe { IsZoomed(hwnd) } != 0 { super::SC_RESTORE } else { super::SC_MAXIMIZE };
+                return unsafe { DefSubclassProc(hwnd, WM_SYSCOMMAND, sc as usize, 0) };
+            }
+            _ => {}
+        }
+        def()
     }
 }
 
 #[cfg(not(windows))]
 pub mod overlay {
     pub fn set_main(_: &rune::WindowHandle) {}
+    pub fn set_waker(_: rune::Waker) {}
     pub fn show(w: &rune::WindowHandle, on: bool) { w.set_visible(on) }
     pub fn keep_keys(_: &rune::WindowHandle) {}
 }

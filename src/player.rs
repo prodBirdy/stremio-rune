@@ -264,7 +264,7 @@ mod win {
 
     /// A child of the app window that mpv draws into. Created and destroyed on the UI thread.
     /// Starts hidden; `fit` remembers what it last applied so repeat calls do nothing.
-    pub struct Host(pub HWND, Cell<Option<(i32, i32)>>);
+    pub struct Host(pub HWND, Cell<Option<(i32, i32, i32)>>);
 
     impl Host {
         /// Under the app window (its handle from Rune at start-up; else the active window).
@@ -279,14 +279,16 @@ mod win {
             (!hwnd.is_null()).then(|| Host(hwnd, Cell::new(None)))
         }
 
-        /// Cover the parent's client area, and show.
+        /// Cover the parent's client area below its title strip, and show.
         pub fn fit(&self) {
             unsafe {
+                let parent = GetParent(self.0);
                 let mut r: RECT = std::mem::zeroed();
-                GetClientRect(GetParent(self.0), &mut r);
-                let (w, h) = (r.right, r.bottom);
-                if self.1.replace(Some((w, h))) == Some((w, h)) { return }
-                MoveWindow(self.0, 0, 0, w, h, 1);
+                GetClientRect(parent, &mut r);
+                let top = crate::window::overlay::strip_px(parent, windows_sys::Win32::UI::HiDpi::GetDpiForWindow(parent));
+                let (w, h) = (r.right, (r.bottom - top).max(0));
+                if self.1.replace(Some((top, w, h))) == Some((top, w, h)) { return }
+                MoveWindow(self.0, 0, top, w, h, 1);
                 ShowWindow(self.0, SW_SHOWNA);
             }
         }

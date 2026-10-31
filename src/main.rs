@@ -73,7 +73,11 @@ struct Catalog { base: String, ty: String, id: String, name: String }
 #[derive(Clone, Copy, PartialEq)]
 enum Page { Login, Home, Browse(&'static str), Detail, Player, Search }
 
-struct Icons { play: Image, pause: Image, back: Image, close: Image, expand: Image, shrink: Image, subs: Image, search: Image }
+struct Icons {
+    play: Image, pause: Image, back: Image, close: Image, expand: Image, shrink: Image, subs: Image, search: Image,
+    // The caption buttons' glyphs, thin as Windows draws them.
+    minimize: Image, maximize: Image, restore: Image, quit: Image,
+}
 
 struct State {
     page: Page,
@@ -121,6 +125,8 @@ struct State {
     /// The profile menu under the avatar.
     menu: bool,
     fullscreen: bool,
+    /// The app's title strip, where the system's title bar was.
+    caption: window::Caption,
     /// Playback controls: shown while the mouse moves (see `poll`).
     controls: bool,
     cursor: (i32, i32),
@@ -210,6 +216,7 @@ fn state() -> State {
         sheet: false,
         menu: false,
         fullscreen: false,
+        caption: window::caption(),
         controls: true,
         cursor: (0, 0),
         last_move: Instant::now(),
@@ -652,6 +659,9 @@ fn icons(cache: &ImageCache) -> Icons {
     let icon = |path: &str| cache.svg(format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" d="{path}"/></svg>"##
     ).into_bytes(), 22.0, 3.0);
+    let thin = |path: &str| cache.svg(format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path fill="none" stroke="#fff" stroke-width="1" d="{path}"/></svg>"##
+    ).into_bytes(), 12.0, 3.0);
     Icons {
         play: icon("M7 5v14l12-7z"),
         pause: icon("M8 5v14M16 5v14"),
@@ -661,10 +671,15 @@ fn icons(cache: &ImageCache) -> Icons {
         shrink: icon("M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"),
         subs: icon("M4 6h16v12H4zM7 14h3M12 14h5M7 10.5h6M15 10.5h2"),
         search: icon("M11 4a7 7 0 1 0 0 14a7 7 0 1 0 0-14zM20 20l-4.2-4.2"),
+        minimize: thin("M1 6h10"),
+        maximize: thin("M1.5 1.5h9v9h-9z"),
+        restore: thin("M1.5 3.5h7v7h-7zM3.5 3.5v-2h7v7h-2"),
+        quit: thin("M1.5 1.5l9 9M10.5 1.5l-9 9"),
     }
 }
 
 fn setup(s: &mut State, waker: Waker) {
+    window::overlay::set_waker(waker.clone());
     let cache = ImageCache::new(waker.clone());
     s.icons = Some(icons(&cache));
     s.search.debounce.set_waker(waker.clone());
@@ -762,6 +777,8 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
         }
     }
     changed |= rotate_hero(s, tx);
+    let caption = window::caption();
+    if caption != s.caption { s.caption = caption; changed = true }
     if let Some((app, win)) = &s.overlay {
         let on = s.page == Page::Player;
         if on != s.overlay_on { s.overlay_on = on; window::overlay::show(win, on) }
