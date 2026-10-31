@@ -196,6 +196,47 @@ pub fn selftest_front_maximized() {
 #[cfg(not(windows))]
 pub fn selftest_front_maximized() {}
 
+/// For the cursor self-test: the system cursor as `GetCursorInfo` sees it (showing flag, and
+/// whether its image is the arrow, none, or another), and which window is under it.
+#[cfg(windows)]
+pub fn cursor_diag() -> String {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CURSOR_SHOWING, CURSORINFO, GA_ROOT, GetAncestor, GetCursorInfo, IDC_ARROW, LoadCursorW, WindowFromPoint,
+    };
+    unsafe {
+        let mut ci: CURSORINFO = std::mem::zeroed();
+        ci.cbSize = size_of::<CURSORINFO>() as u32;
+        GetCursorInfo(&mut ci);
+        let arrow = LoadCursorW(std::ptr::null_mut(), IDC_ARROW);
+        let image = if ci.hCursor.is_null() { "none".to_string() } else if ci.hCursor == arrow { "arrow".into() } else { format!("other {:?}", ci.hCursor) };
+        let under = WindowFromPoint(ci.ptScreenPos);
+        let who = if under == overlay::window() { "controls window" } else if under == overlay::main() { "app window" }
+            else if !under.is_null() && GetAncestor(under, GA_ROOT) == overlay::main() { "mpv (child of the app window)" } else { "another window" };
+        format!("showing {} image {image} | under the pointer: {who}", ci.flags & CURSOR_SHOWING != 0)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn cursor_diag() -> String { String::new() }
+
+/// For the self-tests: put the pointer at a fraction of the app window's client area.
+#[cfg(windows)]
+pub fn selftest_point_at(fx: f32, fy: f32) {
+    use windows_sys::Win32::Foundation::{POINT, RECT};
+    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, SetCursorPos};
+    unsafe {
+        let mut r: RECT = std::mem::zeroed();
+        GetClientRect(overlay::main(), &mut r);
+        let mut p = POINT { x: (r.right as f32 * fx) as i32, y: (r.bottom as f32 * fy) as i32 };
+        ClientToScreen(overlay::main(), &mut p);
+        SetCursorPos(p.x, p.y);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn selftest_point_at(_: f32, _: f32) {}
+
 /// For the fullscreen self-test: nudge the mouse so the controls show for a screenshot.
 #[cfg(windows)]
 pub fn selftest_jiggle() {
@@ -396,6 +437,7 @@ pub mod overlay {
     /// Idempotent; call on the UI thread while `overlay` is hidden (the style change needs it).
     pub fn attach(main: HWND, overlay: HWND) {
         unsafe {
+            SetWindowSubclass(overlay, Some(controls_cursor), 0x5355, 0); // same id: replaces, no stacking
             SetWindowLongPtrW(overlay, GWLP_HWNDPARENT, main as isize);
             let ex = GetWindowLongPtrW(overlay, GWL_EXSTYLE);
             SetWindowLongPtrW(overlay, GWL_EXSTYLE, (ex | (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) as isize) & !(WS_EX_APPWINDOW as isize));
@@ -514,6 +556,33 @@ pub mod overlay {
         def()
     }
 
+    /// The pointer hides over the controls' window while the controls do (the app's poll says
+    /// when). Rune's `Cursor::Hidden` needs a focused window and this one never takes focus, so
+    /// Rune shows the arrow there; this answers the window's WM_SETCURSOR instead.
+    static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+    pub fn hide_cursor(hide: bool) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, IDC_ARROW, LoadCursorW, SetCursor, WindowFromPoint};
+        if CURSOR_HIDDEN.swap(hide, Ordering::Relaxed) == hide { return }
+        // Now, for a pointer at rest: Windows asks again (WM_SETCURSOR) only when it moves.
+        let mut p = POINT { x: 0, y: 0 };
+        unsafe {
+            GetCursorPos(&mut p);
+            if !window().is_null() && WindowFromPoint(p) == window() {
+                SetCursor(if hide { std::ptr::null_mut() } else { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) });
+            }
+        }
+    }
+
+    unsafe extern "system" fn controls_cursor(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _: usize, _: usize) -> LRESULT {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SetCursor, WM_SETCURSOR};
+        if msg == WM_SETCURSOR && (lp & 0xFFFF) as u32 == HTCLIENT && CURSOR_HIDDEN.load(Ordering::Relaxed) {
+            unsafe { SetCursor(std::ptr::null_mut()) };
+            return 1;
+        }
+        unsafe { DefSubclassProc(hwnd, msg, wp, lp) }
+    }
+
     /// mpv's host window while one exists (see `player.rs`), resized by `frame`.
     static VIDEO: AtomicIsize = AtomicIsize::new(0);
     pub fn set_video(h: HWND) { VIDEO.store(h as isize, Ordering::Relaxed) }
@@ -521,6 +590,7 @@ pub mod overlay {
 
 #[cfg(not(windows))]
 pub mod overlay {
+    pub fn hide_cursor(_: bool) {}
     pub fn set_main(_: &rune::WindowHandle) {}
     pub fn set_waker(_: rune::Waker) {}
     pub fn show(w: &rune::WindowHandle, on: bool) { w.set_visible(on) }
