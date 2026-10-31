@@ -2276,7 +2276,6 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 [[package]]
 name = "rune"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=93c7a04b8d3e82efab3ada142989a0207957654d#93c7a04b8d3e82efab3ada142989a0207957654d"
 dependencies = [
  "arboard",
  "blake3",
@@ -2330,6 +2329,7 @@ dependencies = [
  "wgpu",
  "wgpu-core",
  "wgpu-hal",
+ "windows",
  "windows-sys 0.59.0",
  "winit",
  "x11rb",
@@ -2341,12 +2341,10 @@ dependencies = [
 [[package]]
 name = "rune-motion"
 version = "0.1.0"
-source = "git+https://github.com/anomalyco/rune?rev=93c7a04b8d3e82efab3ada142989a0207957654d#93c7a04b8d3e82efab3ada142989a0207957654d"
 
 [[package]]
 name = "rune-staging"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=93c7a04b8d3e82efab3ada142989a0207957654d#93c7a04b8d3e82efab3ada142989a0207957654d"
 dependencies = [
  "wgpu",
 ]
@@ -2702,6 +2700,7 @@ dependencies = [
  "serde",
  "serde_json",
  "ureq",
+ "windows",
  "windows-sys 0.59.0",
 ]
 

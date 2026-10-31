@@ -7,6 +7,10 @@ mod library;
 mod player;
 mod server;
 mod ui;
+#[cfg(windows)]
+mod video;
+#[cfg(windows)]
+mod videotest;
 mod window;
 
 use player::{Mpv, Playback};
@@ -652,7 +656,7 @@ fn play(s: &mut State, url: &str) {
     stop(s); // close the previous player first
     let title = s.meta.as_ref().and_then(|m| m["name"].as_str()).unwrap_or("Stremio").to_string();
     let start = s.resume.as_ref().filter(|(v, _)| *v == s.stream_for).map(|(_, at)| *at);
-    match Mpv::play(url, &title, s.waker.clone(), start, settings::mpv_options(&s.settings)) {
+    match Mpv::play(url, &title, s.waker.clone(), start, settings::mpv_options(&s.settings), None) {
         Ok(p) => {
             // Arrow keys over the video: mpv's own bindings, at the chosen step.
             let step = s.settings.seek_ms as f64 / 1000.0;
@@ -1097,6 +1101,8 @@ fn demo_controls(c: &mut Ctl) {
 }
 
 fn main() {
+    #[cfg(windows)]
+    if videotest::run() { return }
     let mut app = rune::App::new(AppSpec {
         setup: Some(setup),
         poll: Some(poll),
@@ -1195,7 +1201,7 @@ mod tests {
     fn playback_reports_time_pauses_seeks_and_quits_cleanly() {
         // TEST_STREAM: any 10+ minute video; the default needs the Stremio app running.
         let src = std::env::var("TEST_STREAM").unwrap_or_else(|_| "http://127.0.0.1:11470/dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c/-1".into());
-        let p = Mpv::play(&src, "test", None, Some(60.0), vec![]).unwrap();
+        let p = Mpv::play(&src, "test", None, Some(60.0), vec![], None).unwrap();
         let mut pb = Playback::default();
         let wait = |pb: &mut Playback, done: &dyn Fn(&Playback) -> bool| {
             let t = std::time::Instant::now();
@@ -1224,7 +1230,7 @@ mod tests {
     fn loader_timeline() {
         let src = std::env::var("TEST_STREAM").unwrap_or_else(|_| "http://127.0.0.1:11470/dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c/-1".into());
         let t = Instant::now();
-        let p = Mpv::play(&src, "test", None, None, vec![]).unwrap();
+        let p = Mpv::play(&src, "test", None, None, vec![], None).unwrap();
         println!("{:>6.0} ms  Mpv::play returned", t.elapsed().as_secs_f64() * 1000.0);
         let mut pb = Playback::default();
         let key = |p: &Playback| (p.started, p.buffering, p.seeking, p.idle, p.paused, p.cache_pct as i64, p.loading());
@@ -1257,7 +1263,7 @@ mod tests {
     #[ignore = "plays TEST_STREAM; opens a window briefly"]
     fn switching_streams_keeps_the_position() {
         let src = std::env::var("TEST_STREAM").expect("TEST_STREAM: a 10+ minute video");
-        let p = Mpv::play(&src, "test", None, Some(120.0), vec![]).unwrap();
+        let p = Mpv::play(&src, "test", None, Some(120.0), vec![], None).unwrap();
         let mut pb = Playback::default();
         let wait = |pb: &mut Playback, done: &dyn Fn(&Playback) -> bool| {
             let t = std::time::Instant::now();
@@ -1279,7 +1285,7 @@ mod tests {
     fn audio_tracks_are_listed_and_switch() {
         // TEST_AUDIO_STREAM: a clip whose audio tracks are eng then ger (see BRIEF: target	wo-audio.mkv).
         let src = std::env::var("TEST_AUDIO_STREAM").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/target/two-audio.mkv").into());
-        let p = Mpv::play(&src, "test", None, None, vec![]).unwrap();
+        let p = Mpv::play(&src, "test", None, None, vec![], None).unwrap();
         let mut pb = Playback::default();
         let wait = |pb: &mut Playback, done: &dyn Fn(&Playback) -> bool| {
             let t = std::time::Instant::now();
@@ -1384,7 +1390,7 @@ mod tests {
     #[ignore = "plays TEST_STREAM; opens a window briefly"]
     fn volume_starts_at_the_saved_one_and_is_observed() {
         let src = std::env::var("TEST_STREAM").expect("TEST_STREAM: a video");
-        let p = Mpv::play(&src, "test", None, None, vec![("volume", "40".into())]).unwrap();
+        let p = Mpv::play(&src, "test", None, None, vec![("volume", "40".into())], None).unwrap();
         let mut pb = Playback::default();
         let wait = |pb: &mut Playback, done: &dyn Fn(&Playback) -> bool| {
             let t = Instant::now();

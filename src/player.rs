@@ -52,6 +52,9 @@ pub struct Mpv {
     waker: *mut Waker,
     #[cfg(windows)]
     host: Option<win::Host>,
+    /// mpv's frames into a Rune surface (video.rs), instead of the child window.
+    #[cfg(windows)]
+    video: Option<crate::video::FrameSource>,
 }
 
 fn libmpv() -> Result<&'static libloading::Library, String> {
@@ -89,7 +92,10 @@ const DOUBLE: c_int = 5;
 
 impl Mpv {
     /// Start `url`, at `start` seconds if given, with `extra` options (the user's settings) last.
-    pub fn play(url: &str, title: &str, waker: Option<Waker>, start: Option<f64>, extra: Vec<(&'static str, String)>) -> Result<Mpv, String> {
+    /// With `surface`, frames go there through the GPU (see `video.rs`) once the app gives a
+    /// size (`set_video_size`); without, mpv draws in a child window of the app.
+    pub fn play(url: &str, title: &str, waker: Option<Waker>, start: Option<f64>, extra: Vec<(&'static str, String)>,
+        surface: Option<rune::NativeSurface>) -> Result<Mpv, String> {
         let create: unsafe extern "C" fn() -> *mut c_void = sym(b"mpv_create\0")?;
         let set: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int = sym(b"mpv_set_option_string\0")?;
         let init: unsafe extern "C" fn(*mut c_void) -> c_int = sym(b"mpv_initialize\0")?;
@@ -99,7 +105,9 @@ impl Mpv {
         let ctx = unsafe { create() };
         if ctx.is_null() { return Err("mpv_create failed".into()) }
         let waker = Box::into_raw(Box::new(waker.unwrap_or_else(|| std::sync::Arc::new(|| {}))));
-        let mpv = Mpv { ctx, waker, #[cfg(windows)] host: win::Host::new() }; // cleaned up on any early return
+        let in_rune = surface.is_some();
+        // cleaned up on any early return
+        let mut mpv = Mpv { ctx, waker, #[cfg(windows)] host: if in_rune { None } else { win::Host::new() }, #[cfg(windows)] video: None };
         // hwdec: mpv defaults to CPU decoding, which can't keep up with 4K/8K HEVC.
         // cursor-autohide matches the app's controls, which hide after the same idle time.
         let mut opts = vec![("force-window", "yes".to_string()), ("osc", "no".into()), ("input-default-bindings", "yes".into()),
@@ -107,6 +115,8 @@ impl Mpv {
             ("cursor-autohide", "2500".into()), ("title", title.into())];
         if let Some(at) = start { opts.push(("start", format!("{at}"))) }
         opts.extend(extra);
+        // In Rune: mpv renders through the render API (vo=libmpv) into Rune's surface.
+        if in_rune { opts.extend([("vo", "libmpv".to_string()), ("force-window", "no".into())]) }
         #[cfg(windows)]
         if let Some(h) = &mpv.host { opts.push(("wid", (h.0 as isize).to_string())) }
         unsafe {
@@ -126,6 +136,8 @@ impl Mpv {
             ("F11", "script-message fullscreen"), ("MBTN_LEFT_DBL", "script-message fullscreen")] {
             mpv.command(&["keybind", key, cmd])?;
         }
+        #[cfg(windows)]
+        if let Some(surface) = surface { mpv.video = Some(crate::video::FrameSource::start(ctx, surface)?) }
         mpv.command(&["loadfile", url]).map_err(|_| format!("mpv couldn't load {url}"))?;
         Ok(mpv)
     }
@@ -180,6 +192,18 @@ impl Mpv {
             Track { id: field("id"), label: if label.is_empty() { format!("Track {}", field("id")) } else { label }, external: field("external-filename") }
         }).collect()
     }
+
+    /// Render frames at this many device pixels (the video element's size).
+    pub fn set_video_size(&self, _w: u32, _h: u32) {
+        #[cfg(windows)]
+        if let Some(v) = &self.video { v.set_size(_w, _h) }
+    }
+
+    #[cfg(windows)]
+    pub fn video_stats(&self) -> Option<crate::video::Stats> { self.video.as_ref().map(|v| v.stats()) }
+
+    /// A property as text, for measuring (`frame-drop-count`, …).
+    pub fn property(&self, name: &str) -> Option<String> { self.get(name) }
 
     /// Size mpv's window to the app window. Cheap when nothing changed; call every poll.
     pub fn fit(&self) {
@@ -257,6 +281,8 @@ pub fn audio_label(lang: &str, title: &str, channels: u32, codec: &str) -> Strin
 
 impl Drop for Mpv {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        { self.video = None; } // the render context goes first, as libmpv requires
         if let Ok(destroy) = sym::<unsafe extern "C" fn(*mut c_void)>(b"mpv_terminate_destroy\0") {
             unsafe { destroy(self.ctx) }
         }
