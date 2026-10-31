@@ -22,6 +22,19 @@ pub struct T {
 fn knob(name: &str) -> bool { std::env::var(name).is_ok_and(|v| !v.is_empty() && v != "0") }
 
 static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Gaps between encoded frames (ms) since measuring began, and the last frame's time.
+static GAPS: std::sync::Mutex<(Option<Instant>, Vec<f64>)> = std::sync::Mutex::new((None, Vec::new()));
+
+/// Frame pacing: median, p99 and worst gap, and how many gaps missed one and two vsyncs.
+fn pacing() -> String {
+    let mut g = GAPS.lock().unwrap().1.clone();
+    if g.is_empty() { return "no frames".into() }
+    g.sort_by(f64::total_cmp);
+    let at = |q: f64| g[((g.len() - 1) as f64 * q) as usize];
+    let vsync = 1000.0 / 60.0;
+    format!("gaps p50 {:.1} p99 {:.1} max {:.1} ms, {} over 1.5 vsyncs, {} over 2.5", at(0.5), at(0.99), g[g.len() - 1],
+        g.iter().filter(|&&x| x > 1.5 * vsync).count(), g.iter().filter(|&&x| x > 2.5 * vsync).count())
+}
 
 #[cfg(windows)]
 fn cpu_seconds() -> f64 {
@@ -69,12 +82,16 @@ fn poll(t: &mut T, _: f64, tx: &mut Tx) -> bool {
     if t.done { tx.quit(); return false }
     let Some(m) = &t.mpv else { return false };
     if let Some(e) = m.pump(&mut t.pb) { log(&format!("ended early: {e:?}")); t.done = true; return false }
-    if t.size.0 > 0 { m.set_video_size(t.size.0, t.size.1) }
+    // VIDEOTEST_SIZE=WxH: have mpv render at that size whatever the window's.
+    let forced = std::env::var("VIDEOTEST_SIZE").ok().and_then(|v| { let (w, h) = v.split_once('x')?; Some((w.parse().ok()?, h.parse().ok()?)) });
+    let (w, h) = forced.unwrap_or(t.size);
+    if w > 0 { m.set_video_size(w, h) }
     // Measure from 3 s into playback, past start-up.
     let count = |n: &str| m.property(n).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
     if t.pb.started && t.pb.pos > 3.0 && t.started.is_none() {
         t.started = Some((Instant::now(), cpu_seconds(), count("frame-drop-count"), count("vo-delayed-frame-count")));
         FRAMES.store(0, std::sync::atomic::Ordering::Relaxed);
+        *GAPS.lock().unwrap() = (None, Vec::new());
     }
     if let Some((at, cpu, drops, delayed)) = t.started && at.elapsed().as_secs_f64() >= t.secs {
         let wall = at.elapsed().as_secs_f64();
@@ -89,7 +106,7 @@ fn poll(t: &mut T, _: f64, tx: &mut Tx) -> bool {
             line += &format!(" | rendered {} at {}x{}, {:.2} ms/frame on the render thread, starved {} | surface draws {:?} error {:?}",
                 s.frames, s.size.0, s.size.1, s.render_ms / s.frames.max(1) as f64, s.starved, t.surface.counts(), t.surface.last_error());
         }
-        line += &format!(" | Rune frames {:.1}/s", FRAMES.load(std::sync::atomic::Ordering::Relaxed) as f64 / wall);
+        line += &format!(" | Rune frames {:.1}/s, {}", FRAMES.load(std::sync::atomic::Ordering::Relaxed) as f64 / wall, pacing());
         log(&line);
         t.done = true;
     }
@@ -102,8 +119,15 @@ fn view(t: &T, _: &mut Cx<T>) -> El {
         // Fixed render size, for telling apart what keeps the window drawing.
         return video.native_surface(&t.surface, SurfaceFit::Fit);
     }
-    // Fires on the first layout and on a resize only. (`on_layout_tx` with `live_only` would
-    // keep the window drawing at the display rate.)
+    // VIDEOTEST_LIVE: draw at the display rate, as the app's player does (`on_layout_tx` with
+    // `live_only`); otherwise fires on the first layout and on a resize only.
+    if knob("VIDEOTEST_LIVE") {
+        return video.on_layout_tx(|t: &mut T, r, tx| {
+            tx.live_only();
+            let s = crate::window::scale();
+            t.size = ((r[2] * s).round() as u32, (r[3] * s).round() as u32);
+        }).native_surface(&t.surface, SurfaceFit::Fit);
+    }
     video = video.on_layout(|t: &mut T, r| {
         let s = crate::window::scale();
         t.size = ((r[2] * s).round() as u32, (r[3] * s).round() as u32);
@@ -118,7 +142,11 @@ pub fn run() -> bool {
     let fixed = knob("VIDEOTEST_NO_LAYOUT").then_some((1920, 1080));
     let init = move || T { clip: clip.clone(), surface: NativeSurface::new(), mpv: None, pb: Playback::default(), size: fixed.unwrap_or((0, 0)), started: None, secs, done: false };
     let app = rune::App::new(AppSpec { setup: Some(setup), poll: Some(poll), ..AppSpec::new("Video test", (1280.0, 720.0), || unreachable!(), view) })
-        .on_frame_encoded(|_| { FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); });
+        .on_frame_encoded(|f| {
+            FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut g = GAPS.lock().unwrap();
+            if let Some(last) = g.0.replace(f.at()) { g.1.push((f.at() - last).as_secs_f64() * 1000.0) }
+        });
     app.init(init).run();
     true
 }

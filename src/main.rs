@@ -1200,7 +1200,29 @@ fn main() {
         ],
         ..AppSpec::new("Stremio", (1280.0, 800.0), state, ui::view)
     }).on_window(window::chrome::set_main).on_focus(on_focus);
+    let app = match std::env::var_os("STREMIO_RUNE_PACING") { Some(path) => app.on_frame_encoded(pacing(path.into())), None => app };
     app.run();
+}
+
+/// `STREMIO_RUNE_PACING=<file>`: every 10 s, append the frame pacing of the last 10 s to the
+/// file: gaps between frames, how many missed a vsync (60 Hz), and Rune's update and encode
+/// times, to tell a frame the app was busy with from one that waited on the GPU.
+fn pacing(path: PathBuf) -> impl FnMut(&rune::FrameEncoded) {
+    let (mut last, mut since, mut gaps, mut work) = (None::<Instant>, Instant::now(), Vec::new(), Vec::new());
+    move |f| {
+        if let Some(l) = last.replace(f.at()) { gaps.push((f.at() - l).as_secs_f64() * 1000.0) }
+        work.push(f.update_ms().unwrap_or(0.0) + f.encode_ms().unwrap_or(0.0));
+        if since.elapsed() < Duration::from_secs(10) || gaps.is_empty() { return }
+        since = Instant::now();
+        let sorted = |v: &mut Vec<f64>| { v.sort_by(f64::total_cmp); let v = std::mem::take(v); move |q: f64| v[((v.len() - 1) as f64 * q) as usize] };
+        let (n, slow, very) = (gaps.len(), gaps.iter().filter(|&&g| g > 25.0).count(), gaps.iter().filter(|&&g| g > 41.7).count());
+        let busy = work.iter().filter(|&&w| w > 12.0).count();
+        let (g, w) = (sorted(&mut gaps), sorted(&mut work));
+        let line = format!("{:.1} fps | gaps p50 {:.1} p99 {:.1} max {:.1} ms, {slow} over 25 ms, {very} over 41.7 | update+encode p50 {:.1} p99 {:.1} max {:.1} ms, {busy} over 12 ms\n",
+            n as f64 / 10.0, g(0.5), g(0.99), g(1.0), w(0.5), w(0.99), w(1.0));
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) { let _ = file.write_all(line.as_bytes()); }
+    }
 }
 
 #[cfg(test)]

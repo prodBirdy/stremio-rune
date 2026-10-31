@@ -188,6 +188,9 @@ struct Renderer {
     /// GL signals `ready` once a frame is rendered; Rune raises `done` once it lets one go.
     ready: (u32, SharedFence),
     done: (ID3D11Fence, SharedFence),
+    /// `ready` as seen from here, to wait for GL to finish a frame before handing it over.
+    ready_fence: ID3D11Fence,
+    /// For waiting on either fence (one wait at a time, on this thread).
     done_event: HANDLE,
     frame_id: u64,
     slots: Vec<Slot>,
@@ -275,7 +278,7 @@ impl Renderer {
                 let h = f.CreateSharedHandle(None, 0x1F0003 /* GENERIC_ALL */, None).map_err(err("fence CreateSharedHandle"))?;
                 Ok((f, SharedFence::from_nt_handle(h.0)?, h))
             };
-            let (_, ready_shared, ready_handle) = fence()?;
+            let (ready_fence, ready_shared, ready_handle) = fence()?;
             let mut ready_sem = 0;
             (gl.gen_semaphores)(1, &mut ready_sem);
             (gl.import_semaphore)(ready_sem, GL_HANDLE_TYPE_D3D12_FENCE_EXT, ready_handle.0);
@@ -300,7 +303,7 @@ impl Renderer {
             let kick = Box::into_raw(Box::new(kick));
             set_update(render, on_update, kick.cast());
             Ok(Renderer { window, dc, glrc, gl, render, kick, device, d3d12, ready: (ready_sem, ready_shared), done: (done_fence, done_shared),
-                done_event, frame_id: 0, slots: Vec::new(), size: (0, 0) })
+                ready_fence, done_event, frame_id: 0, slots: Vec::new(), size: (0, 0) })
         }
     }
 
@@ -368,12 +371,15 @@ impl Renderer {
     }
 
     /// Wait (up to `limit`) until Rune has let go of frame `id` and everything before it.
-    fn wait_done(&self, id: u64, limit: Duration) -> bool {
+    fn wait_done(&self, id: u64, limit: Duration) -> bool { self.wait(&self.done.0, id, limit) }
+
+    /// Wait (up to `limit`) until `fence` reaches `id`.
+    fn wait(&self, fence: &ID3D11Fence, id: u64, limit: Duration) -> bool {
         unsafe {
-            if self.done.0.GetCompletedValue() >= id { return true }
-            if limit.is_zero() || self.done.0.SetEventOnCompletion(id, self.done_event).is_err() { return false }
+            if fence.GetCompletedValue() >= id { return true }
+            if limit.is_zero() || fence.SetEventOnCompletion(id, self.done_event).is_err() { return false }
             WaitForSingleObject(self.done_event, limit.as_millis() as u32);
-            self.done.0.GetCompletedValue() >= id
+            fence.GetCompletedValue() >= id
         }
     }
 
@@ -419,6 +425,10 @@ impl Renderer {
                 glFlush();
             }
             let frame = slot.shared.clone().with_sync(FrameSync { ready: self.ready.1.clone(), ready_value: self.frame_id, done: self.done.1.clone() });
+            // Hand Rune only a finished frame. Its queue would wait for GL instead, and a frame
+            // that waits misses its vsync: one hitch per video frame, fullscreen especially
+            // (independent flip). Until this one is ready, Rune keeps showing the last.
+            self.wait(&self.ready_fence, self.frame_id, Duration::from_millis(100));
             if self.frame_id == 30 && std::env::var_os("VIDEO_PROBE").is_some() { self.probe(i) }
             if let Err(e) = surface.push(frame, self.frame_id) { eprintln!("video: {e}") }
             let mut s = shared.stats.lock().unwrap();
