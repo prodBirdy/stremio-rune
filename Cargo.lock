@@ -2673,6 +2673,7 @@ dependencies = [
  "image",
  "libloading",
  "rune",
+ "serde",
  "serde_json",
  "ureq",
  "windows-sys 0.59.0",

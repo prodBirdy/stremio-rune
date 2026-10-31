@@ -8,6 +8,8 @@ use std::f32::consts::PI;
 
 #[path = "search.rs"]
 pub mod search;
+#[path = "settings.rs"]
+pub mod settings;
 
 const PAD: f32 = 56.0;
 const HERO_H: f32 = 560.0;
@@ -129,7 +131,10 @@ fn menu(s: &State) -> El {
             .child(label("Signed in as", 12.0, 500.0, ink(0.5)))
             .child(label(who, 14.0, 600.0, Color::WHITE).truncate()))
         .child(el().h(1.0).w_full().fill(ink(0.1)))
-        .child(tap(row().key("sign-out").h(40.0).px(12.0).mt(4.0).radius(10.0).center_y().hover(ink(0.08))
+        .child(tap(row().key("settings").h(40.0).px(12.0).mt(4.0).radius(10.0).center_y().hover(ink(0.08))
+            .child(label("Settings", 15.0, 500.0, Color::WHITE)))
+            .on_press(settings::open))
+        .child(tap(row().key("sign-out").h(40.0).px(12.0).radius(10.0).center_y().hover(ink(0.08))
             .child(label("Sign out", 15.0, 500.0, oklch(0.72, 0.15, 25.0))))
             .on_press(sign_out))
 }
@@ -540,6 +545,7 @@ pub fn view(s: &State, _: &mut Cx<State>) -> El {
         Page::Browse(ty) => browse(s, ty),
         Page::Detail => detail(s),
         Page::Search => search::view(s),
+        Page::Settings => settings::view(s),
     };
     let mut root = col().w_full().h_full().fill(bg())
         .on_layout_tx(|s: &mut State, r, tx| { tx.live_only(); s.view_h = r[3] })

@@ -10,7 +10,7 @@ mod ui;
 mod window;
 
 use player::{Mpv, Playback};
-use ui::search;
+use ui::{search, settings};
 use rune::{AppSpec, Image, ImageCache, Key, KeyEvent, TextEdit, Tween, Tx, Waker};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -22,8 +22,6 @@ use std::time::{Duration, Instant};
 /// Height of the control bar under the video, and width of the subtitles panel, in points.
 const BAR: f32 = 64.0;
 const SUBS_W: f32 = 380.0;
-/// Mouse stillness after which the playback controls hide.
-const IDLE: Duration = Duration::from_millis(2500);
 /// Catalogs shown as rows on Home, and cards per row (Rune has no horizontal scroll yet).
 const HOME_ROWS: usize = 6;
 const ROW_CARDS: usize = 5;
@@ -63,6 +61,8 @@ enum Msg {
     Saved,
     /// Search answers: (query, index into `search.cats`, metas).
     Search(String, usize, Vec<Value>),
+    /// The streaming server's `/settings`, or why not (it's down).
+    Server(Result<Value, String>),
 }
 
 struct Stream { name: String, title: String, url: String }
@@ -70,7 +70,7 @@ struct Stream { name: String, title: String, url: String }
 struct Catalog { base: String, ty: String, id: String, name: String }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Page { Login, Home, Browse(&'static str), Detail, Player, Search }
+enum Page { Login, Home, Browse(&'static str), Detail, Player, Search, Settings }
 
 struct Icons { play: Image, pause: Image, back: Image, close: Image, expand: Image, shrink: Image, subs: Image, search: Image }
 
@@ -129,6 +129,11 @@ struct State {
     subs_for: String,
     addon_subs: Vec<(String, String)>,
     search: search::Search,
+    settings: settings::Settings,
+    /// The streaming server's settings: none yet, or it's down.
+    server: Option<Result<Value, String>>,
+    /// The settings picker that's unfolded.
+    choice: Option<&'static str>,
     player: Option<Mpv>,
     /// Watch progress for the account's library (see `library.rs`).
     watch: Option<library::Watch>,
@@ -210,6 +215,9 @@ fn state() -> State {
         subs_for: String::new(),
         addon_subs: vec![],
         search: search::Search::default(),
+        settings: if cfg!(test) { Default::default() } else { settings::load(&settings::file()) },
+        server: None,
+        choice: None,
         player: None,
         watch: None,
         playback: Playback::default(),
@@ -524,8 +532,11 @@ fn play(s: &mut State, url: &str) {
     stop(s); // close the previous player first
     let title = s.meta.as_ref().and_then(|m| m["name"].as_str()).unwrap_or("Stremio").to_string();
     let start = s.resume.as_ref().filter(|(v, _)| *v == s.stream_for).map(|(_, at)| *at);
-    match Mpv::play(url, &title, s.waker.clone(), start) {
+    match Mpv::play(url, &title, s.waker.clone(), start, settings::mpv_options(&s.settings)) {
         Ok(p) => {
+            // Arrow keys over the video: mpv's own bindings, at the chosen step.
+            let step = s.settings.seek_ms as f64 / 1000.0;
+            for (key, dir) in [("RIGHT", ""), ("LEFT", "-")] { let _ = p.command(&["keybind", key, &format!("seek {dir}{step}")]); }
             s.player = Some(p);
             library::start(s);
             s.page = Page::Player;
@@ -592,6 +603,10 @@ fn on_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
         Key::Function(11) => toggle_fullscreen(s),
         Key::Text(t) if playing && t == "f" => toggle_fullscreen(s),
         Key::Text(t) if playing && t == " " => mpv(s, &["cycle", "pause"]),
+        Key::Left | Key::Right if playing => {
+            let step = s.settings.seek_ms as f64 / 1000.0 * if ev.key == Key::Left { -1.0 } else { 1.0 };
+            mpv(s, &["seek", &step.to_string()])
+        }
         Key::Escape => escape(s),
         _ => return false,
     }
@@ -605,7 +620,8 @@ fn escape(s: &mut State) {
     else if s.fullscreen { toggle_fullscreen(s) }
     else if s.page == Page::Player { stop(s) }
     else if s.page == Page::Detail { s.page = s.back_to }
-    else if s.page == Page::Search { s.page = Page::Home }
+    else if s.choice.is_some() { s.choice = None }
+    else if matches!(s.page, Page::Search | Page::Settings) { s.page = Page::Home }
 }
 
 fn mpv(s: &State, args: &[&str]) {
@@ -656,7 +672,7 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
         let cursor = window::cursor();
         if cursor != s.cursor { s.cursor = cursor; s.last_move = Instant::now() }
         let p = &s.playback;
-        let controls = p.paused || p.loading() || p.scrub.is_some() || s.bar_hover || s.subs_open || s.last_move.elapsed() < IDLE;
+        let controls = p.paused || p.loading() || p.scrub.is_some() || s.bar_hover || s.subs_open || s.last_move.elapsed() < Duration::from_millis(s.settings.hide_ms as u64);
         changed |= controls != s.controls;
         s.controls = controls;
         player.fit(if controls { BAR } else { 0.0 }, if s.subs_open { SUBS_W } else { 0.0 }, !p.loading());
@@ -722,6 +738,7 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
             Msg::Subs(vid, list) if vid == s.subs_for => s.addon_subs.extend(list),
             Msg::LibraryItem(id, item, meta) => library::landed(s, id, item, meta),
             Msg::Saved => {}
+            Msg::Server(r) => s.server = Some(r),
             Msg::Streams(vid, list) if vid == s.stream_for => {
                 s.streams.extend(list);
                 s.status.clear();
@@ -802,6 +819,16 @@ fn main() {
                 s.search.results = HashMap::from([(0, s.items[&0].clone()), (1, s.items[&1][..3].to_vec())]);
             }),
             ("menu", |s| { demo(s); s.page = Page::Home; s.menu = true }),
+            ("settings", |s| {
+                demo(s);
+                s.page = Page::Settings;
+                s.choice = Some("sub-lang");
+                s.settings.sub_lang = "eng".into();
+                s.server = Some(Ok(json!({ "options": [{ "id": "remoteHttps", "selections": [{ "name": "Disabled", "val": "" }, { "name": "192.168.1.10", "val": "192.168.1.10" }] }],
+                    "values": { "serverVersion": "4.22.3", "cacheSize": 2147483648u64, "btMaxConnections": 55, "btHandshakeTimeout": 20000, "btRequestTimeout": 4000,
+                        "btDownloadSpeedSoftLimit": 2621440, "btDownloadSpeedHardLimit": 3670016, "btMinPeersForStable": 5, "remoteHttps": "",
+                        "transcodeProfile": null, "allTranscodeProfiles": ["nvenc-win"] } })));
+            }),
             ("player", |s| { demo(s); s.page = Page::Player; s.playback = Playback { pos: 1234.0, dur: 5400.0, started: true, ..Default::default() } }),
             ("loading", |s| { demo(s); s.page = Page::Player; s.playback = Playback { cache_pct: 40.0, ..Default::default() } }),
             ("audio", |s| {
@@ -837,7 +864,7 @@ mod tests {
     fn playback_reports_time_pauses_seeks_and_quits_cleanly() {
         // TEST_STREAM: any 10+ minute video; the default needs the Stremio app running.
         let src = std::env::var("TEST_STREAM").unwrap_or_else(|_| "http://127.0.0.1:11470/dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c/-1".into());
-        let p = Mpv::play(&src, "test", None, Some(60.0)).unwrap();
+        let p = Mpv::play(&src, "test", None, Some(60.0), vec![]).unwrap();
         let mut pb = Playback::default();
         let wait = |pb: &mut Playback, done: &dyn Fn(&Playback) -> bool| {
             let t = std::time::Instant::now();
@@ -863,7 +890,7 @@ mod tests {
     fn audio_tracks_are_listed_and_switch() {
         // TEST_AUDIO_STREAM: a clip whose audio tracks are eng then ger (see BRIEF: target	wo-audio.mkv).
         let src = std::env::var("TEST_AUDIO_STREAM").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/target/two-audio.mkv").into());
-        let p = Mpv::play(&src, "test", None, None).unwrap();
+        let p = Mpv::play(&src, "test", None, None, vec![]).unwrap();
         let mut pb = Playback::default();
         let wait = |pb: &mut Playback, done: &dyn Fn(&Playback) -> bool| {
             let t = std::time::Instant::now();
@@ -1119,6 +1146,69 @@ mod tests {
         assert_eq!(backdrop(&json!({ "_id": "tt5", "background": "", "poster": "" })).unwrap(), "https://images.metahub.space/background/medium/tt5/img");
         assert_eq!(fallbacks("https://images.metahub.space/background/medium/tt5/img")[1], "https://images.metahub.space/poster/medium/tt5/img");
         assert_eq!(logo(&json!({ "id": "tt5", "logo": "" })).unwrap(), "https://images.metahub.space/logo/medium/tt5/img");
+    }
+
+    #[test]
+    fn settings_round_trip_with_defaults_for_what_is_missing() {
+        let dir = std::env::temp_dir().join(format!("stremio-rune-test-{}", std::process::id()));
+        let f = dir.join("settings.json");
+        assert_eq!(settings::load(&f), settings::Settings::default(), "no file: defaults");
+        let mut p = settings::Settings::default();
+        p.sub_lang = "ger".into();
+        p.seek_ms = 10000;
+        p.hwdec = false;
+        settings::save_to(&f, &p).unwrap();
+        assert_eq!(settings::load(&f), p);
+        std::fs::write(&f, r#"{"sub_size": 150, "unknown": 1}"#).unwrap();
+        assert_eq!(settings::load(&f), settings::Settings { sub_size: 150, ..Default::default() }, "missing fields: defaults");
+        std::fs::write(&f, "not json").unwrap();
+        assert_eq!(settings::load(&f), settings::Settings::default(), "unreadable: defaults");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn settings_become_mpv_options() {
+        let opts = |p: &settings::Settings| settings::mpv_options(p).into_iter().map(|(k, v)| (k.to_string(), v)).collect::<HashMap<_, _>>();
+        let d = opts(&settings::Settings::default());
+        assert_eq!(d["hwdec"], "auto-safe", "today's behaviour");
+        assert_eq!(d["sub-scale"], "1");
+        assert_eq!(d["cursor-autohide"], "2500");
+        assert!(!d.contains_key("alang") && !d.contains_key("slang"), "no language: the file decides");
+        let o = opts(&settings::Settings { audio_lang: "ger".into(), sub_lang: "eng".into(), sub_size: 150, sub_color: "#FFE14D".into(),
+            sub_style: "box".into(), hwdec: false, ..Default::default() });
+        assert_eq!((o["alang"].as_str(), o["slang"].as_str()), ("ger,deu,de", "eng,en"));
+        assert_eq!((o["hwdec"].as_str(), o["sub-scale"].as_str(), o["sub-color"].as_str()), ("no", "1.5", "#FFE14D"));
+        assert_eq!(o["sub-border-style"], "background-box");
+        assert!(o.contains_key("sub-back-color"));
+    }
+
+    #[test]
+    fn server_settings_post_what_stremio_core_posts() {
+        let values = json!({ "serverVersion": "4.22.3", "appPath": "x", "cacheSize": 2147483648u64, "cacheRoot": "C:/c", "btMaxConnections": 55,
+            "btHandshakeTimeout": 20000, "btRequestTimeout": 4000, "btDownloadSpeedSoftLimit": 2621440, "btDownloadSpeedHardLimit": 3670016,
+            "btMinPeersForStable": 5, "remoteHttps": "", "proxyStreamsEnabled": false, "transcodeProfile": null, "allTranscodeProfiles": ["nvenc-win"] });
+        let body = settings::server_body(&values, &json!({ "cacheSize": null }));
+        let o = body.as_object().unwrap();
+        assert_eq!(o.len(), 11, "only the fields the server takes");
+        assert!(o["cacheSize"].is_null() && o["btMaxConnections"] == 55 && o["cacheRoot"] == "C:/c");
+        assert!(!o.contains_key("serverVersion") && !o.contains_key("allTranscodeProfiles"));
+    }
+
+    #[test]
+    fn settings_open_from_the_menu_and_choices_stick() {
+        let mut rt = runtime(|s| { demo(s); s.page = Page::Home });
+        click(&mut rt, "avatar");
+        click(&mut rt, "settings");
+        assert!(rt.state.page == Page::Settings && !rt.state.menu);
+        click(&mut rt, "sub-size-3");
+        assert_eq!(rt.state.settings.sub_size, 150);
+        click(&mut rt, "hwdec");
+        assert!(!rt.state.settings.hwdec);
+        click(&mut rt, "audio-lang");
+        click(&mut rt, "audio-lang-2");
+        assert_eq!((rt.state.settings.audio_lang.as_str(), rt.state.choice), ("ger", None), "picked and folded");
+        click(&mut rt, "settings-sign-out");
+        assert!(rt.state.page == Page::Login);
     }
 
     #[test]
