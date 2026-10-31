@@ -359,6 +359,8 @@ pub mod overlay {
     pub fn show(w: &rune::WindowHandle, on: bool) {
         if let (true, Some(o)) = (on, hwnd(w)) { if !main().is_null() { attach(main(), o) } }
         w.set_visible(on);
+        // Hidden, it's destroyed (`release_gpu_when_closed`); it gets a new HWND next time.
+        if !on { OVERLAY.store(0, Ordering::Relaxed) }
         // Showing can restyle the window (winit applies its own flags) and give it a taskbar
         // button; own it and drop the button again so the app shows as one window.
         if let (true, Some(o)) = (on, hwnd(w)) {

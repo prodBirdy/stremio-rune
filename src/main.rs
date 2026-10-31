@@ -11,7 +11,7 @@ mod window;
 
 use player::{Mpv, Playback};
 use ui::{Ctl, addons, search, settings};
-use rune::{AppHandle, AppSpec, Image, ImageCache, Key, KeyEvent, TextEdit, Tween, Tx, Waker, WindowHandle};
+use rune::{AppHandle, AppSpec, Image, ImageCache, Key, KeyEvent, TextEdit, Tx, Waker, WindowHandle};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -30,6 +30,9 @@ const HERO_PICKS: usize = 5;
 const HERO_EVERY: Duration = Duration::from_secs(4);
 /// Width of the hero's current dot, which fills over `HERO_EVERY`.
 const DOT_W: f32 = 28.0;
+/// Its fill is this many segments, redrawn this often (see `ui::dot_fill`).
+const DOT_SEGMENTS: usize = 7;
+const DOT_FPS: f32 = 8.0;
 
 /// Decoded image pixels kept; least recently used go first past this. Rune keeps a mip chain of
 /// each on the GPU too (~4/3 of this).
@@ -99,10 +102,11 @@ struct State {
     hero: usize,
     /// When the hero last changed; it advances `HERO_EVERY` after.
     hero_at: Instant,
-    /// The current dot's fill: [x, y, w, h] from empty to full over `HERO_EVERY`, and a
-    /// counter that keys it so each title's fill starts over.
-    hero_fill: Tween<[f32; 4]>,
+    /// Counts hero changes; keys the current dot's fill so each title's starts over.
     hero_round: u64,
+    /// The app window has focus (`on_focus`; a window Windows never activated hears nothing).
+    /// Out of focus the hero holds still, so an idle app in the background draws nothing.
+    focused: bool,
     images: HashMap<String, Image>,
     /// Decoded bytes and last use of each image in `images`, for `evict`.
     lru: HashMap<String, (usize, u64)>,
@@ -207,8 +211,8 @@ fn state() -> State {
         library: vec![],
         hero: 0,
         hero_at: Instant::now(),
-        hero_fill: dot_fill(),
         hero_round: 0,
+        focused: false,
         images: HashMap::new(),
         lru: HashMap::new(),
         tick: 0,
@@ -872,7 +876,7 @@ fn fullscreen_selftest(s: &mut State, tx: &mut Tx) {
 /// Advance the Home hero every `HERO_EVERY`, and schedule the next look. Only on Home.
 fn rotate_hero(s: &mut State, tx: &mut Tx) -> bool {
     let n = s.items.get(&0).map_or(0, |v| v.len().min(HERO_PICKS));
-    if s.page != Page::Home || n < 2 { return false }
+    if s.page != Page::Home || n < 2 || !s.focused { return false }
     let left = HERO_EVERY.saturating_sub(s.hero_at.elapsed());
     if !left.is_zero() { tx.wake_after(left); return false }
     show_hero(s, (s.hero + 1) % n);
@@ -880,19 +884,23 @@ fn rotate_hero(s: &mut State, tx: &mut Tx) -> bool {
     true
 }
 
-fn dot_fill() -> Tween<[f32; 4]> { Tween::linear([0.0, 0.0, 0.0, 8.0], [0.0, 0.0, DOT_W, 8.0], HERO_EVERY) }
+/// Back in focus, the hero's title gets a full turn again.
+fn on_focus(s: &mut State, focused: bool, _: &mut Tx) {
+    s.focused = focused;
+    if focused { show_hero(s, s.hero) }
+}
 
 /// Show hero title `i` for a full `HERO_EVERY`, its dot filling from empty.
 fn show_hero(s: &mut State, i: usize) {
     s.hero = i;
     s.hero_at = Instant::now();
-    s.hero_fill = dot_fill();
     s.hero_round += 1;
 }
 
 /// Fake data for headless `--snap … --scene <name>` renders.
 fn demo(s: &mut State) {
     s.auth = None; // keep the real account from loading over the fake data
+    s.focused = true;
     s.catalogs = vec![
         Catalog { base: String::new(), ty: "movie".into(), id: "top".into(), name: "Popular Movies".into() },
         Catalog { base: String::new(), ty: "series".into(), id: "top".into(), name: "Popular Shows".into() },
@@ -980,11 +988,14 @@ fn main() {
             }),
         ],
         ..AppSpec::new("Stremio", (1280.0, 800.0), state, ui::view)
-    }).on_window(window::overlay::set_main);
+    }).on_window(window::overlay::set_main).on_focus(on_focus);
     // The playback controls float over the video in a transparent window of their own (mpv's
     // window covers the app's), shown while playing. Snaps: `--window controls --scene quality`.
     let main = app.handle();
-    let controls = rune::WindowSpec::new("controls", AppSpec {
+    // It's made when playback starts and dropped, GPU device and all, when it ends: on Windows
+    // a transparent window needs its own DX12 device, ~400 MB of RAM and ~190 MB of GPU memory
+    // even while hidden.
+    let controls = rune::WindowSpec::from_app("controls", rune::App::new(AppSpec {
         setup: Some(ui::ctl_setup),
         scenes: &[
             ("player", demo_controls),
@@ -1002,7 +1013,7 @@ fn main() {
             }),
         ],
         ..AppSpec::new("Stremio controls", (1280.0, 800.0), Ctl::default, ui::controls)
-    }).state(Ctl { main: Some(main), ..Default::default() })
+    }).windowless().release_gpu_when_closed()).state(Ctl { main: Some(main), ..Default::default() })
         .options(rune::WindowOptions { transparent: true, borderless: true, visible: false, min_size: Some((0.0, 0.0)), ..Default::default() });
     let overlay = app.window(controls);
     app.init(move || State { overlay: Some(overlay), ..state() }).run();
@@ -1473,6 +1484,18 @@ mod tests {
         rt.state.hero_at -= HERO_EVERY;
         tick(&mut rt);
         assert_eq!(rt.state.hero, 0, "only on Home");
+        rt.state.page = Page::Home;
+        rt.update(|s, tx| on_focus(s, false, tx));
+        rt.frame(1.0 / 60.0);
+        rt.state.hero_at -= HERO_EVERY;
+        tick(&mut rt);
+        assert_eq!(rt.state.hero, 0, "holds while the window is in the background");
+        assert!(rt.find(&format!("fill-{}", rt.state.hero_round)).is_none(), "and its dot doesn't fill");
+        let round = rt.state.hero_round;
+        rt.update(|s, tx| on_focus(s, true, tx));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.hero == 0 && rt.state.hero_round == round + 1, "back in focus: a full turn for the same title");
+        assert!(rt.find(&format!("fill-{}", rt.state.hero_round)).is_some());
     }
 
     #[test]
