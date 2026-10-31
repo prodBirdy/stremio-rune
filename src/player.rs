@@ -1,6 +1,6 @@
-//! Playback through the libmpv Stremio ships. On Windows mpv draws into a child window covering
-//! the app window; the loader and controls float above it in their own window (`ui::Ctl`), and
-//! read [`Playback`].
+//! Playback through the libmpv Stremio ships. mpv renders into a Rune `NativeSurface` (`video.rs`
+//! on Windows, `video_mac.rs` on macOS); the loader and controls float above it and read
+//! [`Playback`].
 
 use rune::Waker;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
@@ -50,16 +50,15 @@ pub struct Mpv {
     ctx: *mut c_void,
     waker: *mut Waker,
     /// mpv's frames into a Rune surface (video.rs).
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     video: Option<crate::video::FrameSource>,
 }
 
 fn libmpv() -> Result<&'static libloading::Library, String> {
     static LIB: OnceLock<Result<libloading::Library, String>> = OnceLock::new();
     LIB.get_or_init(|| {
-        let path = std::env::var_os("MPV_LIB").map(PathBuf::from).unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_default()).join(r"Programs\Stremio\libmpv-2.dll")
-        });
+        let path = std::env::var_os("MPV_LIB").map(PathBuf::from)
+            .unwrap_or_else(|| crate::server::stremio_dir().join(if cfg!(windows) { "libmpv-2.dll" } else { "libmpv.2.dylib" }));
         // Altered search path: the DLL's own dependencies sit beside it.
         #[cfg(windows)]
         let lib = unsafe {
@@ -88,9 +87,9 @@ const INT64: c_int = 4;
 const DOUBLE: c_int = 5;
 
 /// mpv's core handle for a thread of ours: libmpv's client API is thread-safe.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 struct Core(*mut c_void);
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 unsafe impl Send for Core {}
 
 fn command(ctx: *mut c_void, args: &[&str]) -> Result<(), String> {
@@ -117,7 +116,7 @@ impl Mpv {
         if ctx.is_null() { return Err("mpv_create failed".into()) }
         let waker = Box::into_raw(Box::new(waker.unwrap_or_else(|| std::sync::Arc::new(|| {}))));
         // cleaned up on any early return
-        let mut mpv = Mpv { ctx, waker, #[cfg(windows)] video: None };
+        let mut mpv = Mpv { ctx, waker, #[cfg(any(windows, target_os = "macos"))] video: None };
         // vo=libmpv: mpv renders through the render API into Rune's surface (video.rs), and has
         // no window of its own; without a surface (headless tests) nothing is shown.
         // hwdec: mpv defaults to CPU decoding, which can't keep up with 4K/8K HEVC.
@@ -139,7 +138,7 @@ impl Mpv {
         match surface {
             // The file loads once the renderer is up, on its thread (see `FrameSource::start`):
             // setting it up mustn't hold the UI.
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             Some(surface) => {
                 let (core, url) = (Core(ctx), url.to_string());
                 mpv.video = Some(crate::video::FrameSource::start(ctx, surface, move || {
@@ -199,11 +198,11 @@ impl Mpv {
 
     /// Render frames at this many device pixels (the video element's size).
     pub fn set_video_size(&self, _w: u32, _h: u32) {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         if let Some(v) = &self.video { v.set_size(_w, _h) }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub fn video_stats(&self) -> Option<crate::video::Stats> { self.video.as_ref().map(|v| v.stats()) }
 
     /// A property as text, for measuring (`frame-drop-count`, …).
@@ -218,7 +217,7 @@ impl Mpv {
         #[repr(C)] struct ClientMessage { num_args: c_int, args: *const *const c_char }
         let wait: unsafe extern "C" fn(*mut c_void, f64) -> *const Event = sym(b"mpv_wait_event\0").ok()?;
         let describe: unsafe extern "C" fn(c_int) -> *const c_char = sym(b"mpv_error_string\0").ok()?;
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         if let Some(e) = self.video.as_ref().and_then(|v| v.error()) { return Some(Some(format!("Can't show the video: {e}"))) }
         let mut ended = None;
         loop {
@@ -281,7 +280,7 @@ pub fn audio_label(lang: &str, title: &str, channels: u32, codec: &str) -> Strin
 
 impl Drop for Mpv {
     fn drop(&mut self) {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         { self.video = None; } // the render context goes first, as libmpv requires
         if let Ok(destroy) = sym::<unsafe extern "C" fn(*mut c_void)>(b"mpv_terminate_destroy\0") {
             unsafe { destroy(self.ctx) }

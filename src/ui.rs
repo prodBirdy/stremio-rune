@@ -455,6 +455,8 @@ fn top(s: &State) -> f32 { if s.fullscreen { 0.0 } else { s.caption.h } }
 
 fn title_bar(s: &State) -> El {
     let c = &s.caption;
+    // macOS: the traffic lights are AppKit's, over the strip's left end; the strip only drags.
+    if cfg!(target_os = "macos") { return row().key("title-bar").h(c.h).w_full().window_drag() }
     // Hover only: the system hit-tests the strip, so these act on release like its own.
     let button = |key: &str, glyph: fn(&Icons) -> &Image, hover: Color| row().key(key.to_string())
         .w(window::CAPTION_BUTTON_W).h_full().center().hover(hover).child(icon(s, glyph, 10.0));

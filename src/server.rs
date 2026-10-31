@@ -1,12 +1,22 @@
 //! Stremio's streaming server: torrents play through it at 127.0.0.1:11470. On launch the app
 //! starts it hidden from the Stremio install when nothing is listening there yet; one started
-//! here ends with the app (a kill-on-close job object). One already running (the Stremio app's)
-//! is used as is.
+//! here ends with the app (Windows: a kill-on-close job object; macOS: a shell that watches the
+//! app's process). One already running (the Stremio app's) is used as is.
 
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+/// Where the Stremio install keeps its streaming server and libmpv: `%LOCALAPPDATA%\Programs\Stremio`
+/// on Windows, `/Applications/Stremio.app/Contents/MacOS` on macOS (where build.rs points libmpv's
+/// own libraries).
+pub fn stremio_dir() -> PathBuf {
+    #[cfg(windows)]
+    return PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_default()).join(r"Programs\Stremio");
+    #[cfg(not(windows))]
+    PathBuf::from("/Applications/Stremio.app/Contents/MacOS")
+}
 
 pub fn running() -> bool {
     TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], 11470)), Duration::from_millis(300)).is_ok()
@@ -15,17 +25,26 @@ pub fn running() -> bool {
 /// Start the server unless it's up. Blocks briefly (a port check); call off the UI thread.
 pub fn ensure() -> Result<(), String> {
     if running() { return Ok(()) }
-    let dir = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_default()).join(r"Programs\Stremio");
-    let mut cmd = Command::new(dir.join("stremio-runtime.exe"));
-    cmd.arg(dir.join("server.js")).current_dir(&dir).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let dir = stremio_dir();
     #[cfg(windows)]
-    {
+    let mut cmd = {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    let child = cmd.spawn().map_err(|e| format!("Couldn't start Stremio's streaming server from {} ({e})", dir.display()))?;
+        let mut cmd = Command::new(dir.join("stremio-runtime.exe"));
+        cmd.arg(dir.join("server.js")).creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        cmd
+    };
+    // The server under a shell that stops it once this process is gone, however it ends.
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let watch = r#""$1/node" "$1/server.js" & s=$!; while kill -0 "$2" 2>/dev/null && kill -0 $s 2>/dev/null; do sleep 1; done; kill $s 2>/dev/null"#;
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(watch).arg("sh").arg(&dir).arg(std::process::id().to_string());
+        cmd
+    };
+    cmd.current_dir(&dir).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let _child = cmd.spawn().map_err(|e| format!("Couldn't start Stremio's streaming server from {} ({e})", dir.display()))?;
     #[cfg(windows)]
-    end_with_app(&child);
+    end_with_app(&_child);
     Ok(())
 }
 

@@ -114,6 +114,8 @@ fn configure(url: String) {
     if !url.starts_with("http") { return }
     #[cfg(windows)]
     let _ = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", &url]).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(&url).spawn();
 }
 
 // ---- view ----

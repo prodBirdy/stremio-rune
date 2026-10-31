@@ -1,7 +1,7 @@
 //! `STREMIO_RUNE_VIDEOTEST=<video>`: a window that is only the video, played through mpv's GPU
-//! render path into a Rune `NativeSurface` (video.rs). After `VIDEOTEST_SECS` (default 20) of
-//! playback it writes CPU use, mpv's dropped and delayed frames and the renderer's counters to
-//! `%TEMP%\stremio-rune-videotest.txt`, then quits.
+//! render path into a Rune `NativeSurface` (video.rs, video_mac.rs). After `VIDEOTEST_SECS`
+//! (default 20) of playback it writes CPU use, mpv's dropped and delayed frames and the
+//! renderer's counters to `stremio-rune-videotest.txt` in the temp folder, then quits.
 
 use crate::player::{Mpv, Playback};
 use rune::{AppSpec, Cx, El, NativeSurface, SurfaceFit, Tx, Waker, el};
@@ -23,6 +23,7 @@ fn knob(name: &str) -> bool { std::env::var(name).is_ok_and(|v| !v.is_empty() &&
 
 static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+#[cfg(windows)]
 fn cpu_seconds() -> f64 {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
@@ -31,6 +32,19 @@ fn cpu_seconds() -> f64 {
     unsafe { GetProcessTimes(GetCurrentProcess(), &mut a, &mut b, &mut k, &mut u) };
     let t = |f: FILETIME| ((f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64) as f64 / 1e7;
     t(k) + t(u)
+}
+
+#[cfg(target_os = "macos")]
+fn cpu_seconds() -> f64 {
+    #[repr(C)]
+    struct TimeVal { sec: i64, usec: i32 }
+    #[repr(C)]
+    struct RUsage { user: TimeVal, system: TimeVal, rest: [i64; 14] }
+    unsafe extern "C" { fn getrusage(who: i32, usage: *mut RUsage) -> i32; }
+    let mut u: RUsage = unsafe { std::mem::zeroed() };
+    unsafe { getrusage(0 /* RUSAGE_SELF */, &mut u) };
+    let t = |v: &TimeVal| v.sec as f64 + v.usec as f64 / 1e6;
+    t(&u.user) + t(&u.system)
 }
 
 fn log(line: &str) {

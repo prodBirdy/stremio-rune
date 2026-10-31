@@ -1,5 +1,6 @@
 //! Borderless fullscreen for the app window. Rune doesn't expose its window, so this goes to
-//! Win32 directly (Raymond Chen's style swap); elsewhere it's a no-op for now.
+//! Win32 directly (Raymond Chen's style swap); on macOS to AppKit (`mac` below: native
+//! fullscreen, the title strip under the traffic lights); elsewhere it's a no-op for now.
 
 /// Toggle the active top-level window between fullscreen and how it was. Returns whether it
 /// is fullscreen now. Call on the UI thread.
@@ -106,8 +107,13 @@ fn cloak(h: windows_sys::Win32::Foundation::HWND, on: bool) {
     unsafe { DwmSetWindowAttribute(h, DWMWA_CLOAK as _, (&raw const on).cast(), 4) };
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn toggle_fullscreen() -> bool { false }
+
+/// Whether the window is fullscreen now, where the system can change that on its own (macOS:
+/// the green button, the menu bar); `None` where only `toggle_fullscreen` does.
+#[cfg(not(target_os = "macos"))]
+pub fn fullscreen_now() -> Option<bool> { None }
 
 /// What decides whether the taskbar steps aside: the app window against its monitor, its
 /// style, who's in front, cloaking, and where the taskbar sits in the z-order. For diagnosis.
@@ -238,7 +244,7 @@ pub fn cursor() -> (i32, i32) {
     (p.x, p.y)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn cursor() -> (i32, i32) { (0, 0) }
 
 /// Device pixels per point on the primary display, and its width in points (the widest the
@@ -252,10 +258,10 @@ pub fn screen_w() -> f32 {
     unsafe { GetSystemMetrics(SM_CXSCREEN) as f32 / scale() }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn scale() -> f32 { 2.0 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn screen_w() -> f32 { 1920.0 }
 
 /// Width of each caption button (minimize, maximize, close), in points, as Windows 11 draws them.
@@ -288,8 +294,13 @@ pub fn caption() -> Caption {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn caption() -> Caption { Caption { h: 32.0, ..Default::default() } }
+
+/// macOS: the strip is the transparent title bar's, 28 points as AppKit draws it, with the
+/// traffic lights at its left; AppKit drags and zooms from it.
+#[cfg(target_os = "macos")]
+pub fn caption() -> Caption { Caption { h: 28.0, ..Default::default() } }
 
 /// A caption button's command (`SC_MINIMIZE`, `SC_CLOSE`…) to the app window, as the system's
 /// own buttons send it.
@@ -456,8 +467,120 @@ pub mod chrome {
 
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub mod chrome {
     pub fn set_main(_: &rune::WindowHandle) {}
     pub fn set_waker(_: rune::Waker) {}
+}
+
+#[cfg(target_os = "macos")]
+pub use mac::{chrome, cursor, fullscreen_now, scale, screen_w, toggle_fullscreen};
+
+/// macOS: Rune's window is an AppKit `NSWindow` with full-size content under a transparent title
+/// bar; fullscreen is AppKit's own (its own Space, the menu bar on hover), and the pointer and
+/// display come from CoreGraphics.
+#[cfg(target_os = "macos")]
+mod mac {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use std::ffi::c_void;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicPtr, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[repr(C)]
+    struct CGPoint { x: f64, y: f64 }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventCreate(source: *const c_void) -> *mut c_void;
+        fn CGEventGetLocation(event: *mut c_void) -> CGPoint;
+        fn CGMainDisplayID() -> u32;
+        fn CGDisplayCopyDisplayMode(display: u32) -> *mut c_void;
+        fn CGDisplayModeGetWidth(mode: *mut c_void) -> usize;
+        fn CGDisplayModeGetPixelWidth(mode: *mut c_void) -> usize;
+        fn CGDisplayModeRelease(mode: *mut c_void);
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(cf: *const c_void);
+    }
+
+    /// `NSWindowStyleMaskFullScreen`.
+    const FULLSCREEN: usize = 1 << 14;
+    /// How long a requested switch outranks the window's own state: AppKit flips its style mask
+    /// only as the animation gets going.
+    const SWITCH: Duration = Duration::from_secs(2);
+
+    /// The app window's `NSWindow` (null until Rune reports it).
+    static WINDOW: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
+    /// The fullscreen state last asked for, and when.
+    static WANTED: Mutex<Option<(bool, Instant)>> = Mutex::new(None);
+
+    fn window() -> Option<*mut AnyObject> { Some(WINDOW.load(Ordering::Relaxed)).filter(|w| !w.is_null()) }
+
+    pub fn fullscreen_now() -> Option<bool> {
+        let w = window()?;
+        let mask: usize = unsafe { msg_send![w, styleMask] };
+        let on = mask & FULLSCREEN != 0;
+        let mut wanted = WANTED.lock().unwrap_or_else(|e| e.into_inner());
+        match *wanted {
+            Some((want, at)) if want != on && at.elapsed() < SWITCH => Some(want),
+            _ => { *wanted = None; Some(on) }
+        }
+    }
+
+    /// Ask AppKit to switch; returns the state asked for. Call on the main (UI) thread.
+    pub fn toggle_fullscreen() -> bool {
+        let Some(w) = window() else { return false };
+        let want = !fullscreen_now().unwrap_or(false);
+        let _: () = unsafe { msg_send![w, toggleFullScreen: std::ptr::null_mut::<AnyObject>()] };
+        *WANTED.lock().unwrap_or_else(|e| e.into_inner()) = Some((want, Instant::now()));
+        want
+    }
+
+    /// The pointer on screen, in points.
+    pub fn cursor() -> (i32, i32) {
+        unsafe {
+            let e = CGEventCreate(std::ptr::null());
+            if e.is_null() { return (0, 0) }
+            let p = CGEventGetLocation(e);
+            CFRelease(e);
+            (p.x as i32, p.y as i32)
+        }
+    }
+
+    /// The main display's mode: its width in points and in pixels.
+    fn display() -> Option<(f32, f32)> {
+        unsafe {
+            let mode = CGDisplayCopyDisplayMode(CGMainDisplayID());
+            if mode.is_null() { return None }
+            let size = (CGDisplayModeGetWidth(mode) as f32, CGDisplayModeGetPixelWidth(mode) as f32);
+            CGDisplayModeRelease(mode);
+            Some(size).filter(|(w, px)| *w > 0.0 && *px > 0.0)
+        }
+    }
+
+    pub fn scale() -> f32 { display().map_or(2.0, |(w, px)| px / w) }
+
+    pub fn screen_w() -> f32 { display().map_or(1920.0, |(w, _)| w) }
+
+    pub mod chrome {
+        use super::*;
+
+        /// Keep the app window's `NSWindow`, from its content view.
+        pub fn set_main(w: &rune::WindowHandle) {
+            let view = w.with_raw_handle(|h| match h.as_raw() {
+                rune::raw_window_handle::RawWindowHandle::AppKit(h) => Some(h.ns_view.as_ptr().cast::<AnyObject>()),
+                _ => None,
+            }).ok().flatten();
+            if let Some(view) = view {
+                let window: *mut AnyObject = unsafe { msg_send![view, window] };
+                WINDOW.store(window, Ordering::Relaxed);
+            }
+        }
+
+        pub fn set_waker(_: rune::Waker) {}
+    }
 }

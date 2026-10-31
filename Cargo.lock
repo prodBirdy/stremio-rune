@@ -2699,6 +2699,7 @@ dependencies = [
  "embed-resource",
  "image",
  "libloading",
+ "objc2 0.6.5",
  "rune",
  "serde",
  "serde_json",

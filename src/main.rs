@@ -13,7 +13,10 @@ mod server;
 mod ui;
 #[cfg(windows)]
 mod video;
-#[cfg(windows)]
+#[cfg(target_os = "macos")]
+#[path = "video_mac.rs"]
+mod video;
+#[cfg(any(windows, target_os = "macos"))]
 mod videotest;
 mod window;
 
@@ -197,13 +200,19 @@ struct State {
     cache: Option<ImageCache>,
 }
 
+/// `%APPDATA%\stremio-rune\authKey`; on macOS in `~/Library/Application Support/stremio-rune`.
 fn auth_file() -> PathBuf {
-    let dir = std::env::var_os("APPDATA").or_else(|| std::env::var_os("HOME")).unwrap_or_default();
-    PathBuf::from(dir).join("stremio-rune").join("authKey")
+    let dir = if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"))
+    } else {
+        std::env::var_os("APPDATA").or_else(|| std::env::var_os("HOME")).map(PathBuf::from)
+    };
+    dir.unwrap_or_default().join("stremio-rune").join("authKey")
 }
 
 /// The session of the installed Stremio desktop app (stremio-web's `profile` in WebView2
 /// localStorage), so a signed-in Stremio needs no second login.
+#[cfg(not(target_os = "macos"))]
 fn stremio_desktop_auth() -> Option<String> {
     let dir = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
         .join(r"Programs\Stremio\stremio-shell-ng.exe.WebView2\EBWebView\Default\Local Storage\leveldb");
@@ -211,6 +220,23 @@ fn stremio_desktop_auth() -> Option<String> {
     files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
     // byte scan of LevelDB, newest record wins; misses a key only in a snappy-compressed table
     files.iter().rev().filter_map(|p| std::fs::read(p).ok()).find_map(|b| last_auth_key(&b))
+}
+
+/// The same on macOS, where Stremio's web UI runs in WebKit: its localStorage is SQLite under
+/// `~/Library/WebKit/<bundle id>`, values in UTF-16, so the scan drops the zero bytes first.
+#[cfg(target_os = "macos")]
+fn stremio_desktop_auth() -> Option<String> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() { walk(&p, out) } else if p.to_string_lossy().to_lowercase().contains("localstorage") { out.push(p) }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&PathBuf::from(std::env::var_os("HOME")?).join("Library/WebKit/com.westbridge.stremio5-mac"), &mut files);
+    files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+    files.iter().rev().filter_map(|p| std::fs::read(p).ok())
+        .find_map(|b| last_auth_key(&b).or_else(|| last_auth_key(&b.into_iter().filter(|&c| c != 0).collect::<Vec<_>>())))
 }
 
 /// The last `"auth":{"key":"…"` in a blob, unless a later `"auth":null` says it signed out.
@@ -942,6 +968,8 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
     changed |= rotate_hero(s, tx);
     let caption = window::caption();
     if caption != s.caption { s.caption = caption; changed = true }
+    // macOS: the window also leaves fullscreen by its green button or the menu bar's.
+    if let Some(on) = window::fullscreen_now() && on != s.fullscreen { s.fullscreen = on; changed = true }
     changed
 }
 
@@ -1097,8 +1125,9 @@ fn demo_player(v: &mut State) {
 
 fn main() {
     // The video's frames are Direct3D textures (video.rs), which Rune imports on DX12 only.
-    if std::env::var_os("WGPU_BACKEND").is_none() { unsafe { std::env::set_var("WGPU_BACKEND", "dx12") } }
     #[cfg(windows)]
+    if std::env::var_os("WGPU_BACKEND").is_none() { unsafe { std::env::set_var("WGPU_BACKEND", "dx12") } }
+    #[cfg(any(windows, target_os = "macos"))]
     if videotest::run() { return }
     let app = rune::App::new(AppSpec {
         setup: Some(setup),
@@ -1482,6 +1511,9 @@ mod tests {
         assert!(caption.h > 20.0 && caption.h < 50.0, "the system caption's height: {caption:?}");
         for page in [Page::Home, Page::Settings, Page::Addons, Page::Player] {
             let rt = runtime(move |s| { demo(s); s.page = page });
+            assert!(rt.find("title-bar").is_some_and(|t| t.1 < caption.h), "the strip");
+            // macOS: the window's own traffic lights; elsewhere the app draws the buttons.
+            if cfg!(target_os = "macos") { assert!(rt.find("caption-close").is_none()); continue }
             let (min, max, close) = (rt.find("caption-min").unwrap(), rt.find("caption-max").unwrap(), rt.find("caption-close").unwrap());
             assert!(min.0 < max.0 && max.0 < close.0 && close.0 > 1280.0 - window::CAPTION_BUTTON_W, "buttons at the right");
             assert!(close.1 < caption.h, "in the strip");

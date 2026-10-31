@@ -1,4 +1,5 @@
-//! Settings: the app's own (player defaults, kept in `%APPDATA%\stremio-rune\settings.json`) and
+//! Settings: the app's own (player defaults, kept beside `authKey`: `%APPDATA%\stremio-rune\settings.json`,
+//! `~/Library/Application Support/stremio-rune/settings.json` on macOS) and
 //! Stremio's streaming server's (read from and written to its `/settings`, as stremio-web does).
 //! A child of `ui` (see the `#[path]` there) so the page can use its private helpers.
 

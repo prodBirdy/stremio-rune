@@ -1,11 +1,11 @@
 # stremio-rune
 
-A native Windows client for [Stremio](https://www.stremio.com), built with the
+A native Windows and macOS client for [Stremio](https://www.stremio.com), built with the
 [Rune](https://github.com/anomalyco/rune) UI framework. It uses your Stremio account and add-ons,
 and plays through Stremio's own streaming server and mpv, so everything you have in Stremio
 works here. The UI is a dark, cinematic one in plain Rust, at 120 Hz.
 
-> **Alpha.** It works day to day on Windows 11, but expect rough edges. Windows only for now.
+> **Alpha.** It works day to day on Windows 11, but expect rough edges. The macOS port is newer.
 
 ## Features
 
@@ -18,7 +18,8 @@ works here. The UI is a dark, cinematic one in plain Rust, at 120 Hz.
   supports it.
 - **Titles:** seasons and episodes, and streams from all your add-ons in a side sheet.
 - **Player:** mpv renders on the GPU straight into the app (hardware decoding, HDR tone
-  mapping, mpv's scalers, subtitles), with no copy through the CPU. Controls float over the
+  mapping, mpv's scalers, subtitles), with no copy through the CPU: into shared Direct3D
+  textures on Windows, IOSurfaces on macOS. Controls float over the
   video and hide with the cursor when you're idle. Includes audio track and subtitle choice
   (embedded or from add-ons), a quality switch between the title's streams at the current
   position, volume, and fullscreen.
@@ -31,25 +32,45 @@ works here. The UI is a dark, cinematic one in plain Rust, at 120 Hz.
 
 ## Requirements
 
-- Windows 10 or 11 with a Direct3D 12 GPU.
-- [Stremio](https://www.stremio.com/downloads) installed. The app uses the `libmpv` and the
-  streaming server that Stremio ships. It starts the streaming server itself when Stremio
-  isn't running, and stops it again on exit.
+- Windows 10 or 11 with a Direct3D 12 GPU, or macOS 13 or later.
+- [Stremio](https://www.stremio.com/downloads) installed (on macOS, Stremio 5 in
+  `/Applications`). The app uses the `libmpv` and the streaming server
+  that Stremio ships. It starts the streaming server itself when Stremio isn't running, and
+  stops it again on exit. `MPV_LIB` points it at another libmpv.
 - A Stremio account.
 
 ## Build
+
+Windows:
 
 ```sh
 cargo build --release
 target\release\stremio-rune.exe
 ```
 
-Needs a current stable Rust (edition 2024). Video playback needs a Windows import path for Rune's `NativeSurface`;
-until that lands upstream, `Cargo.toml` patches Rune with the branch that adds it.
+macOS:
+
+```sh
+scripts/bundle-macos.sh
+open "target/release/Stremio Rune.app"
+```
+
+The script builds a release binary and wraps it as `Stremio Rune.app` (icon, Info.plist,
+ad-hoc signature); copy it to `/Applications` to keep it. `cargo run --release` works too.
+
+Needs a current stable Rust (edition 2024). Video playback on Windows needs a Windows import
+path for Rune's `NativeSurface`; until that lands upstream, `Cargo.toml` patches Rune with the
+branch that adds it. macOS uses Rune's own IOSurface import.
+
+`STREMIO_RUNE_VIDEOTEST=<video>` opens a window that only plays that file through the GPU path
+and writes frame and CPU counters to `stremio-rune-videotest.txt` in the temp folder.
 
 ## Status and limits
 
-- Windows only: the player, the window frame and fullscreen use Win32 and Direct3D.
+- Windows: the player, the window frame and fullscreen use Win32 and Direct3D.
+- macOS: the window keeps its traffic lights over the app's title strip, and fullscreen is
+  macOS's own (F11, `f` or the green button). Signing in reuses the Stremio app's session when
+  it finds one in Stremio's WebKit storage.
 - HDR is tone-mapped by mpv, which looks slightly different from mpv's own window output.
 - Not affiliated with or endorsed by Stremio. "Stremio" is a trademark of its owners.
 
