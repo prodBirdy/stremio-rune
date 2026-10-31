@@ -4,6 +4,7 @@
 //! ships. Views live in `ui.rs`, playback in `player.rs`.
 
 mod player;
+mod server;
 mod ui;
 mod window;
 
@@ -523,6 +524,12 @@ fn setup(s: &mut State, waker: Waker) {
     s.search.debounce.set_waker(waker.clone());
     s.cache = Some(cache);
     s.waker = Some(waker);
+    // Torrents need Stremio's streaming server; start it if the Stremio app isn't running it.
+    let (tx, wake) = (s.tx.clone(), s.waker.clone());
+    std::thread::spawn(move || if let Err(e) = server::ensure() {
+        let _ = tx.send(Msg::Error(e));
+        if let Some(w) = wake { w() }
+    });
     load_account(s);
 }
 
@@ -856,6 +863,16 @@ mod tests {
         let names: Vec<_> = search::catalogs(&addons).into_iter().map(|c| (c.base, c.name)).collect();
         assert_eq!(names, [("https://Cinemeta".into(), "Movies".into()), ("https://Cinemeta".into(), "Shows".to_string()), ("https://Anime".into(), "Anime · Shows".into())]);
         assert_eq!(catalogs(&addons).len(), 2, "catalogs that require search stay off Home");
+    }
+
+    #[test]
+    #[ignore = "starts Stremio's streaming server (ends with the test process)"]
+    fn streaming_server_starts_when_down() {
+        let was_up = server::running();
+        server::ensure().unwrap();
+        let t = Instant::now();
+        while !server::running() { assert!(t.elapsed().as_secs() < 20, "server never came up"); std::thread::sleep(Duration::from_millis(200)) }
+        if !was_up { assert!(get("http://127.0.0.1:11470/settings").is_ok(), "it answers HTTP") }
     }
 
     #[test]
