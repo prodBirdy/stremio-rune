@@ -877,7 +877,13 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
                 s.library = continue_watching(items);
             }
             // Pictures ask for their images when laid out near the viewport (`ui::picture`).
-            Msg::Catalog(i, items) => { s.items.insert(i, items); }
+            Msg::Catalog(i, items) => {
+                // The hero cycles through catalog 0's first titles: fetch all their backdrops now,
+                // so each turn shows its image at once instead of starting a download.
+                let heroes: Vec<String> = if i == 0 { items.iter().take(HERO_PICKS).filter_map(|m| ui::hero_img(backdrop(m))).collect() } else { vec![] };
+                s.items.insert(i, items);
+                want(s, heroes);
+            }
             Msg::More(r, metas) => more_landed(s, r, metas),
             Msg::Image(url, img) => if let Some(c) = &s.cache {
                 s.tick += 1;
@@ -1832,6 +1838,19 @@ mod tests {
         let t = Instant::now();
         while !server::running() { assert!(t.elapsed().as_secs() < 20, "server never came up"); std::thread::sleep(Duration::from_millis(200)) }
         if !was_up { assert!(get("http://127.0.0.1:11470/settings").is_ok(), "it answers HTTP") }
+    }
+
+    #[test]
+    fn every_hero_backdrop_is_fetched_when_the_hero_titles_arrive() {
+        let mut rt = runtime(|s| { demo(s); s.page = Page::Home; s.items.clear() });
+        let titles: Vec<Value> = (1..9).map(|n| json!({ "id": format!("tt{n}"), "type": "movie", "name": "x" })).collect();
+        rt.state.tx.send(Msg::Catalog(0, titles.clone())).unwrap();
+        rt.update(|s, tx| { poll(s, 0.0, tx); });
+        let queued: Vec<String> = rt.state.queue.0.lock().unwrap().iter().cloned().collect();
+        for m in titles.iter().take(HERO_PICKS) {
+            let key = ui::hero_img(backdrop(m)).unwrap();
+            assert!(queued.contains(&key) || rt.state.requested.contains(&key), "hero image queued before it shows: {key}");
+        }
     }
 
     #[test]
