@@ -13,9 +13,10 @@ use player::{Mpv, Playback};
 use ui::search;
 use rune::{AppSpec, Image, ImageCache, Key, KeyEvent, TextEdit, Tween, Tx, Waker};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Height of the control bar under the video, and width of the subtitles panel, in points.
@@ -31,6 +32,15 @@ const HERO_PICKS: usize = 5;
 const HERO_EVERY: Duration = Duration::from_secs(4);
 /// Width of the hero's current dot, which fills over `HERO_EVERY`.
 const DOT_W: f32 = 28.0;
+
+/// Decoded image pixels kept; least recently used go first past this. Rune keeps a mip chain of
+/// each on the GPU too (~4/3 of this).
+const IMAGE_BUDGET: usize = 160 << 20;
+/// Image fetch threads: enough to hide latency, few enough that the first images aren't starved.
+const IMAGE_WORKERS: usize = 6;
+
+/// Image bytes fetched so far, for `measure_home_images`.
+static DOWNLOADED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 const API: &str = "https://api.strem.io/api/";
 const SERVER: &str = "http://127.0.0.1:11470";
@@ -84,9 +94,17 @@ struct State {
     /// counter that keys it so each title's fill starts over.
     hero_fill: Tween<[f32; 4]>,
     hero_round: u64,
-    // unbounded, ~1-4 MB per backdrop; evict by last use if long sessions bloat
     images: HashMap<String, Image>,
+    /// Decoded bytes and last use of each image in `images`, for `evict`.
+    lru: HashMap<String, (usize, u64)>,
+    tick: u64,
+    /// Images loaded, loading or queued.
     requested: HashSet<String>,
+    /// Images waiting for a worker, best first, and the page they were wanted for.
+    queue: Arc<(Mutex<VecDeque<String>>, Condvar)>,
+    queue_page: Page,
+    /// Height of the window in points, for what counts as near the viewport.
+    view_h: f32,
     meta_id: String,
     /// The page a detail page goes back to (Home, Browse or Search).
     back_to: Page,
@@ -167,7 +185,12 @@ fn state() -> State {
         hero_fill: dot_fill(),
         hero_round: 0,
         images: HashMap::new(),
+        lru: HashMap::new(),
+        tick: 0,
         requested: HashSet::new(),
+        queue: Default::default(),
+        queue_page: Page::Login,
+        view_h: 800.0,
         meta_id: String::new(),
         back_to: Page::Home,
         meta: None,
@@ -310,23 +333,86 @@ fn episode_of(video_id: &str) -> Option<(i64, i64)> {
     Some((season, ep))
 }
 
-/// Fetch and decode images off the main thread. Decoding here also covers WebP, which
-/// metahub serves and Rune's ImageCache can't decode on desktop.
-fn want(s: &mut State, urls: impl IntoIterator<Item = String>) {
-    let todo: Vec<String> = urls.into_iter().filter(|u| s.requested.insert(u.clone())).collect();
-    for chunk in todo.chunks(8) { // a thread per 8 images; a shared pool if pages get huge
-        let (tx, wake, chunk) = (s.tx.clone(), s.waker.clone(), chunk.to_vec());
-        std::thread::spawn(move || for url in chunk {
-            let fetch = |u: &String| {
-                let bytes = ureq::get(u).call().ok()?.body_mut().read_to_vec().ok()?;
-                image::load_from_memory(&bytes).ok()
+/// The image key for `url` shown `pt` points wide: metahub's smallest variant that covers it at
+/// the display scale (2× at most), and the width to decode to after `#w`.
+fn sized(url: &str, pt: f32) -> String {
+    sized_px(url, (pt * window::scale().min(2.0)).round() as u32)
+}
+
+fn sized_px(url: &str, px: u32) -> String {
+    // Measured: background small 480 wide, medium = large 1920; poster 300, 500, 780. A tenth
+    // short of the width still looks sharp.
+    let fit = |sizes: &[(&'static str, u32)]| sizes.iter().find(|s| s.1 as f32 >= px as f32 * 0.9).unwrap_or(sizes.last().unwrap()).0;
+    let mut parts: Vec<&str> = url.split('/').collect(); // https://images.metahub.space/{kind}/{size}/{id}/img
+    if parts.len() > 4 && parts[2].ends_with("metahub.space") {
+        match parts[3] {
+            "background" => parts[4] = fit(&[("small", 480), ("medium", 1920)]),
+            "poster" => parts[4] = fit(&[("small", 300), ("medium", 500), ("large", 780)]),
+            _ => {}
+        }
+    }
+    format!("{}#w{px}", parts.join("/"))
+}
+
+/// Fetch and decode an image key (a URL, sized by `sized` or else capped at 1280 px wide).
+/// Decoding here also covers WebP, which metahub serves and Rune's ImageCache can't decode on
+/// desktop.
+fn load_image(key: &str) -> Option<image::RgbaImage> {
+    let (url, w) = key.rsplit_once("#w").and_then(|(u, w)| Some((u, w.parse().ok()?))).unwrap_or((key, 1280));
+    let fetch = |u: &String| {
+        let bytes = ureq::get(u).call().ok()?.body_mut().read_to_vec().ok()?;
+        DOWNLOADED.fetch_add(bytes.len(), std::sync::atomic::Ordering::Relaxed);
+        image::load_from_memory(&bytes).ok()
+    };
+    let img = fallbacks(url).iter().find_map(fetch)?;
+    Some(if img.width() > w { img.thumbnail(w, w * 4) } else { img }.to_rgba8())
+}
+
+/// The fetch pool: workers take the queue's front, so the first wanted loads first.
+fn start_image_workers(s: &State) {
+    for _ in 0..IMAGE_WORKERS {
+        let (queue, tx, wake) = (s.queue.clone(), s.tx.clone(), s.waker.clone());
+        std::thread::spawn(move || loop {
+            let key = {
+                let (q, ready) = &*queue;
+                ready.wait_while(q.lock().unwrap(), |q| q.is_empty()).unwrap().pop_front().unwrap()
             };
-            let Some(img) = fallbacks(&url).iter().find_map(fetch) else { continue };
-            // Cap at 1280 px wide: enough for a full-window hero, bounded memory per image.
-            let img = if img.width() > 1280 { img.resize(1280, 1280 * 4, image::imageops::FilterType::Triangle) } else { img };
-            let _ = tx.send(Msg::Image(url, img.to_rgba8()));
+            // A codec panic on a bad file fails that image, not the worker.
+            let Some(img) = std::panic::catch_unwind(|| load_image(&key)).ok().flatten() else { continue };
+            let _ = tx.send(Msg::Image(key, img));
             if let Some(w) = &wake { w() }
         });
+    }
+}
+
+/// Queue images not yet asked for, in order, and mark them all just used. Work still queued
+/// for a page we left is dropped (it's asked for again on return).
+fn want(s: &mut State, urls: impl IntoIterator<Item = String>) {
+    let queue = s.queue.clone();
+    let (q, ready) = &*queue;
+    let mut q = q.lock().unwrap();
+    if s.queue_page != s.page {
+        for k in q.drain(..) { s.requested.remove(&k); }
+        s.queue_page = s.page;
+    }
+    s.tick += 1;
+    for u in urls {
+        if let Some(e) = s.lru.get_mut(&u) { e.1 = s.tick }
+        if s.requested.insert(u.clone()) { q.push_back(u) }
+    }
+    ready.notify_all();
+}
+
+/// Drop least recently used images until the decoded pixels fit `budget`.
+// an image on screen that hasn't moved is "used" when it was laid out; a page bigger
+// than the budget would evict its own images (they reload when they move again).
+fn evict(s: &mut State, budget: usize) {
+    let mut total: usize = s.lru.values().map(|e| e.0).sum();
+    while total > budget {
+        let Some(k) = s.lru.iter().min_by_key(|e| e.1.1).map(|e| e.0.clone()) else { break };
+        total -= s.lru.remove(&k).map_or(0, |e| e.0);
+        s.images.remove(&k);
+        s.requested.remove(&k);
     }
 }
 
@@ -377,14 +463,9 @@ fn fetch_catalog(s: &mut State, i: usize) {
     spawn(s, move || Ok(Msg::Catalog(i, get(&url)?["metas"].as_array().cloned().unwrap_or_default())));
 }
 
-fn posters(items: &[Value]) -> Vec<String> {
-    items.iter().filter_map(|m| m["poster"].as_str().map(String::from)).collect()
-}
-
 fn open_catalog(s: &mut State, i: usize) {
     s.selected = i;
     fetch_catalog(s, i);
-    if let Some(items) = s.items.get(&i) { let p = posters(items); want(s, p) }
 }
 
 fn go(s: &mut State, page: Page) {
@@ -557,6 +638,7 @@ fn setup(s: &mut State, waker: Waker) {
         let _ = tx.send(Msg::Error(e));
         if let Some(w) = wake { w() }
     });
+    start_image_workers(s);
     load_account(s);
 }
 
@@ -615,22 +697,18 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
             }
             Msg::Library(items) => {
                 s.library = continue_watching(items);
-                let urls: Vec<String> = s.library.iter().take(ROW_CARDS).filter_map(backdrop).collect();
-                want(s, urls);
             }
-            Msg::Catalog(i, items) => {
-                let mut urls: Vec<String> = items.iter().take(ROW_CARDS.max(HERO_PICKS)).filter_map(backdrop).collect();
-                if s.page == Page::Browse(type_static(&s.catalogs[i].ty)) && s.selected == i { urls.extend(posters(&items)) }
-                s.items.insert(i, items);
-                want(s, urls);
-            }
+            // Pictures ask for their images when laid out near the viewport (`ui::picture`).
+            Msg::Catalog(i, items) => { s.items.insert(i, items); }
             Msg::Image(url, img) => if let Some(c) = &s.cache {
+                s.tick += 1;
+                s.lru.insert(url.clone(), (img.as_raw().len(), s.tick));
                 s.images.insert(url, c.rgba(img.width(), img.height(), img.into_raw()));
+                evict(s, IMAGE_BUDGET);
             },
             Msg::Meta(id, meta) if id == s.meta_id => {
                 let ty = meta["type"].as_str().unwrap_or("movie").to_string();
                 let episodic = ty != "movie" && meta["videos"].as_array().is_some_and(|v| !v.is_empty());
-                want(s, backdrop(&meta));
                 s.season = s.resume.as_ref().and_then(|(v, _)| episode_of(v)).map(|(se, _)| se)
                     .or_else(|| ui::seasons(&meta).into_iter().find(|&n| n > 0))
                     .unwrap_or(0);
@@ -674,11 +752,6 @@ fn show_hero(s: &mut State, i: usize) {
     s.hero_at = Instant::now();
     s.hero_fill = dot_fill();
     s.hero_round += 1;
-}
-
-/// The `&'static str` a Browse page is keyed by, for the two types the nav offers.
-fn type_static(ty: &str) -> &'static str {
-    match ty { "movie" => "movie", "series" => "series", _ => "" }
 }
 
 /// Fake data for headless `--snap … --scene <name>` renders.
@@ -871,6 +944,84 @@ mod tests {
         assert!(rt.find("sheet").is_some());
         click(&mut rt, "sheet-scrim");
         assert!(!rt.state.sheet);
+    }
+
+    /// Home as Cinemeta alone fills it: 5 hero picks, then rows of 5 from four catalogs.
+    #[test]
+    #[ignore = "network: times Home's images from Cinemeta and metahub"]
+    fn measure_home_images() {
+        let cat = |p: &str| get(&format!("https://v3-cinemeta.strem.io/catalog/{p}.json")).unwrap()["metas"].as_array().cloned().unwrap();
+        let rows = ["movie/top", "series/top", "movie/imdbRating", "series/imdbRating"].map(cat);
+        // In Home's order: the hero, the first row (above the fold), the rest, other hero picks.
+        let mut keys: Vec<String> = ui::hero_img(backdrop(&rows[0][0])).into_iter().collect();
+        keys.extend(rows[0][HERO_PICKS..HERO_PICKS + ROW_CARDS].iter().filter_map(|m| ui::card_img(backdrop(m))));
+        for r in &rows[1..] { keys.extend(r[..ROW_CARDS].iter().filter_map(|m| ui::card_img(backdrop(m)))) }
+        keys.extend(rows[0][1..HERO_PICKS].iter().filter_map(|m| ui::hero_img(backdrop(m))));
+        let mut s = state();
+        start_image_workers(&s);
+        let t = Instant::now();
+        want(&mut s, keys.clone());
+        let fold: HashSet<&String> = keys[..1 + ROW_CARDS].iter().collect();
+        let (mut first, mut above, mut last, mut px, mut n) = (None, 0, t.elapsed(), 0usize, 0);
+        let mut fold_at = Duration::ZERO;
+        while let Ok(Msg::Image(key, img)) = s.rx.recv_timeout(Duration::from_secs(10)) {
+            last = t.elapsed();
+            first.get_or_insert((last, key.clone()));
+            if fold.contains(&key) { above += 1; fold_at = last }
+            px += (img.width() * img.height() * 4) as usize;
+            n += 1;
+            if n == keys.len() { break }
+        }
+        let (first, first_key) = first.unwrap();
+        println!("scale {} screen {}pt hero {} card {}", window::scale(), window::screen_w(), keys[0], keys[1]);
+        println!("images {n}/{} first {first:?} (hero: {}) above the fold {above}/{} {fold_at:?} all {:?} downloaded {} KB decoded {} KB",
+            keys.len(), first_key == keys[0], fold.len(), last, DOWNLOADED.load(std::sync::atomic::Ordering::Relaxed) / 1024, px / 1024);
+    }
+
+    #[test]
+    fn images_take_the_smallest_sharp_variant_and_the_cache_drops_the_least_recently_used() {
+        let mh = |kind: &str, size: &str| format!("https://images.metahub.space/{kind}/{size}/tt1/img");
+        assert_eq!(sized_px(&mh("background", "medium"), 472), mh("background", "small") + "#w472"); // a card at 1×
+        assert_eq!(sized_px(&mh("background", "small"), 944), mh("background", "medium") + "#w944"); // at 2×
+        assert_eq!(sized_px(&mh("background", "medium"), 2560), mh("background", "medium") + "#w2560"); // a hero: the largest
+        assert_eq!(sized_px(&mh("poster", "small"), 320), mh("poster", "small") + "#w320");
+        assert_eq!(sized_px(&mh("poster", "small"), 600), mh("poster", "large") + "#w600");
+        assert_eq!(sized_px(&mh("logo", "medium"), 600), mh("logo", "medium") + "#w600");
+        assert_eq!(sized_px("https://x.org/a.jpg", 300), "https://x.org/a.jpg#w300");
+
+        let mut s = state();
+        for (k, used) in [("a", 3), ("b", 1), ("c", 2)] { s.lru.insert(k.into(), (40, used)); s.requested.insert(k.into()); }
+        evict(&mut s, 120);
+        assert_eq!(s.lru.len(), 3, "within budget");
+        evict(&mut s, 100);
+        assert!(!s.lru.contains_key("b") && !s.requested.contains("b"), "the oldest goes, and may be fetched again");
+        evict(&mut s, 40);
+        assert_eq!(s.lru.keys().collect::<Vec<_>>(), ["a"]);
+    }
+
+    #[test]
+    fn home_queues_the_hero_first_then_rows_near_the_viewport_and_drops_them_on_leaving() {
+        let mut rt = runtime(|s| {
+            demo(s);
+            for i in 2..HOME_ROWS {
+                s.catalogs.push(Catalog { base: String::new(), ty: "movie".into(), id: format!("c{i}"), name: format!("Row {i}") });
+                s.items.insert(i, (i * 10..i * 10 + 5).map(|n| json!({ "id": format!("tt{n}"), "name": "x",
+                    "poster": format!("https://images.metahub.space/poster/small/tt{n}/img") })).collect());
+            }
+            for m in s.items.get_mut(&0).unwrap() { m["poster"] = format!("https://images.metahub.space/poster/small/{}/img", m["id"].as_str().unwrap()).into() }
+            s.page = Page::Home;
+        });
+        for _ in 0..3 { rt.frame(1.0 / 60.0); }
+        let queued: Vec<String> = rt.state.queue.0.lock().unwrap().iter().cloned().collect();
+        assert_eq!(Some(&queued[0]), ui::hero_img(backdrop(&rt.state.items[&0][0])).as_ref(), "hero first");
+        let card = |n: usize| ui::card_img(backdrop(&json!({ "id": format!("tt{n}") }))).unwrap();
+        let at = |n: usize| queued.iter().position(|k| *k == card(n));
+        assert!(at(6) < at(9) && at(9) < at(20), "rows top-down");
+        assert_eq!(at(50), None, "the last row is over two screens down: not yet");
+        click(&mut rt, "nav-Movies");
+        let queued: Vec<String> = rt.state.queue.0.lock().unwrap().iter().cloned().collect();
+        assert!(!queued.is_empty() && queued.iter().all(|k| k.contains("/poster/")), "Home's queue dropped for Browse's posters");
+        assert!(!rt.state.requested.contains(&card(6)), "and asked for again on return");
     }
 
     #[test]

@@ -72,9 +72,7 @@ pub fn run(s: &mut State, q: String) {
 
 pub fn landed(s: &mut State, q: String, i: usize, metas: Vec<Value>) {
     if q != s.search.query.text.trim() { return } // typed on since
-    let p = posters(&metas);
-    s.search.results.insert(i, metas);
-    want(s, p);
+    s.search.results.insert(i, metas); // posters load lazily as their cards lay out
 }
 
 pub fn open(s: &mut State) {
