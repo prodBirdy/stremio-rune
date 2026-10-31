@@ -1178,6 +1178,8 @@ mod tests {
     fn controls_float_only_while_active_and_panels_toggle() {
         let mut rt = controls(demo_controls);
         assert!(rt.find("bar").is_some() && rt.find("video").is_some() && rt.find("loader").is_none());
+        let (back, toggle) = (rt.find("back").expect("back"), rt.find("toggle").expect("play/pause"));
+        assert!(back.1 < 100.0 && toggle.1 > 700.0, "back and the title at the top, play/pause at the bottom");
         let mut s = state();
         click(&mut rt, "quality");
         apply(&mut rt, &mut s);
@@ -1193,7 +1195,7 @@ mod tests {
         // Pushed state: the bar goes when the mouse rests; the button names what plays.
         let mut rt = controls(|c| { demo_controls(c); c.shown.controls = false });
         for _ in 0..60 { rt.frame(1.0 / 60.0); }
-        assert!(rt.find("bar").is_none(), "controls hidden");
+        assert!(rt.find("bar").is_none() && rt.find("top-bar").is_none(), "controls hidden, top and bottom");
         let rt = controls(|c| { demo_controls(c); c.shown.playback.buffering = true });
         assert!(rt.find("loader").is_some(), "the loader floats over the frozen frame");
         // `shown` copies the app's state, in whole seconds.

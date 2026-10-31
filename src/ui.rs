@@ -553,8 +553,9 @@ fn seek(c: &mut Ctl, d: &mut Drag, _: &mut Tx) {
     c.send(move |s| mpv(s, &["seek", &at, "absolute"]));
 }
 
-/// The floating controls, over the whole video: the loader while it loads, the bar on a scrim
-/// along the bottom while the mouse is active, fading in and out, and the Audio & Subtitles or Quality panel on the right.
+/// The floating controls, over the whole video: the loader while it loads, and while the mouse
+/// is active, back and the title along the top and the bar along the bottom, each on a scrim,
+/// fading in and out, and the Audio & Subtitles or Quality panel on the right.
 /// Clear elsewhere; double-click toggles fullscreen, and the cursor hides with the controls.
 pub fn controls(c: &Ctl, _: &mut Cx<Ctl>) -> El {
     let v = &c.shown;
@@ -562,6 +563,14 @@ pub fn controls(c: &Ctl, _: &mut Cx<Ctl>) -> El {
         .child(el().key("video").w_full().grow(1.0).on_double_press(act(toggle_fullscreen)));
     if v.playback.loading() { stage = stage.child(loader(v.logo.as_ref().map(|l| &l.0), &v.playback)) }
     if v.controls {
+        // Back and the title along the top, on a scrim of their own; they fade with the bar.
+        stage = stage.child(row().key("top-bar").pin(Some(0.0), Some(0.0), Some(0.0), None).h(BAR + 48.0).px(14.0).pb(48.0).gap(12.0).center_y()
+            .linear_gradient(PI, [(0.0, Color::BLACK.alpha(0.75)), (1.0, Color::BLACK.alpha(0.0))])
+            .transition(Transition::opacity())
+            .on_hover_change(|c: &mut Ctl, inside, _| c.send(move |s| s.bar_hover = inside))
+            .child(tap(row().key("back").size(40.0, 40.0).radius(20.0).center().hover(ink(0.14))
+                .child(glyph(&c.icons, |i| &i.back, 20.0))).on_press(act(stop)))
+            .child(label(v.title.clone(), 17.0, 600.0, Color::WHITE).truncate().grow(1.0).min_w(0.0)));
         stage = stage.child(col().key("controls").w_full().pt(72.0)
             .linear_gradient(0.0, [(0.0, Color::BLACK.alpha(0.82)), (1.0, Color::BLACK.alpha(0.0))])
             .transition(Transition::opacity())
@@ -579,7 +588,6 @@ fn bar(c: &Ctl) -> El {
     let frac = if p.dur > 0.0 { (at / p.dur) as f32 } else { 0.0 };
     let round = |key: &str, on: bool| tap(row().key(key.to_string()).size(40.0, 40.0).radius(20.0).center()
         .fill(if on { ink(0.16) } else { Color::TRANSPARENT }).hover(ink(0.14)));
-    let back = round("back", false).child(glyph(&c.icons, |i| &i.back, 20.0)).on_press(act(stop));
     let toggle = round("toggle", false).child(glyph(&c.icons, |i| if p.paused { &i.play } else { &i.pause }, 20.0))
         .on_press(act(|s| mpv(s, &["cycle", "pause"])));
     let time = |secs: f64| label(clock(secs), 14.0, 500.0, ink(0.85)).font(TextStyle::new(14.0, 500.0).features("'tnum' 1"));
@@ -588,8 +596,7 @@ fn bar(c: &Ctl) -> El {
         .child(progress(frac, if c.scrub.is_some() { 6.0 } else { 4.0 }).w_full());
     let mut bar = row().key("bar").w_full().h(BAR).px(14.0).gap(10.0).center_y()
         .on_hover_change(|c: &mut Ctl, inside, _| c.send(move |s| s.bar_hover = inside))
-        .child(back).child(toggle)
-        .child(label(v.title.clone(), 15.0, 600.0, Color::WHITE).truncate().max_w(260.0)).child(el().w(6.0));
+        .child(toggle).child(el().w(4.0));
     if p.started && p.buffering { bar = bar.child(label(format!("Buffering {}%", p.cache_pct as u32), 13.0, 500.0, ink(0.7))) }
     bar = bar.child(time(at)).child(track).child(time(p.dur));
     if !v.streams.is_empty() {
