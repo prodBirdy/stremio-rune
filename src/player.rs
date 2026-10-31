@@ -87,10 +87,24 @@ const FLAG: c_int = 3;
 const INT64: c_int = 4;
 const DOUBLE: c_int = 5;
 
+/// mpv's core handle for a thread of ours: libmpv's client API is thread-safe.
+#[cfg(windows)]
+struct Core(*mut c_void);
+#[cfg(windows)]
+unsafe impl Send for Core {}
+
+fn command(ctx: *mut c_void, args: &[&str]) -> Result<(), String> {
+    let command: unsafe extern "C" fn(*mut c_void, *const *const c_char) -> c_int = sym(b"mpv_command\0")?;
+    let args: Vec<CString> = args.iter().map(|a| cs(a)).collect();
+    let argv: Vec<*const c_char> = args.iter().map(|a| a.as_ptr()).chain([std::ptr::null()]).collect();
+    if unsafe { command(ctx, argv.as_ptr()) } < 0 { return Err(format!("mpv {} failed", args[0].to_string_lossy())) }
+    Ok(())
+}
+
 impl Mpv {
     /// Start `url`, at `start` seconds if given, with `extra` options (the user's settings) last.
     /// With `surface`, frames go there through the GPU (see `video.rs`) once the app gives a
-    /// size (`set_video_size`); without, mpv draws in a child window of the app.
+    /// size (`set_video_size`); without (headless tests), nothing is shown.
     pub fn play(url: &str, title: &str, waker: Option<Waker>, start: Option<f64>, extra: Vec<(&'static str, String)>,
         surface: Option<rune::NativeSurface>) -> Result<Mpv, String> {
         let create: unsafe extern "C" fn() -> *mut c_void = sym(b"mpv_create\0")?;
@@ -122,25 +136,23 @@ impl Mpv {
                 observe(ctx, id, cs(name).as_ptr(), format);
             }
         }
-        // Keys and clicks land in mpv's window while the video has focus; hand the
-        // app-level ones back to the app.
-        for (key, cmd) in [("ESC", "script-message escape"), ("f", "script-message fullscreen"),
-            ("F11", "script-message fullscreen"), ("MBTN_LEFT_DBL", "script-message fullscreen")] {
-            mpv.command(&["keybind", key, cmd])?;
+        match surface {
+            // The file loads once the renderer is up, on its thread (see `FrameSource::start`):
+            // setting it up mustn't hold the UI.
+            #[cfg(windows)]
+            Some(surface) => {
+                let (core, url) = (Core(ctx), url.to_string());
+                mpv.video = Some(crate::video::FrameSource::start(ctx, surface, move || {
+                    let core = core;
+                    let _ = command(core.0, &["loadfile", &url]);
+                }));
+            }
+            _ => command(ctx, &["loadfile", url]).map_err(|_| format!("mpv couldn't load {url}"))?,
         }
-        #[cfg(windows)]
-        if let Some(surface) = surface { mpv.video = Some(crate::video::FrameSource::start(ctx, surface)?) }
-        mpv.command(&["loadfile", url]).map_err(|_| format!("mpv couldn't load {url}"))?;
         Ok(mpv)
     }
 
-    pub fn command(&self, args: &[&str]) -> Result<(), String> {
-        let command: unsafe extern "C" fn(*mut c_void, *const *const c_char) -> c_int = sym(b"mpv_command\0")?;
-        let args: Vec<CString> = args.iter().map(|a| cs(a)).collect();
-        let argv: Vec<*const c_char> = args.iter().map(|a| a.as_ptr()).chain([std::ptr::null()]).collect();
-        if unsafe { command(self.ctx, argv.as_ptr()) } < 0 { return Err(format!("mpv {} failed", args[0].to_string_lossy())) }
-        Ok(())
-    }
+    pub fn command(&self, args: &[&str]) -> Result<(), String> { command(self.ctx, args) }
 
     /// Play `url` instead, from `at` seconds, keeping the audio and subtitle languages. Track ids
     /// belong to the old file, so the new one picks by language; an addon subtitle comes along.
@@ -206,6 +218,8 @@ impl Mpv {
         #[repr(C)] struct ClientMessage { num_args: c_int, args: *const *const c_char }
         let wait: unsafe extern "C" fn(*mut c_void, f64) -> *const Event = sym(b"mpv_wait_event\0").ok()?;
         let describe: unsafe extern "C" fn(c_int) -> *const c_char = sym(b"mpv_error_string\0").ok()?;
+        #[cfg(windows)]
+        if let Some(e) = self.video.as_ref().and_then(|v| v.error()) { return Some(Some(format!("Can't show the video: {e}"))) }
         let mut ended = None;
         loop {
             let e = unsafe { &*wait(self.ctx, 0.0) };

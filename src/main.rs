@@ -968,7 +968,9 @@ fn fullscreen_selftest(s: &mut State, tx: &mut Tx) -> bool {
         use std::io::Write;
         let path = std::env::temp_dir().join("stremio-rune-fstest.txt");
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "[{t:.1}s] {what} (fullscreen {}, strip {:?}, video {:?}): {}", s.fullscreen, s.caption, s.video_size, window::diag());
+            let _ = writeln!(f, "[{t:.1}s] {what} (fullscreen {}, strip {:?}, video {:?}, mpv dropped {:?} delayed {:?}, rendered {:?}): {}", s.fullscreen, s.caption, s.video_size,
+                s.player.as_ref().and_then(|p| p.property("frame-drop-count")), s.player.as_ref().and_then(|p| p.property("vo-delayed-frame-count")),
+                s.player.as_ref().and_then(|p| p.video_stats()).map(|v| (v.frames, v.starved)), window::diag());
         }
     };
     let step = STEP.load(Ordering::Relaxed);

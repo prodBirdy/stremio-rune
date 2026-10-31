@@ -81,6 +81,8 @@ struct Shared {
     size: AtomicU64,
     quit: AtomicBool,
     stats: Mutex<Stats>,
+    /// Why the renderer couldn't start, if it couldn't.
+    error: Mutex<Option<String>>,
 }
 
 /// Frames from mpv into `surface`. Drop it before the mpv core it was started on.
@@ -101,25 +103,30 @@ unsafe extern "C" fn on_update(data: *mut c_void) {
 
 impl FrameSource {
     /// Attach mpv's OpenGL renderer to `mpv` (an initialized core with `vo=libmpv`, before any
-    /// file is loaded) and start pushing frames into `surface`. Returns once the renderer is up.
-    pub fn start(mpv: *mut c_void, surface: NativeSurface) -> Result<FrameSource, String> {
+    /// file is loaded) and start pushing frames into `surface`. Returns at once: setting up GL,
+    /// D3D and mpv's renderer takes a moment, and `load` (loading the file) runs on the render
+    /// thread once it's done, as mpv needs its renderer before a video starts. If it can't be set
+    /// up, `error` says why.
+    pub fn start(mpv: *mut c_void, surface: NativeSurface, load: impl FnOnce() + Send + 'static) -> FrameSource {
         let (kick, wake) = sync_channel(1);
-        let shared = Arc::new(Shared { size: AtomicU64::new(0), quit: AtomicBool::new(false), stats: Mutex::new(Stats::default()) });
-        let (ready_tx, ready_rx) = sync_channel(1);
+        let shared = Arc::new(Shared { size: AtomicU64::new(0), quit: AtomicBool::new(false), stats: Mutex::new(Stats::default()),
+            error: Mutex::new(None) });
         let (core, sh, k) = (Core(mpv), shared.clone(), kick.clone());
         let thread = std::thread::Builder::new().name("mpv-render".into()).spawn(move || {
             let core = core;
             match Renderer::new(core.0, k) {
                 Ok(mut r) => {
-                    let _ = ready_tx.send(Ok(()));
+                    load();
                     r.run(wake, sh, surface);
                 }
-                Err(e) => { let _ = ready_tx.send(Err(e)); }
+                Err(e) => *sh.error.lock().unwrap() = Some(e),
             }
-        }).map_err(|e| e.to_string())?;
-        ready_rx.recv().map_err(|_| "the render thread ended".to_string())??;
-        Ok(FrameSource { kick, shared, thread: Some(thread) })
+        });
+        if let Err(e) = &thread { *shared.error.lock().unwrap() = Some(e.to_string()) }
+        FrameSource { kick, shared, thread: thread.ok() }
     }
+
+    pub fn error(&self) -> Option<String> { self.shared.error.lock().unwrap().clone() }
 
     /// Render at this many device pixels from the next frame (and redraw the current one).
     pub fn set_size(&self, w: u32, h: u32) {
