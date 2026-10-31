@@ -58,6 +58,10 @@ open "target/release/Stremio Rune.app"
 The script builds a release binary and wraps it as `Stremio Rune.app` (icon, Info.plist,
 ad-hoc signature); copy it to `/Applications` to keep it. `cargo run --release` works too.
 
+Windows installer: `installer\build.ps1` builds `target\release\stremio-rune-setup.exe`, a
+per-user install (no admin) into `%LOCALAPPDATA%\Programs\stremio-rune`, with a Start-menu
+shortcut, an "Apps" entry and an uninstaller.
+
 Needs a current stable Rust (edition 2024). Video playback on Windows needs a Windows import
 path for Rune's `NativeSurface`; until that lands upstream, `Cargo.toml` patches Rune with the
 branch that adds it. macOS uses Rune's own IOSurface import.
