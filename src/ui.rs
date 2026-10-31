@@ -6,6 +6,9 @@ use rune::tok::{TextStyle, motion};
 use rune::{Color, Cursor, Cx, Cycle, Drag, El, Phase, ScrollSpec, SurfaceFit, Transition, col, el, oklch, row, text, text_input};
 use std::f32::consts::PI;
 
+#[path = "search.rs"]
+pub mod search;
+
 const PAD: f32 = 56.0;
 const HERO_H: f32 = 560.0;
 
@@ -86,9 +89,14 @@ fn nav(s: &State) -> El {
         .linear_gradient(PI * 0.75, [(0.0, ink(0.35)), (1.0, ink(0.12))])
         .child(label(initial, 16.0, 600.0, Color::WHITE)))
         .on_press(|s: &mut State| s.menu = !s.menu);
+    let on = s.page == Page::Search;
+    let find = tap(row().key("nav-search").size(38.0, 38.0).radius(19.0).center()
+        .fill(if on { ink(0.18) } else { Color::TRANSPARENT }).hover(ink(0.1))
+        .child(icon(s, |i| &i.search, 18.0)))
+        .on_press(search::open);
     let pill = glass(row().key("nav").h(50.0).px(6.0).gap(4.0).radius(25.0).center_y())
         .shadow(10.0, 30.0, Color::BLACK.alpha(0.35))
-        .child(item("Home", Page::Home)).child(item("Movies", Page::Browse("movie"))).child(item("Shows", Page::Browse("series")))
+        .child(find).child(item("Home", Page::Home)).child(item("Movies", Page::Browse("movie"))).child(item("Shows", Page::Browse("series")))
         .child(el().w(4.0)).child(avatar);
     // The menu hangs off a plain wrapper so the pill's blur layer doesn't clip it.
     let mut anchor = el().child(pill);
@@ -267,6 +275,18 @@ fn chip(key: String, words: String, on: bool) -> El {
         .child(label(words, 15.0, if on { 600.0 } else { 500.0 }, if on { Color::BLACK } else { ink(0.85) })))
 }
 
+/// A 2:3 poster with its title and year; opens the title's detail page.
+fn poster_card(s: &State, m: &Value, key: String) -> El {
+    let (t, id) = (s_(&m["type"]).to_string(), s_(&m["id"]).to_string());
+    let poster = picture(s, m["poster"].as_str()).w_full().aspect_ratio(2.0 / 3.0).radius(12.0).clip_rounded(12.0)
+        .border(1.0, ink(0.08)).shadow(8.0, 22.0, Color::BLACK.alpha(0.4));
+    tap(col().key(key).gap(10.0).min_w(0.0))
+        .child(poster)
+        .child(label(s_(&m["name"]).to_string(), 15.0, 600.0, Color::WHITE).truncate())
+        .child(label(s_(&m["releaseInfo"]).to_string(), 13.0, 500.0, ink(0.5)))
+        .on_press(move |s: &mut State| open_meta(s, t.clone(), id.clone()))
+}
+
 fn browse(s: &State, ty: &str) -> El {
     let mut chips = row().w_full().gap(10.0).flex_wrap();
     for (i, c) in s.catalogs.iter().enumerate().filter(|(_, c)| c.ty == ty) {
@@ -274,14 +294,7 @@ fn browse(s: &State, ty: &str) -> El {
     }
     let mut grid = row().w_full().equal_columns(7).gap(22.0);
     for m in s.items.get(&s.selected).into_iter().flatten() {
-        let (t, id) = (s_(&m["type"]).to_string(), s_(&m["id"]).to_string());
-        let poster = picture(s, m["poster"].as_str()).w_full().aspect_ratio(2.0 / 3.0).radius(12.0).clip_rounded(12.0)
-            .border(1.0, ink(0.08)).shadow(8.0, 22.0, Color::BLACK.alpha(0.4));
-        grid = grid.child(tap(col().key(format!("p-{id}")).gap(10.0).min_w(0.0))
-            .child(poster)
-            .child(label(s_(&m["name"]).to_string(), 15.0, 600.0, Color::WHITE).truncate())
-            .child(label(s_(&m["releaseInfo"]).to_string(), 13.0, 500.0, ink(0.5)))
-            .on_press(move |s: &mut State| open_meta(s, t.clone(), id.clone())));
+        grid = grid.child(poster_card(s, m, format!("p-{}", s_(&m["id"]))));
     }
     col().w_full().pt(104.0).px(PAD).pb(56.0).gap(28.0)
         .child(label(type_label(ty), 40.0, 700.0, Color::WHITE).font(TextStyle::new(40.0, 700.0).tracking(-0.8)))
@@ -505,6 +518,7 @@ pub fn view(s: &State, _: &mut Cx<State>) -> El {
         Page::Home => home(s),
         Page::Browse(ty) => browse(s, ty),
         Page::Detail => detail(s),
+        Page::Search => search::view(s),
     };
     let mut root = col().w_full().h_full().fill(bg())
         .child(body.scroll(ScrollSpec { stick_bottom: false }).w_full().grow(1.0).shrink().min_h(0.0));

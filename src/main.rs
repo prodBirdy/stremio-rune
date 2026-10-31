@@ -8,6 +8,7 @@ mod ui;
 mod window;
 
 use player::{Mpv, Playback};
+use ui::search;
 use rune::{AppSpec, Image, ImageCache, Key, KeyEvent, TextEdit, Tx, Waker};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -41,6 +42,8 @@ enum Msg {
     Streams(String, Vec<Stream>),
     /// Addon subtitles for a video: (language code, url).
     Subs(String, Vec<(String, String)>),
+    /// Search answers: (query, index into `search.cats`, metas).
+    Search(String, usize, Vec<Value>),
 }
 
 struct Stream { name: String, title: String, url: String }
@@ -48,9 +51,9 @@ struct Stream { name: String, title: String, url: String }
 struct Catalog { base: String, ty: String, id: String, name: String }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Page { Login, Home, Browse(&'static str), Detail, Player }
+enum Page { Login, Home, Browse(&'static str), Detail, Player, Search }
 
-struct Icons { play: Image, pause: Image, back: Image, close: Image, expand: Image, shrink: Image, subs: Image }
+struct Icons { play: Image, pause: Image, back: Image, close: Image, expand: Image, shrink: Image, subs: Image, search: Image }
 
 struct State {
     page: Page,
@@ -90,6 +93,7 @@ struct State {
     subs_open: bool,
     subs_for: String,
     addon_subs: Vec<(String, String)>,
+    search: search::Search,
     player: Option<Mpv>,
     playback: Playback,
     icons: Option<Icons>,
@@ -159,6 +163,7 @@ fn state() -> State {
         subs_open: false,
         subs_for: String::new(),
         addon_subs: vec![],
+        search: search::Search::default(),
         player: None,
         playback: Playback::default(),
         icons: None,
@@ -491,7 +496,7 @@ fn escape(s: &mut State) {
     else if s.sheet && s.page == Page::Detail { s.sheet = false }
     else if s.fullscreen { toggle_fullscreen(s) }
     else if s.page == Page::Player { stop(s) }
-    else if s.page == Page::Detail { s.page = Page::Home }
+    else if matches!(s.page, Page::Detail | Page::Search) { s.page = Page::Home }
 }
 
 fn mpv(s: &State, args: &[&str]) {
@@ -513,7 +518,9 @@ fn setup(s: &mut State, waker: Waker) {
         expand: icon("M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"),
         shrink: icon("M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"),
         subs: icon("M4 6h16v12H4zM7 14h3M12 14h5M7 10.5h6M15 10.5h2"),
+        search: icon("M11 4a7 7 0 1 0 0 14a7 7 0 1 0 0-14zM20 20l-4.2-4.2"),
     });
+    s.search.debounce.set_waker(waker.clone());
     s.cache = Some(cache);
     s.waker = Some(waker);
     load_account(s);
@@ -548,6 +555,7 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
             changed = true;
         }
     }
+    if let Some(q) = s.search.debounce.take() { search::run(s, q); changed = true }
     while let Ok(msg) = s.rx.try_recv() {
         changed = true;
         match msg {
@@ -565,6 +573,7 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
             Msg::Addons(addons) => {
                 s.addons = addons;
                 s.catalogs = catalogs(&s.addons);
+                s.search.cats = search::catalogs(&s.addons);
                 s.items.clear();
                 s.status.clear();
                 for i in 0..s.catalogs.len().min(HOME_ROWS) { fetch_catalog(s, i) }
@@ -596,6 +605,7 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
                 if let Some((video, _)) = s.resume.clone() { pick(s, ty, video) }
                 else if !episodic { load_streams(s, ty, id) }
             }
+            Msg::Search(q, i, metas) => search::landed(s, q, i, metas),
             Msg::Subs(vid, list) if vid == s.subs_for => s.addon_subs.extend(list),
             Msg::Streams(vid, list) if vid == s.stream_for => {
                 s.streams.extend(list);
@@ -629,6 +639,10 @@ fn demo(s: &mut State) {
     s.user = "jonas@example.com".into();
 }
 
+fn demo_cat(ty: &str, name: &str) -> Catalog {
+    Catalog { base: String::new(), ty: ty.into(), id: "top".into(), name: name.into() }
+}
+
 fn main() {
     rune::run(AppSpec {
         setup: Some(setup),
@@ -647,6 +661,13 @@ fn main() {
                 s.stream_for = "tt1:1:2".into();
                 s.sheet = true;
                 s.streams = (1..5).map(|n| Stream { name: format!("Torrentio {n}080p"), title: "The.Long.Quiet.S01E02.1080p.WEB.h264\n👤 120 💾 2.1 GB".into(), url: String::new() }).collect();
+            }),
+            ("search", |s| {
+                demo(s);
+                search::open(s);
+                s.search.query = TextEdit::new("long quiet");
+                s.search.cats = vec![demo_cat("movie", "Movies"), demo_cat("series", "Shows")];
+                s.search.results = HashMap::from([(0, s.items[&0].clone()), (1, s.items[&1][..3].to_vec())]);
             }),
             ("menu", |s| { demo(s); s.page = Page::Home; s.menu = true }),
             ("player", |s| { demo(s); s.page = Page::Player; s.playback = Playback { pos: 1234.0, dur: 5400.0, started: true, ..Default::default() } }),
@@ -791,6 +812,50 @@ mod tests {
         assert!(rt.find("sheet").is_some());
         click(&mut rt, "sheet-scrim");
         assert!(!rt.state.sheet);
+    }
+
+    #[test]
+    fn search_opens_types_shows_results_and_opens_a_title() {
+        let mut rt = runtime(|s| { demo(s); s.page = Page::Home; s.search.cats = vec![demo_cat("movie", "Movies")] });
+        click(&mut rt, "nav-search");
+        assert!(rt.state.page == Page::Search);
+        rt.paste("long quiet"); // lands in the field: it's focused on open
+        for _ in 0..5 { rt.frame(1.0 / 60.0); }
+        assert_eq!(rt.state.search.query.text, "long quiet");
+        assert!(rt.state.search.debounce.is_pending(), "typing schedules a search");
+        // Stub the network: drop the real request and answer it by hand, plus a stale answer.
+        rt.state.search.debounce.cancel();
+        let metas = rt.state.items[&0].clone();
+        rt.state.tx.send(Msg::Search("long".into(), 0, vec![json!({ "id": "stale" })])).unwrap();
+        rt.state.tx.send(Msg::Search("long quiet".into(), 0, metas)).unwrap();
+        rt.update(|s, tx| { poll(s, 0.0, tx); });
+        for _ in 0..5 { rt.frame(1.0 / 60.0); }
+        assert!(rt.find("s0-stale").is_none(), "answers for older text are dropped");
+        click(&mut rt, "s0-tt2");
+        assert!(rt.state.page == Page::Detail && rt.state.meta_id == "tt2");
+        click(&mut rt, "nav-search");
+        for _ in 0..5 { rt.frame(1.0 / 60.0); }
+        rt.key(KeyEvent { key: Key::Escape, mods: Default::default() }); // field focused: one press leaves
+        for _ in 0..5 { rt.frame(1.0 / 60.0); }
+        assert!(rt.state.page == Page::Home, "Esc leaves search");
+    }
+
+    #[test]
+    fn search_catalogs_come_from_search_extras() {
+        let cat = |ty: &str, id: &str, extra: Value| json!({ "type": ty, "id": id, "name": "Top", "extra": extra });
+        let addon = |name: &str, cats: Value| json!({ "transportUrl": format!("https://{name}/manifest.json"), "manifest": { "name": name, "catalogs": cats } });
+        let addons = vec![
+            addon("Cinemeta", json!([
+                cat("movie", "top", json!([{ "name": "genre" }])),
+                cat("movie", "top", json!([{ "name": "search", "isRequired": true }])),
+                cat("series", "top", json!([{ "name": "search", "isRequired": true }])),
+                cat("movie", "year", json!([{ "name": "genre", "isRequired": true }, { "name": "search" }])),
+            ])),
+            addon("Anime", json!([cat("series", "a", json!([{ "name": "search" }]))])),
+        ];
+        let names: Vec<_> = search::catalogs(&addons).into_iter().map(|c| (c.base, c.name)).collect();
+        assert_eq!(names, [("https://Cinemeta".into(), "Movies".into()), ("https://Cinemeta".into(), "Shows".to_string()), ("https://Anime".into(), "Anime · Shows".into())]);
+        assert_eq!(catalogs(&addons).len(), 2, "catalogs that require search stay off Home");
     }
 
     #[test]
