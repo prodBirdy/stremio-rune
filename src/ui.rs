@@ -206,9 +206,11 @@ fn hero(s: &State) -> El {
         let on = i == s.hero.min(picks.len() - 1);
         dots = dots.child(tap(el().key(format!("dot-{i}")).h(8.0).w(if on { 24.0 } else { 8.0 }).radius(4.0)
             .fill(if on { Color::WHITE } else { ink(0.35) }).motion(motion::SNAPPY))
-            .on_press(move |s: &mut State| s.hero = i));
+            .on_press(move |s: &mut State| { s.hero = i; s.hero_at = Instant::now() }));
     }
     let [image, side, fade] = backdrop_layer(s, backdrop(m).as_deref());
+    // Keyed by title so a change cross-fades: the old image fades out as the new one fades in.
+    let image = image.key(format!("hero-{}", s_(&m["id"])));
     el().key("hero").w_full().h(HERO_H)
         .child(image).child(side).child(fade)
         .child(info.pin(Some(PAD), None, None, Some(40.0)))

@@ -25,8 +25,9 @@ const IDLE: Duration = Duration::from_millis(2500);
 /// Catalogs shown as rows on Home, and cards per row (Rune has no horizontal scroll yet).
 const HOME_ROWS: usize = 6;
 const ROW_CARDS: usize = 5;
-/// Titles the Home hero cycles through.
+/// Titles the Home hero cycles through, and how long each stays.
 const HERO_PICKS: usize = 5;
+const HERO_EVERY: Duration = Duration::from_secs(4);
 
 const API: &str = "https://api.strem.io/api/";
 const SERVER: &str = "http://127.0.0.1:11470";
@@ -70,6 +71,8 @@ struct State {
     /// Continue watching, newest first.
     library: Vec<Value>,
     hero: usize,
+    /// When the hero last changed; it advances `HERO_EVERY` after.
+    hero_at: Instant,
     // unbounded, ~1-4 MB per backdrop; evict by last use if long sessions bloat
     images: HashMap<String, Image>,
     requested: HashSet<String>,
@@ -147,6 +150,7 @@ fn state() -> State {
         items: HashMap::new(),
         library: vec![],
         hero: 0,
+        hero_at: Instant::now(),
         images: HashMap::new(),
         requested: HashSet::new(),
         meta_id: String::new(),
@@ -626,7 +630,20 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
             _ => {} // a stale answer for a page we left
         }
     }
+    changed |= rotate_hero(s, tx);
     changed
+}
+
+/// Advance the Home hero every `HERO_EVERY`, and schedule the next look. Only on Home.
+fn rotate_hero(s: &mut State, tx: &mut Tx) -> bool {
+    let n = s.items.get(&0).map_or(0, |v| v.len().min(HERO_PICKS));
+    if s.page != Page::Home || n < 2 { return false }
+    let left = HERO_EVERY.saturating_sub(s.hero_at.elapsed());
+    if !left.is_zero() { tx.wake_after(left); return false }
+    s.hero = (s.hero + 1) % n;
+    s.hero_at = Instant::now();
+    tx.wake_after(HERO_EVERY);
+    true
 }
 
 /// The `&'static str` a Browse page is keyed by, for the two types the nav offers.
@@ -881,6 +898,23 @@ mod tests {
         let t = Instant::now();
         while !server::running() { assert!(t.elapsed().as_secs() < 20, "server never came up"); std::thread::sleep(Duration::from_millis(200)) }
         if !was_up { assert!(get("http://127.0.0.1:11470/settings").is_ok(), "it answers HTTP") }
+    }
+
+    #[test]
+    fn hero_advances_every_few_seconds_and_wraps() {
+        let mut rt = runtime(|s| { demo(s); s.page = Page::Home });
+        let tick = |rt: &mut rune::Runtime<State>| rt.update(|s, tx| { rotate_hero(s, tx); });
+        tick(&mut rt);
+        assert_eq!(rt.state.hero, 0, "not before its time");
+        for want in [1, 2, 3, 4, 0] {
+            rt.state.hero_at -= HERO_EVERY;
+            tick(&mut rt);
+            assert_eq!(rt.state.hero, want);
+        }
+        rt.state.page = Page::Detail;
+        rt.state.hero_at -= HERO_EVERY;
+        tick(&mut rt);
+        assert_eq!(rt.state.hero, 0, "only on Home");
     }
 
     #[test]
