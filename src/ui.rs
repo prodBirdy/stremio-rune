@@ -262,13 +262,36 @@ fn landscape(s: &State, key: String, url: Option<String>, title: String, sub: St
         .child(label(sub, 14.0, 500.0, ink(0.55)).truncate())
 }
 
-fn section(title: &str, body: El) -> El {
-    col().w_full().px(PAD).gap(16.0).child(label(title, 24.0, 600.0, Color::WHITE)).child(body)
+/// A Home row: its title with back/on chevrons, and a page of cards that slides in from the
+/// side it was turned toward while the last one fades. Shift+wheel, a sideways swipe or the
+/// arrow keys over it turn it too.
+fn home_row(s: &State, r: usize, title: &str, card: impl Fn(&Value) -> El) -> El {
+    let name = if r == UP_NEXT { "up".to_string() } else { r.to_string() };
+    let at = row_at(s, r);
+    let enter = Transition::offset(160.0 * s.row_dir, 0.0).combined(Transition::opacity());
+    let mut page = row().key(format!("page-{name}-{at}")).w_full().equal_columns(ROW_CARDS).gap(GAP)
+        .transition(Transition::asymmetric(enter, Transition::opacity()));
+    for m in row_items(s, r)[at..].iter().take(ROW_CARDS) { page = page.child(card(m)) }
+    let arrow = |dir: i32| {
+        let on = can_page(s, r, dir);
+        let b = glass(row().key(format!("{}-{name}", if dir < 0 { "prev" } else { "next" })).size(36.0, 36.0).radius(18.0).center())
+            .opacity(if on { 1.0 } else { 0.35 })
+            .child(icon(s, move |i| if dir < 0 { &i.back } else { &i.next }, 16.0));
+        if on { tap(b).hover(ink(0.16)).on_press(move |s: &mut State| page_row(s, r, dir)) } else { b }
+    };
+    let mut head = row().w_full().h(36.0).gap(8.0).center_y()
+        .child(label(title, 24.0, 600.0, Color::WHITE).truncate().grow(1.0).min_w(0.0));
+    // A row that fits on one page gets no arrows.
+    if can_page(s, r, -1) || can_page(s, r, 1) { head = head.child(arrow(-1)).child(arrow(1)) }
+    col().key(format!("row-{name}")).w_full().px(PAD).gap(16.0).child(head).child(el().w_full().child(page))
+        .on_hover_change(move |s: &mut State, inside, _| {
+            if inside { s.row_hover = Some(r) } else if s.row_hover == Some(r) { s.row_hover = None }
+        })
+        .on_wheel(move |s: &mut State, e, _| wheel_row(s, r, e))
 }
 
 fn up_next(s: &State) -> El {
-    let mut cards = row().w_full().equal_columns(ROW_CARDS).gap(GAP);
-    for item in s.library.iter().take(ROW_CARDS) {
+    home_row(s, UP_NEXT, "Up Next", |item| {
         let st = &item["state"];
         let (at, len) = (st["timeOffset"].as_f64().unwrap_or(0.0), st["duration"].as_f64().unwrap_or(0.0));
         let left = ((len - at) / 60_000.0).max(0.0).round();
@@ -276,31 +299,25 @@ fn up_next(s: &State) -> El {
         if let Some((se, ep)) = episode_of(s_(&st["video_id"])) { sub = format!("S{se}, E{ep} · {sub}") }
         let done = (len > 0.0).then(|| (at / len) as f32);
         let it = item.clone();
-        cards = cards.child(landscape(s, format!("cw-{}", s_(&item["_id"])), backdrop(item), s_(&item["name"]).to_string(), sub, done)
-            .on_press(move |s: &mut State| resume(s, &it)));
-    }
-    section("Up Next", cards)
+        landscape(s, format!("cw-{}", s_(&item["_id"])), backdrop(item), s_(&item["name"]).to_string(), sub, done)
+            .on_press(move |s: &mut State| resume(s, &it))
+    })
 }
 
-fn catalog_row(s: &State, i: usize, items: &[Value]) -> El {
-    let mut cards = row().w_full().equal_columns(ROW_CARDS).gap(GAP);
-    for m in items.iter().take(ROW_CARDS) {
+fn catalog_row(s: &State, i: usize) -> El {
+    home_row(s, i, &s.catalogs[i].name, |m| {
         let (ty, id) = (s_(&m["type"]).to_string(), s_(&m["id"]).to_string());
-        let sub = meta_line(m);
-        cards = cards.child(landscape(s, format!("c{i}-{id}"), backdrop(m), s_(&m["name"]).to_string(), sub, None)
-            .on_press(move |s: &mut State| open_meta(s, ty.clone(), id.clone())));
-    }
-    section(&s.catalogs[i].name, cards)
+        landscape(s, format!("c{i}-{id}"), backdrop(m), s_(&m["name"]).to_string(), meta_line(m), None)
+            .on_press(move |s: &mut State| open_meta(s, ty.clone(), id.clone()))
+    })
 }
 
 fn home(s: &State) -> El {
     let mut page = col().w_full().gap(36.0).pb(56.0).child(hero(s));
     if !s.library.is_empty() { page = page.child(up_next(s)) }
+    // The first catalog feeds the hero; its row starts after the hero's picks (`row_items`).
     for i in 0..s.catalogs.len().min(HOME_ROWS) {
-        // The first catalog feeds the hero; show it as a row too, from its sixth title on.
-        let Some(items) = s.items.get(&i) else { continue };
-        let items = if i == 0 && items.len() > HERO_PICKS { &items[HERO_PICKS..] } else { &items[..] };
-        page = page.child(catalog_row(s, i, items));
+        if s.items.contains_key(&i) { page = page.child(catalog_row(s, i)) }
     }
     page
 }
