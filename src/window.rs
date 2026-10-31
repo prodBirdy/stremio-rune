@@ -56,3 +56,20 @@ pub fn cursor() -> (i32, i32) {
 
 #[cfg(not(windows))]
 pub fn cursor() -> (i32, i32) { (0, 0) }
+
+/// Device pixels per point on the primary display, and its width in points (the widest the
+/// window gets), for sizing images.
+#[cfg(windows)]
+pub fn scale() -> f32 { unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForSystem() as f32 / 96.0 } }
+
+#[cfg(windows)]
+pub fn screen_w() -> f32 {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN};
+    unsafe { GetSystemMetrics(SM_CXSCREEN) as f32 / scale() }
+}
+
+#[cfg(not(windows))]
+pub fn scale() -> f32 { 2.0 }
+
+#[cfg(not(windows))]
+pub fn screen_w() -> f32 { 1920.0 }

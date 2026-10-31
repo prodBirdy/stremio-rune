@@ -15,3 +15,11 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 [target.'cfg(windows)'.dependencies]
 # The child window mpv draws into, under the app's control bar.
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi"] }
+
+# Image decoding runs on every card; unoptimized it takes ~10× longer (a 1920 px JPEG ~0.5 s).
+[profile.dev.package]
+image = { opt-level = 3 }
+zune-jpeg = { opt-level = 3 }
+image-webp = { opt-level = 3 }
+png = { opt-level = 3 }
+fdeflate = { opt-level = 3 }

@@ -8,6 +8,8 @@ use std::f32::consts::PI;
 
 const PAD: f32 = 56.0;
 const HERO_H: f32 = 560.0;
+/// Space between cards.
+const GAP: f32 = 22.0;
 
 fn bg() -> Color { oklch(0.15, 0.012, 265.0) }
 fn ink(a: f32) -> Color { Color::WHITE.alpha(a) }
@@ -25,13 +27,27 @@ fn tap(e: El) -> El { e.cursor(Cursor::Pointer).press_scale(0.97) }
 
 fn all(e: El) -> El { e.pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)) }
 
-/// An image by URL, cover-filled, or a quiet placeholder while it loads.
+/// An image by key (see `sized`), cover-filled, or a quiet placeholder while it loads. It asks
+/// for its image when laid out within a screen of the viewport, and each move there (a scroll)
+/// marks it used, so the cache keeps what's on screen.
 fn picture(s: &State, url: Option<&str>) -> El {
-    let e = el().fill(ink(0.05));
-    match url.and_then(|u| s.images.get(u)) {
-        Some(img) => e.pixels_fit(img.pixels(), SurfaceFit::Fill),
-        None => e,
-    }
+    let mut e = el().fill(ink(0.05));
+    let Some(u) = url else { return e };
+    if let Some(img) = s.images.get(u) { e = e.pixels_fit(img.pixels(), SurfaceFit::Fill) }
+    let key = u.to_string();
+    e.on_layout_tx(move |s: &mut State, [_, y, _, h], tx| {
+        tx.live_only();
+        if y < s.view_h * 2.0 && y + h > -s.view_h { want(s, [key.clone()]) }
+    })
+}
+
+/// Image keys for where they show, at the widest the window gets (the screen's width).
+pub fn hero_img(url: Option<String>) -> Option<String> { url.map(|u| sized(&u, window::screen_w())) }
+pub fn card_img(url: Option<String>) -> Option<String> {
+    url.map(|u| sized(&u, (window::screen_w() - 2.0 * PAD - (ROW_CARDS - 1) as f32 * GAP) / ROW_CARDS as f32))
+}
+pub fn poster_img(url: Option<&str>) -> Option<String> {
+    url.map(|u| sized(u, (window::screen_w() - 2.0 * PAD - 6.0 * GAP) / 7.0))
 }
 
 fn icon(s: &State, pick: impl Fn(&Icons) -> &Image, size: f32) -> El {
@@ -200,7 +216,7 @@ fn hero(s: &State) -> El {
             .fill(if on { Color::WHITE } else { ink(0.35) }).motion(motion::SNAPPY))
             .on_press(move |s: &mut State| s.hero = i));
     }
-    let [image, side, fade] = backdrop_layer(s, backdrop(m).as_deref());
+    let [image, side, fade] = backdrop_layer(s, hero_img(backdrop(m)).as_deref());
     el().key("hero").w_full().h(HERO_H)
         .child(image).child(side).child(fade)
         .child(info.pin(Some(PAD), None, None, Some(40.0)))
@@ -209,7 +225,7 @@ fn hero(s: &State) -> El {
 
 /// A 16:9 card with an optional progress bar over the image, and two lines under it.
 fn landscape(s: &State, key: String, url: Option<String>, title: String, sub: String, done: Option<f32>) -> El {
-    let mut image = picture(s, url.as_deref()).w_full().aspect_ratio(16.0 / 9.0).radius(14.0).clip_rounded(14.0)
+    let mut image = picture(s, card_img(url).as_deref()).w_full().aspect_ratio(16.0 / 9.0).radius(14.0).clip_rounded(14.0)
         .border(1.0, ink(0.08)).shadow(10.0, 28.0, Color::BLACK.alpha(0.45));
     if let Some(f) = done { image = image.child(progress(f, 4.0).pin(Some(14.0), None, Some(14.0), Some(12.0))) }
     tap(col().key(key).gap(10.0).min_w(0.0))
@@ -223,7 +239,7 @@ fn section(title: &str, body: El) -> El {
 }
 
 fn up_next(s: &State) -> El {
-    let mut cards = row().w_full().equal_columns(ROW_CARDS).gap(22.0);
+    let mut cards = row().w_full().equal_columns(ROW_CARDS).gap(GAP);
     for item in s.library.iter().take(ROW_CARDS) {
         let st = &item["state"];
         let (at, len) = (st["timeOffset"].as_f64().unwrap_or(0.0), st["duration"].as_f64().unwrap_or(0.0));
@@ -239,7 +255,7 @@ fn up_next(s: &State) -> El {
 }
 
 fn catalog_row(s: &State, i: usize, items: &[Value]) -> El {
-    let mut cards = row().w_full().equal_columns(ROW_CARDS).gap(22.0);
+    let mut cards = row().w_full().equal_columns(ROW_CARDS).gap(GAP);
     for m in items.iter().take(ROW_CARDS) {
         let (ty, id) = (s_(&m["type"]).to_string(), s_(&m["id"]).to_string());
         let sub = meta_line(m);
@@ -272,10 +288,10 @@ fn browse(s: &State, ty: &str) -> El {
     for (i, c) in s.catalogs.iter().enumerate().filter(|(_, c)| c.ty == ty) {
         chips = chips.child(chip(format!("cat-{i}"), c.name.clone(), i == s.selected).on_press(move |s: &mut State| open_catalog(s, i)));
     }
-    let mut grid = row().w_full().equal_columns(7).gap(22.0);
+    let mut grid = row().w_full().equal_columns(7).gap(GAP);
     for m in s.items.get(&s.selected).into_iter().flatten() {
         let (t, id) = (s_(&m["type"]).to_string(), s_(&m["id"]).to_string());
-        let poster = picture(s, m["poster"].as_str()).w_full().aspect_ratio(2.0 / 3.0).radius(12.0).clip_rounded(12.0)
+        let poster = picture(s, poster_img(m["poster"].as_str()).as_deref()).w_full().aspect_ratio(2.0 / 3.0).radius(12.0).clip_rounded(12.0)
             .border(1.0, ink(0.08)).shadow(8.0, 22.0, Color::BLACK.alpha(0.4));
         grid = grid.child(tap(col().key(format!("p-{id}")).gap(10.0).min_w(0.0))
             .child(poster)
@@ -312,7 +328,7 @@ fn detail(s: &State) -> El {
         let ty = ty.clone();
         info = info.child(primary(s, "play", words).self_start().on_press(move |s: &mut State| pick(s, ty.clone(), vid.clone())));
     }
-    let [image, side, fade] = backdrop_layer(s, backdrop(m).as_deref());
+    let [image, side, fade] = backdrop_layer(s, hero_img(backdrop(m)).as_deref());
     let head = el().key("detail-hero").w_full().h(HERO_H)
         .child(image).child(side).child(fade)
         .child(info.pin(Some(PAD), None, None, Some(28.0)))
@@ -499,6 +515,7 @@ pub fn view(s: &State, _: &mut Cx<State>) -> El {
         Page::Detail => detail(s),
     };
     let mut root = col().w_full().h_full().fill(bg())
+        .on_layout_tx(|s: &mut State, r, tx| { tx.live_only(); s.view_h = r[3] })
         .child(body.scroll(ScrollSpec { stick_bottom: false }).w_full().grow(1.0).shrink().min_h(0.0));
     // A click anywhere outside the open menu closes it.
     if s.menu { root = root.child(all(el()).key("menu-scrim").on_press(|s: &mut State| s.menu = false)) }
