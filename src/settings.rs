@@ -53,12 +53,14 @@ pub struct Settings {
     pub seek_ms: u32,
     pub hide_ms: u32,
     pub hwdec: bool,
+    /// Playback volume, percent (set from the player's volume control).
+    pub volume: u32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings { audio_lang: String::new(), sub_lang: String::new(), sub_size: 100, sub_color: "#FFFFFF".into(),
-            sub_style: "outline".into(), seek_ms: 5000, hide_ms: 2500, hwdec: true }
+            sub_style: "outline".into(), seek_ms: 5000, hide_ms: 2500, hwdec: true, volume: 100 }
     }
 }
 
@@ -78,7 +80,7 @@ pub fn save_to(path: &std::path::Path, s: &Settings) -> std::io::Result<()> {
 pub fn mpv_options(s: &Settings) -> Vec<(&'static str, String)> {
     let mut o = vec![("hwdec", if s.hwdec { "auto-safe" } else { "no" }.to_string()),
         ("sub-scale", format!("{}", s.sub_size as f32 / 100.0)), ("sub-color", s.sub_color.clone()),
-        ("cursor-autohide", s.hide_ms.to_string())];
+        ("cursor-autohide", s.hide_ms.to_string()), ("volume", s.volume.to_string())];
     let tags = |code: &str| LANGS.iter().find(|l| l.0 == code).map_or(code.to_string(), |l| l.1.to_string());
     if !s.audio_lang.is_empty() { o.push(("alang", tags(&s.audio_lang))) }
     if !s.sub_lang.is_empty() { o.push(("slang", tags(&s.sub_lang))) }
@@ -91,7 +93,7 @@ pub fn mpv_options(s: &Settings) -> Vec<(&'static str, String)> {
 }
 
 /// Change a setting and keep it.
-fn set(s: &mut State, f: impl FnOnce(&mut Settings)) {
+pub fn set(s: &mut State, f: impl FnOnce(&mut Settings)) {
     f(&mut s.settings);
     if !cfg!(test) && let Err(e) = save_to(&file(), &s.settings) { s.status = format!("Couldn't save settings ({e})") }
 }

@@ -466,6 +466,8 @@ pub struct Ctl {
     pub shown: Shown,
     /// Seek-bar drag in progress, as a fraction of the duration.
     pub scrub: Option<f32>,
+    /// Volume-slider drag in progress, percent.
+    pub vol_drag: Option<f64>,
     pub icons: Option<Icons>,
     pub cache: Option<ImageCache>,
     pub main: Option<rune::AppHandle<State>>,
@@ -542,6 +544,19 @@ fn glyph(icons: &Option<Icons>, pick: impl Fn(&Icons) -> &Image, size: f32) -> E
     match icons { Some(i) => e.pixels(pick(i).pixels()), None => e }
 }
 
+/// Width of the volume slider, in points.
+pub const VOL_W: f32 = 96.0;
+
+/// Volume drag: follows the pointer as it goes (you hear it), and unmutes.
+fn volume_drag(c: &mut Ctl, d: &mut Drag, _: &mut Tx) {
+    let v = ((d.x / d.w.max(1.0)).clamp(0.0, 1.0) * 100.0).round() as f64;
+    c.vol_drag = (d.phase != Phase::Up).then_some(v);
+    if d.cancelled() { return }
+    c.shown.playback.volume = v;
+    let v = v.to_string();
+    c.send(move |s| { mpv(s, &["set", "volume", &v]); mpv(s, &["set", "mute", "no"]) });
+}
+
 fn seek(c: &mut Ctl, d: &mut Drag, _: &mut Tx) {
     let f = (d.x / d.w.max(1.0)).clamp(0.0, 1.0);
     if d.phase != Phase::Up { c.scrub = Some(f); return }
@@ -596,7 +611,21 @@ fn bar(c: &Ctl) -> El {
         .child(progress(frac, if c.scrub.is_some() { 6.0 } else { 4.0 }).w_full());
     let mut bar = row().key("bar").w_full().h(BAR).px(14.0).gap(10.0).center_y()
         .on_hover_change(|c: &mut Ctl, inside, _| c.send(move |s| s.bar_hover = inside))
-        .child(toggle).child(el().w(4.0));
+        .child(toggle);
+    // Mute, and a slider: drag it, or scroll over it.
+    let vol = c.vol_drag.unwrap_or(p.volume);
+    bar = bar.child(round("mute", false).child(glyph(&c.icons, |i| if p.muted || p.volume <= 0.0 { &i.muted } else { &i.volume }, 20.0))
+            .on_press(act(|s| mpv(s, &["cycle", "mute"]))))
+        .child(row().key("volume").w(VOL_W).h(BAR).center_y().cursor(Cursor::Pointer).on_drag(volume_drag)
+            // one 5% step per wheel event; a trackpad's many small events step fast
+            .on_wheel(|c: &mut Ctl, e: rune::WheelEvent, _| {
+                if e.dy == 0.0 { return false }
+                let by = if e.dy > 0.0 { "5" } else { "-5" };
+                c.send(move |s| mpv(s, &["add", "volume", by]));
+                true
+            })
+            .child(progress(if p.muted { 0.0 } else { (vol / 100.0) as f32 }, if c.vol_drag.is_some() { 6.0 } else { 4.0 }).w_full()))
+        .child(el().w(8.0));
     if p.started && p.buffering { bar = bar.child(label(format!("Buffering {}%", p.cache_pct as u32), 13.0, 500.0, ink(0.7))) }
     bar = bar.child(time(at)).child(track).child(time(p.dur));
     if !v.streams.is_empty() {

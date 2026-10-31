@@ -25,6 +25,9 @@ pub struct Playback {
     /// paused: both flip the moment playback stops moving, before `buffering` does.
     pub seeking: bool,
     pub idle: bool,
+    /// Percent (0 until mpv reports it), and whether it's muted.
+    pub volume: f64,
+    pub muted: bool,
     pub cache_pct: f64,
     pub tracks: Vec<Track>,
     /// Selected subtitle track id, or `no`.
@@ -113,7 +116,7 @@ impl Mpv {
             // userdata ids match `pump`.
             for (id, name, format) in [(1, "time-pos", DOUBLE), (2, "duration", DOUBLE), (3, "pause", FLAG),
                 (4, "paused-for-cache", FLAG), (5, "cache-buffering-state", INT64), (6, "sid", STRING), (7, "track-list/count", INT64), (8, "aid", STRING),
-                (9, "seeking", FLAG), (10, "core-idle", FLAG)] {
+                (9, "seeking", FLAG), (10, "core-idle", FLAG), (11, "volume", DOUBLE), (12, "mute", FLAG)] {
                 observe(ctx, id, cs(name).as_ptr(), format);
             }
         }
@@ -226,6 +229,8 @@ impl Mpv {
                             7 => (p.tracks, p.audio) = (self.tracks("sub"), self.tracks("audio")),
                             9 => p.seeking = *(prop.data as *const c_int) != 0,
                             10 => p.idle = *(prop.data as *const c_int) != 0,
+                            11 => p.volume = *(prop.data as *const f64),
+                            12 => p.muted = *(prop.data as *const c_int) != 0,
                             8 => p.aid = CStr::from_ptr(*(prop.data as *const *const c_char)).to_string_lossy().into_owned(),
                             _ => {}
                         }
