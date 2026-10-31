@@ -58,6 +58,8 @@ pub fn toggle_fullscreen() -> bool {
         for h in [hwnd, overlay::window()] { taskbar::mark_fullscreen(h, true) }
         // The fullscreen window has to be the one in front, not the controls that were clicked.
         windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+        // Bringing the app window forward can put it above its own controls; keep them on top.
+        overlay::raise();
         *saved = Some((style, place));
         true
     }
@@ -423,6 +425,25 @@ pub mod overlay {
             }
             if GetForegroundWindow() == o { SetForegroundWindow(main()); }
         }
+        raise();
+    }
+
+    /// Keep the controls directly above the app window. Being owned should guarantee it, but
+    /// fullscreen's bring-to-front (and the foreground hand-back above) can leave them under it,
+    /// where they're neither seen nor clickable.
+    pub fn raise() {
+        let (m, o) = (main(), window());
+        if m.is_null() || o.is_null() { return }
+        unsafe {
+            // Is the controls window already above the app window? Walk up from the app window.
+            let mut h = windows_sys::Win32::UI::WindowsAndMessaging::GetWindow(m, windows_sys::Win32::UI::WindowsAndMessaging::GW_HWNDPREV);
+            while !h.is_null() {
+                if h == o { return }
+                h = windows_sys::Win32::UI::WindowsAndMessaging::GetWindow(h, windows_sys::Win32::UI::WindowsAndMessaging::GW_HWNDPREV);
+            }
+            // Not above: put the app window right under it.
+            SetWindowPos(m, o, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
     }
 
     /// A Rune window's HWND.
@@ -595,4 +616,5 @@ pub mod overlay {
     pub fn set_waker(_: rune::Waker) {}
     pub fn show(w: &rune::WindowHandle, on: bool) { w.set_visible(on) }
     pub fn keep_keys(_: &rune::WindowHandle) {}
+    pub fn raise() {}
 }
