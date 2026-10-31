@@ -22,6 +22,9 @@ pub fn toggle_fullscreen() -> bool {
         // that one, and fullscreening it would leave the app as it was.
         let hwnd = Some(overlay::main()).filter(|h| !h.is_null()).unwrap_or_else(|| GetAncestor(GetActiveWindow(), GA_ROOT));
         if hwnd.is_null() { return saved.is_some() }
+        // Hide the windows from the screen while they change, so the switch shows as one cut
+        // instead of a frame repaint, a video at its old size and controls smeared mid-resize.
+        cloak_briefly(&[hwnd, overlay::window()]);
         if let Some((style, place)) = saved.take() {
             SetWindowLongPtrW(hwnd, GWL_STYLE, style);
             SetWindowPlacement(hwnd, &place);
@@ -43,6 +46,22 @@ pub fn toggle_fullscreen() -> bool {
         *saved = Some((style, place));
         true
     }
+}
+
+/// Cloak windows now and uncloak them once the app, mpv and the controls have redrawn at the
+/// new size (a few frames). Null handles are skipped.
+#[cfg(windows)]
+fn cloak_briefly(windows: &[windows_sys::Win32::Foundation::HWND]) {
+    fn cloak(h: isize, on: i32) {
+        use windows_sys::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
+        unsafe { DwmSetWindowAttribute(h as _, DWMWA_CLOAK as _, (&raw const on).cast(), 4) };
+    }
+    let hs: Vec<isize> = windows.iter().filter(|h| !h.is_null()).map(|h| *h as isize).collect();
+    for &h in &hs { cloak(h, 1) }
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        for h in hs { cloak(h, 0) }
+    });
 }
 
 #[cfg(not(windows))]
@@ -101,6 +120,10 @@ pub mod overlay {
     /// The app window (null until Rune reports it).
     pub fn main() -> HWND { MAIN.load(Ordering::Relaxed) as HWND }
 
+    /// The controls' window, once attached (null before).
+    static OVERLAY: AtomicIsize = AtomicIsize::new(0);
+    pub fn window() -> HWND { OVERLAY.load(Ordering::Relaxed) as HWND }
+
     /// Show the controls' window over the app window, or hide it.
     pub fn show(w: &rune::WindowHandle, on: bool) {
         if let (true, Some(o)) = (on, hwnd(w)) { if !main().is_null() { attach(main(), o) } }
@@ -123,6 +146,7 @@ pub mod overlay {
     /// Own `overlay` by `main` (the app window) and keep it over `main`'s client area.
     /// Idempotent; call on the UI thread while `overlay` is hidden (the style change needs it).
     pub fn attach(main: HWND, overlay: HWND) {
+        OVERLAY.store(overlay as isize, Ordering::Relaxed);
         unsafe {
             SetWindowLongPtrW(overlay, GWLP_HWNDPARENT, main as isize);
             let ex = GetWindowLongPtrW(overlay, GWL_EXSTYLE);
@@ -143,9 +167,25 @@ pub mod overlay {
     }
 
     unsafe extern "system" fn follow(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _: usize, overlay: usize) -> LRESULT {
-        if msg == WM_WINDOWPOSCHANGED { place(hwnd, overlay as HWND) }
+        if msg == WM_WINDOWPOSCHANGED {
+            place(hwnd, overlay as HWND);
+            // The video's window too, in the same instant: waiting for the app's next poll lags
+            // a resize (leaving fullscreen most visibly).
+            let video = VIDEO.load(Ordering::Relaxed) as HWND;
+            if !video.is_null() {
+                let mut r: RECT = unsafe { std::mem::zeroed() };
+                unsafe {
+                    GetClientRect(hwnd, &mut r);
+                    SetWindowPos(video, std::ptr::null_mut(), 0, 0, r.right, r.bottom, SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+            }
+        }
         unsafe { DefSubclassProc(hwnd, msg, wp, lp) }
     }
+
+    /// mpv's host window while one exists (see `player.rs`), resized by `follow`.
+    static VIDEO: AtomicIsize = AtomicIsize::new(0);
+    pub fn set_video(h: HWND) { VIDEO.store(h as isize, Ordering::Relaxed) }
 }
 
 #[cfg(not(windows))]

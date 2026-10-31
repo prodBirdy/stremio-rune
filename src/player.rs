@@ -276,7 +276,9 @@ mod win {
                 CreateWindowExW(0, class.as_ptr(), std::ptr::null(), WS_CHILD | WS_CLIPCHILDREN | SS_BLACKRECT, 0, 0, 0, 0, parent,
                     std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null())
             };
-            (!hwnd.is_null()).then(|| Host(hwnd, Cell::new(None)))
+            if hwnd.is_null() { return None }
+            crate::window::overlay::set_video(hwnd);
+            Some(Host(hwnd, Cell::new(None)))
         }
 
         /// Cover the parent's client area, and show.
@@ -293,6 +295,9 @@ mod win {
     }
 
     impl Drop for Host {
-        fn drop(&mut self) { unsafe { DestroyWindow(self.0); } }
+        fn drop(&mut self) {
+            crate::window::overlay::set_video(std::ptr::null_mut());
+            unsafe { DestroyWindow(self.0); }
+        }
     }
 }
