@@ -120,10 +120,19 @@ fn nav(s: &State) -> El {
         .fill(if on { ink(0.18) } else { Color::TRANSPARENT }).hover(ink(0.1))
         .child(icon(s, |i| &i.search, 18.0)))
         .on_press(search::open);
-    let pill = glass(row().key("nav").h(50.0).px(6.0).gap(4.0).radius(25.0).center_y())
+    let mut pill = glass(row().key("nav").h(50.0).px(6.0).gap(4.0).radius(25.0).center_y())
         .shadow(10.0, 30.0, Color::BLACK.alpha(0.35))
         .child(find).child(item("Home", Page::Home)).child(item("Movies", Page::Browse("movie"))).child(item("Shows", Page::Browse("series"))).child(item("Add-ons", Page::Addons))
-        .child(el().w(4.0)).child(avatar);
+        .child(el().w(4.0));
+    // A newer release: installs in place and restarts (`update_now`).
+    if let Some(u) = &s.update {
+        let version = u.version.split('-').next().unwrap_or(&u.version);
+        pill = pill.child(tap(row().key("nav-update").h(38.0).pl(14.0).pr(16.0).gap(8.0).radius(19.0).center().fill(ink(0.1)).hover(ink(0.16))
+            .child(el().size(8.0, 8.0).radius(4.0).fill(oklch(0.78, 0.17, 150.0)))
+            .child(label(format!("Update to {version}"), 15.0, 600.0, Color::WHITE)))
+            .on_press_tx(update_now));
+    }
+    let pill = pill.child(avatar);
     // The menu hangs off a plain wrapper so the pill's blur layer doesn't clip it.
     let mut anchor = el().child(pill);
     if s.menu { anchor = anchor.child(menu(s).pin(None, Some(60.0), Some(0.0), None)) }
@@ -193,15 +202,6 @@ fn toast(s: &State) -> El {
         glass(row().key("toast").h(40.0).px(18.0).radius(20.0).center()).fill(Color::BLACK.alpha(0.55))
             .child(label(s.status.clone(), 14.0, 500.0, ink(0.9))),
     )
-}
-
-/// A newer release, offered at the bottom right; a press installs it (`update_now`).
-fn update_pill(u: &update::Release) -> El {
-    tap(glass(row().key("update").h(40.0).px(18.0).gap(10.0).radius(20.0).center()).fill(Color::BLACK.alpha(0.55)).hover(Color::BLACK.alpha(0.7)))
-        .pin(None, None, Some(28.0), Some(28.0))
-        .child(label(format!("stremio-rune {} is available", u.version), 14.0, 500.0, ink(0.75)))
-        .child(label("Update", 14.0, 650.0, Color::WHITE))
-        .on_press_tx(update_now)
 }
 
 fn back_button(s: &State) -> El {
@@ -498,6 +498,5 @@ fn page(s: &State) -> El {
     root = root.child(nav(s));
     if s.sheet && s.page == Page::Detail { for e in sheet(s) { root = root.child(e) } }
     if !s.status.is_empty() { root = root.child(toast(s)) }
-    else if let Some(u) = &s.update { root = root.child(update_pill(u)) }
     root
 }

@@ -86,7 +86,7 @@ enum Msg {
     Written(Result<String, String>),
     /// A newer release on GitHub, if there is one.
     Update(Option<update::Release>),
-    /// The update's Setup is running.
+    /// The update is installed (macOS) or its Setup is running (Windows; it closes the app).
     Updating,
 }
 
@@ -872,11 +872,12 @@ fn setup(s: &mut State, waker: Waker) {
     if !cfg!(test) { spawn(s, || Ok(Msg::Update(update::check().unwrap_or(None)))) }
 }
 
-/// Install the offered update: run its Setup on Windows, else open its page.
+/// Install the offered update in place (see `update`); the app restarts into it. A release with
+/// nothing for this platform opens its page instead.
 fn update_now(s: &mut State, tx: &mut Tx) {
-    let Some(r) = s.update.clone() else { return };
-    if cfg!(windows) && r.setup.is_some() {
-        s.status = format!("Downloading stremio-rune {}…", r.version);
+    let Some(r) = s.update.take() else { return };
+    if r.asset.is_some() {
+        s.status = format!("Updating to {}…", r.version);
         spawn(s, move || update::install(&r).map(|()| Msg::Updating));
     } else if let Err(e) = tx.open_url(&r.page) {
         s.status = format!("Couldn't open the release page ({e:?})");
@@ -980,7 +981,8 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
             Msg::Preview(d) => { s.store.preview = Some(d); s.status.clear() }
             Msg::Written(r) => addons::written(s, r),
             Msg::Update(Some(r)) => s.update = Some(r),
-            Msg::Updating => { s.status.clear(); s.update = None }
+            // macOS: quit, and the new app opens (`update::install`).
+            Msg::Updating => if cfg!(target_os = "macos") { tx.quit() },
             Msg::Streams(vid, list) if vid == s.stream_for => {
                 s.streams.extend(list);
                 s.status.clear();
@@ -1158,7 +1160,7 @@ fn main() {
         on_key: Some(on_key),
         scenes: &[
             ("home", |s| { demo(s); s.page = Page::Home }),
-            ("update", |s| { demo(s); s.page = Page::Home; s.update = Some(update::Release { version: "0.3.0-alpha".into(), page: String::new(), setup: None }) }),
+            ("update", |s| { demo(s); s.page = Page::Home; s.update = Some(update::Release { version: "0.3.0-alpha".into(), page: String::new(), asset: None }) }),
             ("browse", |s| { demo(s); s.page = Page::Browse("movie") }),
             ("detail", |s| {
                 demo(s);

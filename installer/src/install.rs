@@ -384,6 +384,21 @@ pub fn free_space(dir: &Path) -> Option<(String, String)> {
     Some((format!("{:.1}", free as f64 / 1_073_741_824.0), drive))
 }
 
+/// The app's in-place update (`--update`): install with no window, then start the new app.
+/// False if it failed.
+pub fn update(dir: &Path) -> bool {
+    let run = start_install(dir.to_path_buf());
+    loop {
+        if let Phase::Finished(r) = *run.lock().unwrap() {
+            if r.is_ok() {
+                launch_app(dir);
+            }
+            return r.is_ok();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 pub fn launch_app(dir: &Path) {
     let _ = Command::new(dir.join(EXE)).current_dir(dir).spawn();
 }

@@ -3,6 +3,7 @@
 //! Five steps (Welcome, License, Requirements, Install, Done) on a layered, borderless window
 //! drawn with Direct2D, driven by mouse and keyboard. `--uninstall` (the copy in the install
 //! folder, which the Apps list runs) shows Confirm, Removing and Done in the same window.
+//! `--update` (the app's Update button) installs with no window and starts the new app.
 //! What it does to the machine is in `install.rs`.
 
 #![windows_subsystem = "windows"]
@@ -953,6 +954,10 @@ fn main() {
             return;
         }
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        // `--update`, from the app's Update: no window unless it fails, then Setup as usual.
+        if !uninstall && std::env::args().any(|a| a == "--update") && install::update(&dir) {
+            return;
+        }
         let instance = GetModuleHandleW(None).expect("module handle");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
