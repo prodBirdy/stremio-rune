@@ -321,6 +321,26 @@ pub mod overlay {
             SetWindowSubclass(h, Some(frame), 0x5354, 0); // same id: replaces, no stacking
             SetWindowPos(h, std::ptr::null_mut(), 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
+        set_icon(h);
+    }
+
+    /// The app icon (the exe's icon resource 1, see build.rs) on the window: the taskbar and
+    /// Alt+Tab use the window's icon, and winit gives windows a generic one.
+    fn set_icon(h: HWND) {
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW, SM_CXICON, SM_CXSMICON, SendMessageW, WM_SETICON,
+        };
+        unsafe {
+            let dpi = GetDpiForWindow(h);
+            for (which, metric) in [(ICON_BIG, SM_CXICON), (ICON_SMALL, SM_CXSMICON)] {
+                let px = GetSystemMetricsForDpi(metric, dpi);
+                // MAKEINTRESOURCE(1): the id as a pointer.
+                let icon = LoadImageW(GetModuleHandleW(std::ptr::null()), 1 as _, IMAGE_ICON, px, px, LR_DEFAULTCOLOR);
+                if !icon.is_null() { SendMessageW(h, WM_SETICON, which as usize, icon as isize); }
+            }
+        }
     }
 
     pub fn set_waker(w: rune::Waker) { let _ = WAKE.set(w); }
