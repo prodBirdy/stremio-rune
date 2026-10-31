@@ -523,7 +523,7 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
     if let Some(player) = &s.player {
         // Redraw when a shown value changes: whole seconds, not every video frame.
-        let shown = |p: &Playback| (p.pos as u64, p.dur as u64, p.paused, p.loading(), p.cache_pct as u64, p.sid.clone(), p.tracks.clone());
+        let shown = |p: &Playback| (p.pos as u64, p.dur as u64, p.paused, p.loading(), p.cache_pct as u64, p.sid.clone(), p.tracks.clone(), p.aid.clone(), p.audio.clone());
         let before = shown(&s.playback);
         let ended = player.pump(&mut s.playback);
         changed |= before != shown(&s.playback);
@@ -651,6 +651,17 @@ fn main() {
             ("menu", |s| { demo(s); s.page = Page::Home; s.menu = true }),
             ("player", |s| { demo(s); s.page = Page::Player; s.playback = Playback { pos: 1234.0, dur: 5400.0, started: true, ..Default::default() } }),
             ("loading", |s| { demo(s); s.page = Page::Player; s.playback = Playback { cache_pct: 40.0, ..Default::default() } }),
+            ("audio", |s| {
+                demo(s);
+                s.page = Page::Player;
+                s.subs_open = true;
+                s.playback = Playback { pos: 1234.0, dur: 5400.0, started: true, sid: "no".into(), aid: "1".into(), ..Default::default() };
+                let t = |id: &str, label: String| player::Track { id: id.into(), label, external: String::new() };
+                s.playback.audio = vec![t("1", player::audio_label("eng", "", 6, "truehd")), t("2", player::audio_label("ger", "", 2, "aac")),
+                    t("3", player::audio_label("eng", "Commentary", 2, "ac3"))];
+                s.playback.tracks = vec![t("4", "ENG · SDH".into())];
+                s.addon_subs = vec![("ger".into(), "u1".into())];
+            }),
             ("subtitles", |s| {
                 demo(s);
                 s.page = Page::Player;
@@ -692,6 +703,48 @@ mod tests {
         let t = std::time::Instant::now();
         while p.pump(&mut pb).is_none() { assert!(t.elapsed().as_secs() < 10, "no shutdown"); std::thread::sleep(std::time::Duration::from_millis(50)) }
         drop(p);
+    }
+
+    #[test]
+    #[ignore = "plays a clip with two audio tracks; opens a window briefly"]
+    fn audio_tracks_are_listed_and_switch() {
+        // TEST_AUDIO_STREAM: a clip whose audio tracks are eng then ger (see BRIEF: target	wo-audio.mkv).
+        let src = std::env::var("TEST_AUDIO_STREAM").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/target/two-audio.mkv").into());
+        let p = Mpv::play(&src, "test", None, None).unwrap();
+        let mut pb = Playback::default();
+        let wait = |pb: &mut Playback, done: &dyn Fn(&Playback) -> bool| {
+            let t = std::time::Instant::now();
+            while !done(pb) {
+                assert_eq!(p.pump(pb), None, "ended early");
+                assert!(t.elapsed().as_secs() < 20, "timed out: {:?} aid={}", pb.audio, pb.aid);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+        wait(&mut pb, &|pb| pb.started && pb.audio.len() == 2 && pb.aid == "1");
+        assert!(pb.audio[0].label.starts_with("English") && pb.audio[1].label.starts_with("German · Commentary"), "{:?}", pb.audio);
+        p.command(&["set", "aid", "2"]).unwrap();
+        wait(&mut pb, &|pb| pb.aid == "2");
+        p.command(&["quit"]).unwrap();
+        let t = std::time::Instant::now();
+        while p.pump(&mut pb).is_none() { assert!(t.elapsed().as_secs() < 10, "no shutdown"); std::thread::sleep(std::time::Duration::from_millis(50)) }
+    }
+
+    #[test]
+    fn audio_labels() {
+        assert_eq!(player::audio_label("eng", "", 6, "truehd"), "English · 5.1 · TrueHD");
+        assert_eq!(player::audio_label("ger", "German", 2, "aac"), "German · Stereo · AAC");
+        assert_eq!(player::audio_label("", "Commentary", 0, ""), "Commentary");
+    }
+
+    #[test]
+    fn panel_lists_audio_above_subtitles() {
+        let mut rt = runtime(|s| { s.page = Page::Player; s.subs_open = true;
+            s.playback.audio = vec![player::Track { id: "1".into(), label: "English".into(), external: String::new() }];
+            s.playback.tracks = vec![player::Track { id: "2".into(), label: "ENG".into(), external: String::new() }] });
+        let (a, sub) = (rt.find("aud-1").expect("audio row"), rt.find("sub-2").expect("subtitle row"));
+        assert!(a.1 < sub.1, "audio above subtitles");
+        click(&mut rt, "subs-close");
+        assert!(!rt.state.subs_open);
     }
 
     fn runtime(scene: fn(&mut State)) -> rune::Runtime<State> {

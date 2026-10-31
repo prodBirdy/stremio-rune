@@ -7,7 +7,7 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-/// A subtitle track mpv knows: embedded, or added from an addon (`external` = its URL).
+/// An audio or subtitle track mpv knows: embedded, or added from an addon (`external` = its URL).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Track { pub id: String, pub label: String, pub external: String }
 
@@ -27,6 +27,9 @@ pub struct Playback {
     pub tracks: Vec<Track>,
     /// Selected subtitle track id, or `no`.
     pub sid: String,
+    pub audio: Vec<Track>,
+    /// Selected audio track id, or `no`.
+    pub aid: String,
     /// `script-message`s from mpv's key bindings (`fullscreen`, `escape`) for the app to act on.
     pub messages: Vec<String>,
 }
@@ -104,7 +107,7 @@ impl Mpv {
             if init(ctx) < 0 { return Err("mpv_initialize failed".into()) }
             // userdata ids match `pump`.
             for (id, name, format) in [(1, "time-pos", DOUBLE), (2, "duration", DOUBLE), (3, "pause", FLAG),
-                (4, "paused-for-cache", FLAG), (5, "cache-buffering-state", INT64), (6, "sid", STRING), (7, "track-list/count", INT64)] {
+                (4, "paused-for-cache", FLAG), (5, "cache-buffering-state", INT64), (6, "sid", STRING), (7, "track-list/count", INT64), (8, "aid", STRING)] {
                 observe(ctx, id, cs(name).as_ptr(), format);
             }
         }
@@ -136,13 +139,17 @@ impl Mpv {
         Some(s)
     }
 
-    /// The subtitle tracks, read when mpv's track count changes.
-    fn subtitle_tracks(&self) -> Vec<Track> {
+    /// The tracks of one `kind` (`sub`, `audio`), read when mpv's track count changes.
+    fn tracks(&self, kind: &str) -> Vec<Track> {
         let n: usize = self.get("track-list/count").and_then(|n| n.parse().ok()).unwrap_or(0);
-        (0..n).filter(|i| self.get(&format!("track-list/{i}/type")).as_deref() == Some("sub")).map(|i| {
+        (0..n).filter(|i| self.get(&format!("track-list/{i}/type")).as_deref() == Some(kind)).map(|i| {
             let field = |f: &str| self.get(&format!("track-list/{i}/{f}")).unwrap_or_default();
             let (lang, title) = (field("lang"), field("title"));
-            let label = [lang.to_uppercase(), title].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" · ");
+            let label = if kind == "audio" {
+                audio_label(&lang, &title, field("demux-channel-count").parse().unwrap_or(0), &field("codec"))
+            } else {
+                [lang.to_uppercase(), title].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" · ")
+            };
             Track { id: field("id"), label: if label.is_empty() { format!("Track {}", field("id")) } else { label }, external: field("external-filename") }
         }).collect()
     }
@@ -192,7 +199,8 @@ impl Mpv {
                             4 => p.buffering = *(prop.data as *const c_int) != 0,
                             5 => p.cache_pct = *(prop.data as *const i64) as f64,
                             6 => p.sid = CStr::from_ptr(*(prop.data as *const *const c_char)).to_string_lossy().into_owned(),
-                            7 => p.tracks = self.subtitle_tracks(),
+                            7 => (p.tracks, p.audio) = (self.tracks("sub"), self.tracks("audio")),
+                            8 => p.aid = CStr::from_ptr(*(prop.data as *const *const c_char)).to_string_lossy().into_owned(),
                             _ => {}
                         }
                     }
@@ -201,6 +209,19 @@ impl Mpv {
             }
         }
     }
+}
+
+/// `English · Commentary · 5.1 · TrueHD`: what tells audio tracks apart. Empty parts drop out.
+pub fn audio_label(lang: &str, title: &str, channels: u32, codec: &str) -> String {
+    let lang = crate::ui::language(lang).to_string();
+    let channels = match channels { 0 => String::new(), 1 => "Mono".into(), 2 => "Stereo".into(), 6 => "5.1".into(), 8 => "7.1".into(), n => format!("{n} ch") };
+    let codec = match codec {
+        "truehd" => "TrueHD".into(), "eac3" => "E-AC-3".into(), "ac3" => "AC-3".into(), "dts" => "DTS".into(),
+        "opus" => "Opus".into(), "vorbis" => "Vorbis".into(), c => c.to_uppercase(),
+    };
+    // Titles often repeat the language ("English"); keep them only when they add something.
+    let title = if title.eq_ignore_ascii_case(&lang) { String::new() } else { title.to_string() };
+    [lang, title, channels, codec].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" · ")
 }
 
 impl Drop for Mpv {

@@ -416,7 +416,8 @@ pub fn language(code: &str) -> &str {
     }
 }
 
-/// Subtitle choices, beside the video: off, the file's own tracks, then the addons'.
+/// Audio & subtitle choices, beside the video: the file's audio tracks, then subtitles (off,
+/// the file's own tracks, then the addons').
 fn subtitles(s: &State) -> El {
     let p = &s.playback;
     let option = |key: String, words: String, on: bool| tap(row().key(key).w_full().h(44.0).px(14.0).gap(12.0).radius(10.0).center_y()
@@ -424,7 +425,14 @@ fn subtitles(s: &State) -> El {
         .child(el().size(8.0, 8.0).radius(4.0).fill(if on { Color::WHITE } else { Color::TRANSPARENT }))
         .child(label(words, 15.0, if on { 600.0 } else { 500.0 }, if on { Color::WHITE } else { ink(0.8) }).truncate().grow(1.0).min_w(0.0)));
     let heading = |t: &str| label(t, 12.0, 600.0, ink(0.45)).pt(12.0).px(14.0);
-    let mut list = col().w_full().gap(2.0).pb(24.0)
+    let section = |t: &str| label(t, 16.0, 700.0, ink(0.9)).pt(16.0).pb(4.0).px(14.0);
+    let mut list = col().w_full().gap(2.0).pb(24.0);
+    if !p.audio.is_empty() { list = list.child(section("Audio")) }
+    for t in &p.audio {
+        let id = t.id.clone();
+        list = list.child(option(format!("aud-{id}"), t.label.clone(), p.aid == t.id).on_press(move |s: &mut State| mpv(s, &["set", "aid", &id])));
+    }
+    list = list.child(section("Subtitles"))
         .child(option("sub-off".into(), "Off".into(), p.sid.is_empty() || p.sid == "no").on_press(|s: &mut State| mpv(s, &["set", "sid", "no"])));
     let embedded: Vec<_> = p.tracks.iter().filter(|t| t.external.is_empty()).collect();
     if !embedded.is_empty() { list = list.child(heading("IN THIS VIDEO")) }
@@ -445,13 +453,13 @@ fn subtitles(s: &State) -> El {
     col().key("subtitles").w(SUBS_W).h_full().pt(22.0).px(14.0).gap(12.0).fill(bg()).border(1.0, ink(0.06))
         .transition(Transition::offset(SUBS_W, 0.0).combined(Transition::opacity()))
         .child(row().w_full().px(6.0).center_y()
-            .child(label("Subtitles", 22.0, 700.0, Color::WHITE).grow(1.0))
+            .child(label("Audio & Subtitles", 22.0, 700.0, Color::WHITE).grow(1.0))
             .child(tap(row().key("subs-close").size(36.0, 36.0).radius(18.0).center().hover(ink(0.12))
                 .child(icon(s, |i| &i.close, 16.0))).on_press(|s: &mut State| s.subs_open = false)))
         .child(list.scroll(ScrollSpec { stick_bottom: false }).grow(1.0).shrink().min_h(0.0))
 }
 
-/// The video (mpv's child window covers that area once playing), the subtitles panel when
+/// The video (mpv's child window covers that area once playing), the audio & subtitles panel when
 /// open, and the controls under them while the mouse is active.
 fn player(s: &State) -> El {
     let p = &s.playback;
