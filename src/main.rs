@@ -14,8 +14,8 @@ mod videotest;
 mod window;
 
 use player::{Mpv, Playback};
-use ui::{Ctl, addons, search, settings};
-use rune::{AppHandle, AppSpec, Image, ImageCache, Key, KeyEvent, TextEdit, Tween, Tx, Waker, WindowHandle};
+use ui::{addons, search, settings};
+use rune::{AppSpec, Image, ImageCache, Key, KeyEvent, TextEdit, Tween, Tx, Waker};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -165,10 +165,13 @@ struct State {
     quality_open: bool,
     /// The stream URL playing.
     playing: String,
-    /// The floating controls' window, whether it shows, and what it was last sent.
-    overlay: Option<(AppHandle<Ctl>, WindowHandle)>,
-    overlay_on: bool,
-    pushed: ui::Shown,
+    /// Where mpv's frames land (`video.rs`), drawn by the player page, and the size they're
+    /// rendered at (the video element's, in device pixels).
+    video: rune::NativeSurface,
+    video_size: (u32, u32),
+    /// Seek-bar drag in progress, as a fraction of the duration; volume-slider drag, percent.
+    scrub: Option<f32>,
+    vol_drag: Option<f64>,
     subs_for: String,
     addon_subs: Vec<(String, String)>,
     search: search::Search,
@@ -268,9 +271,10 @@ fn state() -> State {
         subs_open: false,
         quality_open: false,
         playing: String::new(),
-        overlay: None,
-        overlay_on: false,
-        pushed: ui::Shown::default(),
+        video: rune::NativeSurface::new(),
+        video_size: (0, 0),
+        scrub: None,
+        vol_drag: None,
         subs_for: String::new(),
         addon_subs: vec![],
         search: search::Search::default(),
@@ -656,7 +660,7 @@ fn play(s: &mut State, url: &str) {
     stop(s); // close the previous player first
     let title = s.meta.as_ref().and_then(|m| m["name"].as_str()).unwrap_or("Stremio").to_string();
     let start = s.resume.as_ref().filter(|(v, _)| *v == s.stream_for).map(|(_, at)| *at);
-    match Mpv::play(url, &title, s.waker.clone(), start, settings::mpv_options(&s.settings), None) {
+    match Mpv::play(url, &title, s.waker.clone(), start, settings::mpv_options(&s.settings), Some(s.video.clone())) {
         Ok(p) => {
             // Arrow keys over the video: mpv's own bindings, at the chosen step.
             let step = s.settings.seek_ms as f64 / 1000.0;
@@ -723,7 +727,8 @@ fn stop(s: &mut State) {
     s.quality_open = false;
     s.playing.clear();
     s.controls = true;
-    s.player = None; // destroys mpv and its child window, uncovering the app
+    s.player = None; // stops mpv and its renderer
+    s.video.clear();
     s.playback = Playback::default();
     s.page = Page::Detail;
 }
@@ -776,6 +781,8 @@ fn escape(s: &mut State) {
 }
 
 fn mpv(s: &State, args: &[&str]) {
+    #[cfg(test)]
+    tests::MPV.with(|log| log.borrow_mut().push(args.join(" ")));
     if let Some(p) = &s.player { let _ = p.command(args); }
 }
 
@@ -808,7 +815,8 @@ fn icons(cache: &ImageCache) -> Icons {
 }
 
 fn setup(s: &mut State, waker: Waker) {
-    window::overlay::set_waker(waker.clone());
+    window::chrome::set_waker(waker.clone());
+    s.video.set_waker(waker.clone());
     let cache = ImageCache::new(waker.clone());
     s.icons = Some(icons(&cache));
     s.search.debounce.set_waker(waker.clone());
@@ -826,18 +834,23 @@ fn setup(s: &mut State, waker: Waker) {
 
 fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
-    fullscreen_selftest(s, tx);
+    changed |= fullscreen_selftest(s, tx);
     cursor_selftest(s, tx);
     if let Some(player) = &s.player {
-        let ended = player.pump(&mut s.playback); // shown in the controls' window, see `shown`
+        // Redraw when a shown value changes: whole seconds, not every position update.
+        let shown = |p: &Playback| { let mut p = p.clone(); (p.pos, p.cache_pct) = (p.pos.trunc(), p.cache_pct.trunc()); p.messages.clear(); p };
+        let before = shown(&s.playback);
+        let ended = player.pump(&mut s.playback);
+        changed |= before != shown(&s.playback);
         // Controls show while the mouse moves, and stay while paused, loading, hovered or
-        // picking from a panel. The mouse is read from the system: it's over the controls'
-        // window, not this one.
+        // picking from a panel.
         let cursor = window::cursor();
         if cursor != s.cursor { s.cursor = cursor; s.last_move = Instant::now() }
         let p = &s.playback;
-        s.controls = p.paused || p.loading() || s.bar_hover || s.subs_open || s.quality_open || s.last_move.elapsed() < Duration::from_millis(s.settings.hide_ms as u64);
-        player.fit();
+        let controls = p.paused || p.loading() || s.bar_hover || s.subs_open || s.quality_open || s.last_move.elapsed() < Duration::from_millis(s.settings.hide_ms as u64);
+        changed |= controls != s.controls;
+        s.controls = controls;
+        player.set_video_size(s.video_size.0, s.video_size.1);
         remember_volume(s);
         library::tick(s);
         tx.wake_after(Duration::from_millis(200));
@@ -925,14 +938,6 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
     changed |= rotate_hero(s, tx);
     let caption = window::caption();
     if caption != s.caption { s.caption = caption; changed = true }
-    if let Some((app, win)) = &s.overlay {
-        let on = s.page == Page::Player;
-        if on != s.overlay_on { s.overlay_on = on; window::overlay::show(win, on) }
-        if on { window::overlay::keep_keys(win) }
-        window::overlay::hide_cursor(on && !s.controls);
-        let v = shown(s);
-        if v != s.pushed { s.pushed = v.clone(); app.update(move |c, tx| ui::push(c, v, tx)) }
-    }
     changed
 }
 
@@ -947,54 +952,37 @@ fn remember_volume(s: &mut State) {
     }
 }
 
-/// What the floating controls show, sent to their window when it changes.
-fn shown(s: &State) -> ui::Shown {
-    let mut playback = s.playback.clone();
-    // Whole seconds, so the controls redraw once a second rather than on every video frame.
-    (playback.pos, playback.cache_pct) = (playback.pos.trunc(), playback.cache_pct.trunc());
-    ui::Shown {
-        controls: s.controls,
-        playback,
-        title: s.meta.as_ref().and_then(|m| m["name"].as_str()).unwrap_or_default().to_string(),
-        fullscreen: s.fullscreen,
-        subs_open: s.subs_open,
-        quality_open: s.quality_open,
-        addon_subs: s.addon_subs.clone(),
-        logo: s.meta.as_ref().and_then(logo).and_then(|u| s.images.get(&u)).filter(|i| i.is_ready()).cloned().map(ui::Logo),
-        streams: s.streams.clone(),
-        playing: s.playing.clone(),
-    }
-}
-
 /// `STREMIO_RUNE_FSTEST=<video file>`: play it, enter and leave fullscreen the way the
 /// controls' button does, write the window state at each step to
 /// `%TEMP%\stremio-rune-fstest.txt`, and quit. For diagnosing fullscreen on a real desktop.
-fn fullscreen_selftest(s: &mut State, tx: &mut Tx) {
+/// True when it changed what the view shows.
+fn fullscreen_selftest(s: &mut State, tx: &mut Tx) -> bool {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU8, Ordering};
     static START: OnceLock<Instant> = OnceLock::new();
     static STEP: AtomicU8 = AtomicU8::new(0);
-    let Ok(clip) = std::env::var("STREMIO_RUNE_FSTEST") else { return };
+    let Ok(clip) = std::env::var("STREMIO_RUNE_FSTEST") else { return false };
     let t = START.get_or_init(Instant::now).elapsed().as_secs_f32();
     tx.wake_after(Duration::from_millis(100));
-    let log = |what: &str| {
+    let log = |what: &str, s: &State| {
         use std::io::Write;
         let path = std::env::temp_dir().join("stremio-rune-fstest.txt");
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "[{t:.1}s] {what}: {}", window::diag());
+            let _ = writeln!(f, "[{t:.1}s] {what} (fullscreen {}, strip {:?}, video {:?}): {}", s.fullscreen, s.caption, s.video_size, window::diag());
         }
     };
     let step = STEP.load(Ordering::Relaxed);
     let next = match step {
         0 if t > 2.0 => { window::selftest_front_maximized(); true }
         1 if t > 3.0 => { s.meta = None; play(s, &clip); true }
-        2 if t > 6.0 => { log("before"); toggle_fullscreen(s); log("toggled"); true }
-        3 if t > 6.4 => { window::selftest_jiggle(); log("fullscreen +0.4s"); true }
-        4 if t > 8.0 => { log("fullscreen +2s"); toggle_fullscreen(s); true }
-        5 if t > 9.0 => { log("restored +1s"); tx.quit(); true }
+        2 if t > 6.0 => { log("before", s); toggle_fullscreen(s); log("toggled", s); true }
+        3 if t > 6.4 => { window::selftest_jiggle(); log("fullscreen +0.4s", s); true }
+        4 if t > 8.0 => { log("fullscreen +2s", s); toggle_fullscreen(s); true }
+        5 if t > 9.0 => { log("restored +1s", s); tx.quit(); true }
         _ => false,
     };
     if next { STEP.store(step + 1, Ordering::Relaxed) }
+    next
 }
 
 /// `STREMIO_RUNE_CURSORTEST=<video file>`: play it with the pointer over the video, write the
@@ -1082,11 +1070,12 @@ fn demo_cat(ty: &str, name: &str) -> Catalog {
     Catalog { base: String::new(), ty: ty.into(), id: "top".into(), name: name.into(), skip: false }
 }
 
-/// Demo playback for the controls' scenes.
-fn demo_controls(c: &mut Ctl) {
-    let v = &mut c.shown;
+/// Demo playback for the player scenes.
+fn demo_player(v: &mut State) {
+    demo(v);
+    v.page = Page::Player;
     v.controls = true;
-    v.title = "The Long Quiet".into();
+    v.meta = Some(json!({ "id": "tt1", "type": "movie", "name": "The Long Quiet" }));
     v.playback = Playback { pos: 1234.0, dur: 5400.0, started: true, sid: "no".into(), aid: "1".into(), ..Default::default() };
     let st = |name: &str, title: &str, url: &str| Stream { name: name.into(), title: title.into(), url: url.into() };
     v.streams = vec![
@@ -1097,13 +1086,15 @@ fn demo_controls(c: &mut Ctl) {
         st("Some Addon", "Direct link", "e"),
     ];
     v.playing = "b".into();
-    (v.playback.volume, c.vol_drag) = (80.0, None);
+    v.playback.volume = 80.0;
 }
 
 fn main() {
+    // The video's frames are Direct3D textures (video.rs), which Rune imports on DX12 only.
+    if std::env::var_os("WGPU_BACKEND").is_none() { unsafe { std::env::set_var("WGPU_BACKEND", "dx12") } }
     #[cfg(windows)]
     if videotest::run() { return }
-    let mut app = rune::App::new(AppSpec {
+    let app = rune::App::new(AppSpec {
         setup: Some(setup),
         poll: Some(poll),
         on_key: Some(on_key),
@@ -1149,6 +1140,18 @@ fn main() {
                 s.store.preview = Some(addons::descriptor("https://example.org/manifest.json", s.addons[2]["manifest"].clone()));
                 s.store.preview.as_mut().unwrap()["manifest"]["name"] = "Example Addon".into();
             }),
+            ("player", demo_player),
+            ("loading", |s| { demo_player(s); s.playback = Playback { cache_pct: 40.0, ..Default::default() } }),
+            ("quality", |s| { demo_player(s); s.quality_open = true }),
+            ("audio", |s| {
+                demo_player(s);
+                s.subs_open = true;
+                let t = |id: &str, label: String| player::Track { id: id.into(), label, external: String::new() };
+                s.playback.audio = vec![t("1", player::audio_label("eng", "", 6, "truehd")), t("2", player::audio_label("ger", "", 2, "aac")),
+                    t("3", player::audio_label("eng", "Commentary", 2, "ac3"))];
+                s.playback.tracks = vec![t("4", "ENG · SDH".into())];
+                s.addon_subs = vec![("ger".into(), "u1".into()), ("ger".into(), "u2".into()), ("fre".into(), "u3".into())];
+            }),
             ("settings", |s| {
                 demo(s);
                 s.page = Page::Settings;
@@ -1161,35 +1164,8 @@ fn main() {
             }),
         ],
         ..AppSpec::new("Stremio", (1280.0, 800.0), state, ui::view)
-    }).on_window(window::overlay::set_main).on_focus(on_focus);
-    // The playback controls float over the video in a transparent window of their own (mpv's
-    // window covers the app's), shown while playing. Snaps: `--window controls --scene quality`.
-    let main = app.handle();
-    // It's made when playback starts and dropped, GPU device and all, when it ends: on Windows
-    // a transparent window needs its own DX12 device, ~400 MB of RAM and ~190 MB of GPU memory
-    // even while hidden.
-    let controls = rune::WindowSpec::from_app("controls", rune::App::new(AppSpec {
-        setup: Some(ui::ctl_setup),
-        scenes: &[
-            ("player", demo_controls),
-            ("loading", |c| { demo_controls(c); c.shown.playback = Playback { cache_pct: 40.0, ..Default::default() } }),
-            ("quality", |c| { demo_controls(c); c.shown.quality_open = true }),
-            ("audio", |c| {
-                demo_controls(c);
-                c.shown.subs_open = true;
-                let p = &mut c.shown.playback;
-                let t = |id: &str, label: String| player::Track { id: id.into(), label, external: String::new() };
-                p.audio = vec![t("1", player::audio_label("eng", "", 6, "truehd")), t("2", player::audio_label("ger", "", 2, "aac")),
-                    t("3", player::audio_label("eng", "Commentary", 2, "ac3"))];
-                p.tracks = vec![t("4", "ENG · SDH".into())];
-                c.shown.addon_subs = vec![("ger".into(), "u1".into()), ("ger".into(), "u2".into()), ("fre".into(), "u3".into())];
-            }),
-        ],
-        ..AppSpec::new("Stremio controls", (1280.0, 800.0), Ctl::default, ui::controls)
-    }).windowless().release_gpu_when_closed()).state(Ctl { main: Some(main), ..Default::default() })
-        .options(rune::WindowOptions { transparent: true, borderless: true, visible: false, min_size: Some((0.0, 0.0)), ..Default::default() });
-    let overlay = app.window(controls);
-    app.init(move || State { overlay: Some(overlay), ..state() }).run();
+    }).on_window(window::chrome::set_main).on_focus(on_focus);
+    app.run();
 }
 
 #[cfg(test)]
@@ -1318,23 +1294,22 @@ mod tests {
         assert!(p(|p| p.idle = true), "the core waiting while not paused: a stall starting");
         assert!(!p(|p| { p.idle = true; p.paused = true }), "paused isn't loading");
         assert!(p(|p| p.buffering = true));
-        // The click's own frame shows it: the page switches and the loader is in what's pushed.
-        let mut s = state();
-        s.page = Page::Player;
-        assert!(shown(&s).playback.loading());
+        // The click's own frame shows it: the page switches and the loader is on it.
+        let rt = runtime(|s| { demo_player(s); s.playback = Playback::default() });
+        assert!(rt.find("loader").is_some());
     }
 
     #[test]
     fn controls_land_at_once_when_the_window_resizes() {
-        // Fullscreen and back: the controls' window jumps to the new size. Nothing in it may
-        // travel there over frames, with or without a panel open.
+        // Fullscreen and back: the window jumps to the new size, and the controls with it. Nothing
+        // may travel there over frames, with or without a panel open.
         for panel in [false, true] {
-            let mut rt = controls(move |c| { demo_controls(c); c.shown.subs_open = panel });
+            let mut rt = runtime(move |s| { demo_player(s); s.subs_open = panel });
             for _ in 0..60 { rt.frame(1.0 / 60.0); }
             for (w, h) in [(1920.0, 1080.0), (1280.0, 800.0)] {
                 rt.set_viewport((w, h), 2.0);
-                // The app pushes its new state (the fullscreen icon) around the same frame.
-                rt.update(move |c, tx| { let v = ui::Shown { fullscreen: w > 1280.0, ..c.shown.clone() }; ui::push(c, v, tx) });
+                // As the fullscreen button does: the state change in the same frame, instant.
+                rt.update(move |s, tx| { tx.instant(); s.fullscreen = w > 1280.0 });
                 let mut seen = vec![];
                 for _ in 0..20 {
                     rt.frame(1.0 / 60.0);
@@ -1345,7 +1320,7 @@ mod tests {
                 assert!((toggle.1 - (h - BAR / 2.0)).abs() < 1.0 && full.0 > w - 60.0 - if panel { SUBS_W } else { 0.0 }, "at the new edges at once");
             }
             // Showing and hiding the bars still fades.
-            rt.update(|c, tx| { let v = ui::Shown { controls: false, ..c.shown.clone() }; ui::push(c, v, tx) });
+            rt.update(|s, _| s.controls = false);
             rt.frame(1.0 / 60.0);
             let fading = rt.presented("controls").map(|(_, o)| o);
             assert!(fading.is_some_and(|o| o > 0.05 && o < 1.0), "fading out, not gone at once: {fading:?}");
@@ -1354,27 +1329,34 @@ mod tests {
         }
     }
 
+    thread_local! {
+        /// What the app sent mpv (`mpv`), for tests without a player.
+        pub static MPV: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn sent() -> Vec<String> { MPV.with(|log| std::mem::take(&mut *log.borrow_mut())) }
+
     #[test]
     fn volume_slider_drags_scrolls_mutes_and_is_remembered() {
-        let mut rt = controls(demo_controls);
+        let mut rt = runtime(demo_player);
         let (x, y) = rt.find("volume").expect("slider");
         let w = ui::VOL_W;
+        sent();
         rt.pointer_down(x - w / 2.0 + 1.0, y);
         rt.pointer_move(x - w / 4.0, y);
         rt.frame(1.0 / 60.0);
         assert!(rt.state.vol_drag.is_some_and(|v| (v - 25.0).abs() < 3.0), "follows the pointer: {:?}", rt.state.vol_drag);
         rt.pointer_up(x - w / 4.0, y);
         rt.frame(1.0 / 60.0);
-        assert!(rt.state.vol_drag.is_none() && (rt.state.shown.playback.volume - 25.0).abs() < 3.0);
-        assert!(!rt.state.sent.is_empty(), "each step goes to mpv");
-        rt.state.sent.clear();
+        assert!(rt.state.vol_drag.is_none() && (rt.state.playback.volume - 25.0).abs() < 3.0);
+        assert!(sent().iter().any(|c| c.starts_with("set volume")), "each step goes to mpv");
         let mut wheel = rune::WheelEvent::default();
         (wheel.x, wheel.y, wheel.dy) = (x, y, 40.0);
         rt.wheel_event(wheel);
         rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.sent.len(), 1, "a wheel step over the slider");
+        assert_eq!(sent(), ["add volume 5"], "a wheel step over the slider");
         click(&mut rt, "mute");
-        assert_eq!(rt.state.sent.len(), 2);
+        assert_eq!(sent(), ["cycle mute"]);
         // Saved once it has settled for a second, and handed to mpv at the next start.
         let mut s = state();
         s.playback = Playback { started: true, volume: 60.0, ..Default::default() };
@@ -1419,60 +1401,39 @@ mod tests {
 
     #[test]
     fn panel_lists_audio_above_subtitles() {
-        let mut rt = controls(|c| { c.shown.subs_open = true;
-            c.shown.playback.audio = vec![player::Track { id: "1".into(), label: "English".into(), external: String::new() }];
-            c.shown.playback.tracks = vec![player::Track { id: "2".into(), label: "ENG".into(), external: String::new() }] });
+        let mut rt = runtime(|s| { demo_player(s); s.subs_open = true;
+            s.playback.audio = vec![player::Track { id: "1".into(), label: "English".into(), external: String::new() }];
+            s.playback.tracks = vec![player::Track { id: "2".into(), label: "ENG".into(), external: String::new() }] });
         let (a, sub) = (rt.find("aud-1").expect("audio row"), rt.find("sub-2").expect("subtitle row"));
         assert!(a.1 < sub.1, "audio above subtitles");
-        let mut s = State { subs_open: true, ..state() };
+        sent();
+        click(&mut rt, "aud-1");
+        assert_eq!(sent(), ["set aid 1"]);
         click(&mut rt, "panel-close");
-        apply(&mut rt, &mut s);
-        assert!(!s.subs_open);
-    }
-
-    /// The floating controls' window on its own, as in a scene.
-    fn controls(scene: impl FnOnce(&mut Ctl)) -> rune::Runtime<Ctl> {
-        let mut c = Ctl::default();
-        scene(&mut c);
-        let mut rt = rune::Runtime::new(c, ui::controls, (1280.0, 800.0), rune::Env { system_dark: true, scale: 2.0 });
-        rt.frame(0.0);
-        rt
-    }
-
-    /// Run the presses the controls sent on the app's state.
-    fn apply(rt: &mut rune::Runtime<Ctl>, s: &mut State) {
-        for f in std::mem::take(&mut rt.state.sent) { f(s) }
+        assert!(!rt.state.subs_open);
     }
 
     #[test]
     fn controls_float_only_while_active_and_panels_toggle() {
-        let mut rt = controls(demo_controls);
+        let mut rt = runtime(demo_player);
         assert!(rt.find("bar").is_some() && rt.find("video").is_some() && rt.find("loader").is_none());
         let (back, toggle) = (rt.find("back").expect("back"), rt.find("toggle").expect("play/pause"));
         assert!(back.1 < 100.0 && toggle.1 > 700.0, "back and the title at the top, play/pause at the bottom");
-        let mut s = state();
         click(&mut rt, "quality");
-        apply(&mut rt, &mut s);
-        assert!(s.quality_open && !s.subs_open);
-        s.subs_open = true; // opening one panel closes the other
-        click(&mut rt, "quality");
-        apply(&mut rt, &mut s);
-        assert!(!s.quality_open && !s.subs_open);
-        s.quality_open = true;
+        assert!(rt.state.quality_open && !rt.state.subs_open);
+        click(&mut rt, "subs"); // opening one panel closes the other
+        assert!(rt.state.subs_open && !rt.state.quality_open);
         click(&mut rt, "subs");
-        apply(&mut rt, &mut s);
-        assert!(s.subs_open && !s.quality_open);
-        // Pushed state: the bar goes when the mouse rests; the button names what plays.
-        let mut rt = controls(|c| { demo_controls(c); c.shown.controls = false });
+        assert!(!rt.state.subs_open && !rt.state.quality_open);
+        sent();
+        click(&mut rt, "toggle");
+        assert_eq!(sent(), ["cycle pause"]);
+        // The bars go when the mouse rests, and the cursor with them.
+        rt.update(|s, _| s.controls = false);
         for _ in 0..60 { rt.frame(1.0 / 60.0); }
         assert!(rt.find("bar").is_none() && rt.find("top-bar").is_none(), "controls hidden, top and bottom");
-        let rt = controls(|c| { demo_controls(c); c.shown.playback.buffering = true });
-        assert!(rt.find("loader").is_some(), "the loader floats over the frozen frame");
-        // `shown` copies the app's state, in whole seconds.
-        let mut s = state();
-        (s.controls, s.playback.pos, s.quality_open) = (true, 12.7, true);
-        let v = shown(&s);
-        assert!(v.controls && v.quality_open && v.playback.pos == 12.0);
+        let rt = runtime(|s| { demo_player(s); s.playback.buffering = true });
+        assert!(rt.find("loader").is_some(), "the loader over the frozen frame");
     }
 
     #[test]
@@ -1488,12 +1449,10 @@ mod tests {
         let groups: Vec<_> = ui::qualities(&streams).into_iter().map(|(r, g)| (r, g.iter().map(|(i, _)| *i).collect::<Vec<_>>())).collect();
         assert_eq!(groups, [("4K", vec![1, 4]), ("1080p", vec![3]), ("720p", vec![0]), ("Other", vec![2])]);
 
-        let mut rt = controls(|c| { demo_controls(c); c.shown.quality_open = true });
+        let mut rt = runtime(|s| { demo_player(s); s.quality_open = true });
         assert!(rt.find("q-0").unwrap().1 < rt.find("q-1").unwrap().1, "4K first");
-        let mut s = State { quality_open: true, playing: "b".into(), ..state() };
         click(&mut rt, "q-1"); // the stream playing: nothing to switch, the panel closes
-        apply(&mut rt, &mut s);
-        assert!(!s.quality_open && s.playing == "b");
+        assert!(!rt.state.quality_open && rt.state.playing == "b");
     }
 
     fn runtime(scene: impl FnOnce(&mut State)) -> rune::Runtime<State> {

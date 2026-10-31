@@ -297,10 +297,9 @@ impl Renderer {
         }
     }
 
-    /// Make the ring for frames of `w`×`h`, once the old one's textures are all back.
+    /// Make a new ring for frames of `w`×`h`. The old textures go at once: a frame Rune still
+    /// shows keeps its texture alive through Rune's own reference until a new one replaces it.
     fn resize(&mut self, w: u32, h: u32) -> Result<(), String> {
-        let newest = self.slots.iter().map(|s| s.last).max().unwrap_or(0);
-        if !self.wait_done(newest, Duration::from_millis(500)) { return Err("Rune kept the old frames".into()) }
         for s in std::mem::take(&mut self.slots) { self.drop_slot(s) }
         for _ in 0..RING {
             unsafe {

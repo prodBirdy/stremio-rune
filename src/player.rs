@@ -45,14 +45,11 @@ impl Playback {
     pub fn loading(&self) -> bool { !self.started || self.buffering || self.seeking || (self.idle && !self.paused) }
 }
 
-/// mpv core, the boxed waker its wakeup callback holds, and the child window it draws in.
-/// Fields drop in order after `Drop::drop` destroys the core.
+/// mpv core, the boxed waker its wakeup callback holds, and where its frames go.
 pub struct Mpv {
     ctx: *mut c_void,
     waker: *mut Waker,
-    #[cfg(windows)]
-    host: Option<win::Host>,
-    /// mpv's frames into a Rune surface (video.rs), instead of the child window.
+    /// mpv's frames into a Rune surface (video.rs).
     #[cfg(windows)]
     video: Option<crate::video::FrameSource>,
 }
@@ -105,20 +102,15 @@ impl Mpv {
         let ctx = unsafe { create() };
         if ctx.is_null() { return Err("mpv_create failed".into()) }
         let waker = Box::into_raw(Box::new(waker.unwrap_or_else(|| std::sync::Arc::new(|| {}))));
-        let in_rune = surface.is_some();
         // cleaned up on any early return
-        let mut mpv = Mpv { ctx, waker, #[cfg(windows)] host: if in_rune { None } else { win::Host::new() }, #[cfg(windows)] video: None };
+        let mut mpv = Mpv { ctx, waker, #[cfg(windows)] video: None };
+        // vo=libmpv: mpv renders through the render API into Rune's surface (video.rs), and has
+        // no window of its own; without a surface (headless tests) nothing is shown.
         // hwdec: mpv defaults to CPU decoding, which can't keep up with 4K/8K HEVC.
-        // cursor-autohide matches the app's controls, which hide after the same idle time.
-        let mut opts = vec![("force-window", "yes".to_string()), ("osc", "no".into()), ("input-default-bindings", "yes".into()),
-            ("input-vo-keyboard", "yes".into()), ("ytdl", "no".into()), ("hwdec", "auto-safe".into()),
-            ("cursor-autohide", "2500".into()), ("title", title.into())];
+        let mut opts = vec![("vo", if surface.is_some() { "libmpv" } else { "null" }.to_string()), ("osc", "no".into()),
+            ("input-default-bindings", "yes".into()), ("ytdl", "no".into()), ("hwdec", "auto-safe".into()), ("title", title.into())];
         if let Some(at) = start { opts.push(("start", format!("{at}"))) }
         opts.extend(extra);
-        // In Rune: mpv renders through the render API (vo=libmpv) into Rune's surface.
-        if in_rune { opts.extend([("vo", "libmpv".to_string()), ("force-window", "no".into())]) }
-        #[cfg(windows)]
-        if let Some(h) = &mpv.host { opts.push(("wid", (h.0 as isize).to_string())) }
         unsafe {
             on_wake(ctx, on_mpv_wakeup, waker.cast());
             for (k, v) in &opts { set(ctx, cs(k).as_ptr(), cs(v).as_ptr()); }
@@ -205,12 +197,6 @@ impl Mpv {
     /// A property as text, for measuring (`frame-drop-count`, …).
     pub fn property(&self, name: &str) -> Option<String> { self.get(name) }
 
-    /// Size mpv's window to the app window. Cheap when nothing changed; call every poll.
-    pub fn fit(&self) {
-        #[cfg(windows)]
-        if let Some(h) = &self.host { h.fit() }
-    }
-
     /// Drain mpv's events into `p`. `Some(error)` once playback is over: Esc or `q`, end of
     /// file, or a failure (`Some(Some(message))`).
     pub fn pump(&self, p: &mut Playback) -> Option<Option<String>> {
@@ -287,60 +273,5 @@ impl Drop for Mpv {
             unsafe { destroy(self.ctx) }
         }
         drop(unsafe { Box::from_raw(self.waker) }); // after destroy: mpv can't call it any more
-    }
-}
-
-#[cfg(windows)]
-mod win {
-    use std::cell::Cell;
-    use windows_sys::Win32::Foundation::{HWND, RECT};
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, GetClientRect, GetParent, MoveWindow, SW_SHOWNA, ShowWindow, WS_CHILD,
-        WS_CLIPCHILDREN,
-    };
-
-    /// Black until mpv's own window paints (the STATIC class's SS_BLACKRECT).
-    const SS_BLACKRECT: u32 = 0x4;
-
-    /// A child of the app window that mpv draws into. Created and destroyed on the UI thread.
-    /// Starts hidden; `fit` remembers what it last applied so repeat calls do nothing.
-    pub struct Host(pub HWND, Cell<Option<(i32, i32, i32)>>);
-
-    impl Host {
-        /// Under the app window (its handle from Rune at start-up; else the active window).
-        pub fn new() -> Option<Host> {
-            let parent = Some(crate::window::overlay::main()).filter(|h| !h.is_null()).unwrap_or_else(|| unsafe { GetActiveWindow() });
-            if parent.is_null() { return None }
-            let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
-            let hwnd = unsafe {
-                CreateWindowExW(0, class.as_ptr(), std::ptr::null(), WS_CHILD | WS_CLIPCHILDREN | SS_BLACKRECT, 0, 0, 0, 0, parent,
-                    std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null())
-            };
-            if hwnd.is_null() { return None }
-            crate::window::overlay::set_video(hwnd);
-            Some(Host(hwnd, Cell::new(None)))
-        }
-
-        /// Cover the parent's client area below its title strip, and show.
-        pub fn fit(&self) {
-            unsafe {
-                let parent = GetParent(self.0);
-                let mut r: RECT = std::mem::zeroed();
-                GetClientRect(parent, &mut r);
-                let top = crate::window::overlay::strip_px(parent, windows_sys::Win32::UI::HiDpi::GetDpiForWindow(parent));
-                let (w, h) = (r.right, (r.bottom - top).max(0));
-                if self.1.replace(Some((top, w, h))) == Some((top, w, h)) { return }
-                MoveWindow(self.0, 0, top, w, h, 1);
-                ShowWindow(self.0, SW_SHOWNA);
-            }
-        }
-    }
-
-    impl Drop for Host {
-        fn drop(&mut self) {
-            crate::window::overlay::set_video(std::ptr::null_mut());
-            unsafe { DestroyWindow(self.0); }
-        }
     }
 }

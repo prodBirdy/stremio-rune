@@ -18,15 +18,11 @@ pub fn toggle_fullscreen() -> bool {
 
     let mut saved = SAVED.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
-        // The app window itself: with the controls in their own window, the active window can be
-        // that one, and fullscreening it would leave the app as it was.
-        let hwnd = Some(overlay::main()).filter(|h| !h.is_null()).unwrap_or_else(|| GetAncestor(GetActiveWindow(), GA_ROOT));
+        let hwnd = Some(chrome::main()).filter(|h| !h.is_null()).unwrap_or_else(|| GetAncestor(GetActiveWindow(), GA_ROOT));
         if hwnd.is_null() { return saved.is_some() }
-        // The controls hide for a moment while everything moves (they'd smear mid-resize), and
-        // the app window only while its frame changes (else a bare system frame flashes). It has
+        // The window hides only while its frame changes (else a bare system frame flashes). It has
         // to be visible when it takes the monitor's size: the shell only hides the taskbar for a
         // fullscreen window it can see at that moment.
-        cloak_briefly(overlay::window());
         if let Some((style, place)) = saved.take() {
             cloak(hwnd, true);
             SetWindowLongPtrW(hwnd, GWL_STYLE, style);
@@ -34,7 +30,7 @@ pub fn toggle_fullscreen() -> bool {
             SetWindowPlacement(hwnd, &place);
             SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-            for h in [hwnd, overlay::window()] { taskbar::mark_fullscreen(h, false) }
+            taskbar::mark_fullscreen(hwnd, false);
             return false;
         }
         let mut place: WINDOWPLACEMENT = std::mem::zeroed();
@@ -55,11 +51,7 @@ pub fn toggle_fullscreen() -> bool {
         SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_OVERLAPPEDWINDOW as isize));
         cloak(hwnd, false);
         SetWindowPos(hwnd, HWND_TOP, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-        for h in [hwnd, overlay::window()] { taskbar::mark_fullscreen(h, true) }
-        // The fullscreen window has to be the one in front, not the controls that were clicked.
-        windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
-        // Bringing the app window forward can put it above its own controls; keep them on top.
-        overlay::raise();
+        taskbar::mark_fullscreen(hwnd, true);
         *saved = Some((style, place));
         true
     }
@@ -81,7 +73,7 @@ mod taskbar {
         release: unsafe extern "system" fn(*mut c_void) -> u32,
         hr_init: unsafe extern "system" fn(*mut c_void) -> i32,
         _add_tab: usize,
-        delete_tab: unsafe extern "system" fn(*mut c_void, HWND) -> i32,
+        _delete_tab: usize,
         _activate_tab: usize,
         _set_active_alt: usize,
         mark_fullscreen_window: unsafe extern "system" fn(*mut c_void, HWND, i32) -> i32,
@@ -98,15 +90,10 @@ mod taskbar {
         }
     }
 
-    /// The shell's own fullscreen detection misses the window (it's cloaked at the moment it
-    /// covers the monitor, and the controls' window may be the one in front), so say it.
+    /// The shell's own fullscreen detection can miss the window (it's cloaked for a moment as
+    /// its frame changes), so say it.
     pub fn mark_fullscreen(hwnd: HWND, on: bool) {
         if !hwnd.is_null() { with(|v, l| unsafe { (v.mark_fullscreen_window)(l, hwnd, on as i32); }) }
-    }
-
-    /// No taskbar button for this window (the controls': one app, one button).
-    pub fn drop_tab(hwnd: HWND) {
-        if !hwnd.is_null() { with(|v, l| unsafe { (v.delete_tab)(l, hwnd); }) }
     }
 }
 
@@ -117,29 +104,6 @@ fn cloak(h: windows_sys::Win32::Foundation::HWND, on: bool) {
     if h.is_null() { return }
     let on = on as i32;
     unsafe { DwmSetWindowAttribute(h, DWMWA_CLOAK as _, (&raw const on).cast(), 4) };
-}
-
-/// Cloak a window now and uncloak it once it has redrawn and settled at the new size: the
-/// controls re-lay out for the new window size, and that shouldn't be seen mid-move.
-#[cfg(windows)]
-fn cloak_briefly(h: windows_sys::Win32::Foundation::HWND) {
-    if h.is_null() { return }
-    cloak(h, true);
-    let h = h as isize;
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(450));
-        // Windows keeps showing the transparent controls window's old area in white after it
-        // grows (measured: the old window rect stays white in fullscreen until the window is
-        // re-shown). Hide and re-show it, without activating, before it's seen again.
-        use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindowVisible, SW_HIDE, SW_SHOWNA, ShowWindow};
-        unsafe {
-            if IsWindowVisible(h as _) != 0 {
-                ShowWindow(h as _, SW_HIDE);
-                ShowWindow(h as _, SW_SHOWNA);
-            }
-        }
-        cloak(h as _, false);
-    });
 }
 
 #[cfg(not(windows))]
@@ -157,8 +121,7 @@ pub fn diag() -> String {
         GetWindowRect, IsZoomed,
     };
     unsafe {
-        let main = overlay::main();
-        let ov = overlay::window();
+        let main = chrome::main();
         let rect = |h| { let mut r: RECT = std::mem::zeroed(); GetWindowRect(h, &mut r); (r.left, r.top, r.right, r.bottom) };
         let cloaked = |h| { let mut c: u32 = 0; DwmGetWindowAttribute(h, DWMWA_CLOAKED as _, (&raw mut c).cast(), 4); c };
         let mut mi: MONITORINFO = std::mem::zeroed();
@@ -167,22 +130,20 @@ pub fn diag() -> String {
         let m = mi.rcMonitor;
         let tray_class: Vec<u16> = "Shell_TrayWnd\0".encode_utf16().collect();
         let tray = FindWindowW(tray_class.as_ptr(), std::ptr::null());
-        // z-order from the top: where the app, the controls and the taskbar are.
-        let (mut at, mut i, mut h) = ((None, None, None), 0, GetTopWindow(std::ptr::null_mut()));
+        // z-order from the top: where the app and the taskbar are.
+        let (mut at, mut i, mut h) = ((None, None), 0, GetTopWindow(std::ptr::null_mut()));
         while !h.is_null() && i < 5000 {
-            if h == main { at.0 = Some(i) } else if h == ov { at.1 = Some(i) } else if h == tray { at.2 = Some(i) }
+            if h == main { at.0 = Some(i) } else if h == tray { at.1 = Some(i) }
             h = GetWindow(h, GW_HWNDNEXT);
             i += 1;
         }
         let fg = GetForegroundWindow();
-        let owner = if ov.is_null() { "none" } else if windows_sys::Win32::UI::WindowsAndMessaging::GetWindow(ov, windows_sys::Win32::UI::WindowsAndMessaging::GW_OWNER) == main { "main" } else { "other" };
         format!(
-            "overlay owner {owner} | main rect {:?} monitor ({}, {}, {}, {}) style {:#x} ex {:#x} zoomed {} cloaked {} | overlay rect {:?} ex {:#x} cloaked {} | foreground {} | z-order main {:?} overlay {:?} taskbar {:?} (taskbar rect {:?})",
+            "main rect {:?} monitor ({}, {}, {}, {}) style {:#x} ex {:#x} zoomed {} cloaked {} | foreground {} | z-order main {:?} taskbar {:?} (taskbar rect {:?})",
             rect(main), m.left, m.top, m.right, m.bottom, GetWindowLongPtrW(main, GWL_STYLE), GetWindowLongPtrW(main, GWL_EXSTYLE),
-            IsZoomed(main) != 0, cloaked(main), if ov.is_null() { None } else { Some(rect(ov)) },
-            if ov.is_null() { 0 } else { GetWindowLongPtrW(ov, GWL_EXSTYLE) }, if ov.is_null() { 0 } else { cloaked(ov) },
-            if fg == main { "main" } else if fg == ov { "overlay" } else if fg == tray { "taskbar" } else { "other" },
-            at.0, at.1, at.2, if tray.is_null() { None } else { Some(rect(tray)) },
+            IsZoomed(main) != 0, cloaked(main),
+            if fg == main { "main" } else if fg == tray { "taskbar" } else { "other" },
+            at.0, at.1, if tray.is_null() { None } else { Some(rect(tray)) },
         )
     }
 }
@@ -200,17 +161,17 @@ pub fn selftest_front_maximized() {
     unsafe {
         keybd_event(VK_MENU as u8, 0, 0, 0);
         keybd_event(VK_MENU as u8, 0, KEYEVENTF_KEYUP, 0);
-        SetForegroundWindow(overlay::main());
+        SetForegroundWindow(chrome::main());
         // STREMIO_RUNE_FSTEST_RECT=x,y,w,h: start from a normal window there instead (pixels).
         let rect: Option<Vec<i32>> = std::env::var("STREMIO_RUNE_FSTEST_RECT").ok()
             .map(|v| v.split(',').filter_map(|n| n.trim().parse().ok()).collect());
         match rect.as_deref() {
             Some(&[x, y, w, h]) => {
                 use windows_sys::Win32::UI::WindowsAndMessaging::{SW_RESTORE, SWP_NOZORDER, SetWindowPos};
-                ShowWindow(overlay::main(), SW_RESTORE);
-                SetWindowPos(overlay::main(), std::ptr::null_mut(), x, y, w, h, SWP_NOZORDER);
+                ShowWindow(chrome::main(), SW_RESTORE);
+                SetWindowPos(chrome::main(), std::ptr::null_mut(), x, y, w, h, SWP_NOZORDER);
             }
-            _ => { ShowWindow(overlay::main(), SW_MAXIMIZE); }
+            _ => { ShowWindow(chrome::main(), SW_MAXIMIZE); }
         }
     }
 }
@@ -232,8 +193,8 @@ pub fn cursor_diag() -> String {
         let arrow = LoadCursorW(std::ptr::null_mut(), IDC_ARROW);
         let image = if ci.hCursor.is_null() { "none".to_string() } else if ci.hCursor == arrow { "arrow".into() } else { format!("other {:?}", ci.hCursor) };
         let under = WindowFromPoint(ci.ptScreenPos);
-        let who = if under == overlay::window() { "controls window" } else if under == overlay::main() { "app window" }
-            else if !under.is_null() && GetAncestor(under, GA_ROOT) == overlay::main() { "mpv (child of the app window)" } else { "another window" };
+        let who = if under == chrome::main() { "app window" }
+            else if !under.is_null() && GetAncestor(under, GA_ROOT) == chrome::main() { "mpv (child of the app window)" } else { "another window" };
         format!("showing {} image {image} | under the pointer: {who}", ci.flags & CURSOR_SHOWING != 0)
     }
 }
@@ -249,9 +210,9 @@ pub fn selftest_point_at(fx: f32, fy: f32) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, SetCursorPos};
     unsafe {
         let mut r: RECT = std::mem::zeroed();
-        GetClientRect(overlay::main(), &mut r);
+        GetClientRect(chrome::main(), &mut r);
         let mut p = POINT { x: (r.right as f32 * fx) as i32, y: (r.bottom as f32 * fy) as i32 };
-        ClientToScreen(overlay::main(), &mut p);
+        ClientToScreen(chrome::main(), &mut p);
         SetCursorPos(p.x, p.y);
     }
 }
@@ -312,18 +273,18 @@ pub struct Caption {
 }
 
 /// The app window's title strip, and the window behind it: the system draws no title bar (see
-/// `overlay::frame`); the app draws the strip and its buttons, and the system still drags,
+/// `chrome::frame`); the app draws the strip and its buttons, and the system still drags,
 /// snaps, double-click maximizes and resizes from every edge.
 #[cfg(windows)]
 pub fn caption() -> Caption {
     use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::IsZoomed;
-    let main = overlay::main();
+    let main = chrome::main();
     let dpi = if main.is_null() { 96 } else { unsafe { GetDpiForWindow(main) } };
     Caption {
-        h: overlay::strip_px(main, dpi) as f32 * 96.0 / dpi as f32,
+        h: chrome::strip_px(main, dpi) as f32 * 96.0 / dpi as f32,
         zoomed: !main.is_null() && unsafe { IsZoomed(main) } != 0,
-        max_hover: overlay::MAX_HOVER.load(std::sync::atomic::Ordering::Relaxed),
+        max_hover: chrome::MAX_HOVER.load(std::sync::atomic::Ordering::Relaxed),
     }
 }
 
@@ -335,7 +296,7 @@ pub fn caption() -> Caption { Caption { h: 32.0, ..Default::default() } }
 #[cfg(windows)]
 pub fn syscommand(sc: u32) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_SYSCOMMAND};
-    unsafe { PostMessageW(overlay::main(), WM_SYSCOMMAND, sc as usize, 0) };
+    unsafe { PostMessageW(chrome::main(), WM_SYSCOMMAND, sc as usize, 0) };
 }
 
 #[cfg(windows)]
@@ -349,29 +310,24 @@ pub const SC_MAXIMIZE: u32 = 0; #[cfg(not(windows))]
 pub const SC_MINIMIZE: u32 = 0; #[cfg(not(windows))]
 pub const SC_RESTORE: u32 = 0;
 
-/// The app window's frame (title bar removed, see `frame`), and the floating controls: a
-/// transparent Rune window owned by the app window, so it stays above it (and mpv's child
-/// window), hides with it when minimized, and gets no taskbar entry. The app window's moves and
-/// resizes, fullscreen included, carry it along.
+/// The app window's frame: the title bar removed (see `frame`), the app's own strip, its icon.
 #[cfg(windows)]
-pub mod overlay {
+pub mod chrome {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-    use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
+    use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
     use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent};
     use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GWL_STYLE, GWLP_HWNDPARENT, GetClientRect, GetForegroundWindow, GetWindowLongPtrW, HTCAPTION, HTCLIENT,
-        HTMAXBUTTON, HTTOP, HTTOPLEFT, HTTOPRIGHT, IsZoomed, NCCALCSIZE_PARAMS, SM_CXPADDEDBORDER, SM_CYCAPTION,
-        SM_CYSIZEFRAME, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
-        SetWindowLongPtrW, SetWindowPos, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
-        WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_SIZE, WM_SYSCOMMAND, WM_WINDOWPOSCHANGED, WS_CAPTION, WS_EX_APPWINDOW,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        GWL_STYLE, GetClientRect, GetWindowLongPtrW, HTCAPTION, HTCLIENT, HTMAXBUTTON, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+        IsZoomed, NCCALCSIZE_PARAMS, SM_CXPADDEDBORDER, SM_CYCAPTION, SM_CYSIZEFRAME, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK,
+        WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_SIZE, WM_SYSCOMMAND, WS_CAPTION,
     };
 
-    /// The app window, from `App::on_window`, and the controls' window once shown.
+    /// The app window, from `App::on_window`.
     static MAIN: AtomicIsize = AtomicIsize::new(0);
     pub(super) static MAX_HOVER: AtomicBool = AtomicBool::new(false);
     /// Wakes the app's `poll` when the caption changes behind Rune's back.
@@ -414,106 +370,12 @@ pub mod overlay {
     /// The app window (null until Rune reports it).
     pub fn main() -> HWND { MAIN.load(Ordering::Relaxed) as HWND }
 
-    /// The controls' window, once attached (null before).
-    static OVERLAY: AtomicIsize = AtomicIsize::new(0);
-    pub fn window() -> HWND { OVERLAY.load(Ordering::Relaxed) as HWND }
-
-    /// Show the controls' window over the app window, or hide it.
-    pub fn show(w: &rune::WindowHandle, on: bool) {
-        if let (true, Some(o)) = (on, hwnd(w)) { if !main().is_null() { attach(main(), o) } }
-        w.set_visible(on);
-        // Hidden, it's destroyed (`release_gpu_when_closed`); it gets a new HWND next time.
-        if !on { OVERLAY.store(0, Ordering::Relaxed) }
-        // Showing can restyle the window (winit applies its own flags) and give it a taskbar
-        // button; own it and drop the button again so the app shows as one window.
-        if let (true, Some(o)) = (on, hwnd(w)) {
-            if !main().is_null() { attach(main(), o) }
-            super::taskbar::drop_tab(o);
-        }
-    }
-
-    /// Hand activation back to the app window if showing the controls took it: keys go there.
-    pub fn keep_keys(w: &rune::WindowHandle) {
-        let Some(o) = hwnd(w) else { return };
-        unsafe {
-            // winit re-applies its own window flags after ours (taskbar button, no owner), so
-            // put the controls back as an owned tool window whenever that happens.
-            let ex = GetWindowLongPtrW(o, GWL_EXSTYLE);
-            let owned = GetWindowLongPtrW(o, GWLP_HWNDPARENT) as HWND == main();
-            let tool = ex & WS_EX_TOOLWINDOW as isize != 0 && ex & WS_EX_APPWINDOW as isize == 0;
-            if !main().is_null() && !(owned && tool) {
-                attach(main(), o);
-                super::taskbar::drop_tab(o);
-            }
-            if GetForegroundWindow() == o { SetForegroundWindow(main()); }
-        }
-        raise();
-    }
-
-    /// Keep the controls directly above the app window. Being owned should guarantee it, but
-    /// fullscreen's bring-to-front (and the foreground hand-back above) can leave them under it,
-    /// where they're neither seen nor clickable.
-    pub fn raise() {
-        let (m, o) = (main(), window());
-        if m.is_null() || o.is_null() { return }
-        unsafe {
-            // Is the controls window already above the app window? Walk up from the app window.
-            let mut h = windows_sys::Win32::UI::WindowsAndMessaging::GetWindow(m, windows_sys::Win32::UI::WindowsAndMessaging::GW_HWNDPREV);
-            while !h.is_null() {
-                if h == o { return }
-                h = windows_sys::Win32::UI::WindowsAndMessaging::GetWindow(h, windows_sys::Win32::UI::WindowsAndMessaging::GW_HWNDPREV);
-            }
-            // Not above: put the app window right under it.
-            SetWindowPos(m, o, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        }
-    }
-
     /// A Rune window's HWND.
     pub fn hwnd(w: &rune::WindowHandle) -> Option<HWND> {
         w.with_raw_handle(|h| match h.as_raw() {
             rune::raw_window_handle::RawWindowHandle::Win32(h) => Some(h.hwnd.get() as HWND),
             _ => None,
         }).ok().flatten()
-    }
-
-    /// Own `overlay` by `main` (the app window) and keep it over `main`'s video area.
-    /// Idempotent; call on the UI thread while `overlay` is hidden (the style change needs it).
-    pub fn attach(main: HWND, overlay: HWND) {
-        unsafe {
-            SetWindowSubclass(overlay, Some(controls_cursor), 0x5355, 0); // same id: replaces, no stacking
-            SetWindowLongPtrW(overlay, GWLP_HWNDPARENT, main as isize);
-            let ex = GetWindowLongPtrW(overlay, GWL_EXSTYLE);
-            SetWindowLongPtrW(overlay, GWL_EXSTYLE, (ex | (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) as isize) & !(WS_EX_APPWINDOW as isize));
-            // Round like the app window (Windows 11): borderless windows are square by default,
-            // and the controls' scrim would square off the app's bottom corners.
-            use windows_sys::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute};
-            let round = DWMWCP_ROUND;
-            DwmSetWindowAttribute(overlay, DWMWA_WINDOW_CORNER_PREFERENCE as _, (&raw const round).cast(), size_of_val(&round) as u32);
-        }
-        OVERLAY.store(overlay as isize, Ordering::Relaxed);
-        place(main, overlay);
-    }
-
-    /// Cover `main`'s client area below the title strip.
-    fn place(main: HWND, overlay: HWND) {
-        unsafe {
-            let mut r: RECT = std::mem::zeroed();
-            GetClientRect(main, &mut r);
-            let top = strip_px(main, GetDpiForWindow(main));
-            let mut at = POINT { x: 0, y: top };
-            ClientToScreen(main, &mut at);
-            SetWindowPos(overlay, std::ptr::null_mut(), at.x, at.y, r.right, (r.bottom - top).max(0), SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-    }
-
-    /// mpv's host window, a child of `main`, over the same area (same as `Host::fit`).
-    fn place_video(main: HWND, video: HWND) {
-        unsafe {
-            let mut r: RECT = std::mem::zeroed();
-            GetClientRect(main, &mut r);
-            let top = strip_px(main, GetDpiForWindow(main));
-            SetWindowPos(video, std::ptr::null_mut(), 0, top, r.right, (r.bottom - top).max(0), SWP_NOZORDER | SWP_NOACTIVATE);
-        }
     }
 
     /// The resize border the system keeps above the caption, at `dpi`.
@@ -547,13 +409,6 @@ pub mod overlay {
         let def = || unsafe { DefSubclassProc(hwnd, msg, wp, lp) };
         let custom = captioned(hwnd);
         match msg {
-            WM_WINDOWPOSCHANGED => {
-                if !window().is_null() { place(hwnd, window()) }
-                // The video's window too, in the same instant: waiting for the app's next poll
-                // lags a resize (leaving fullscreen most visibly).
-                let video = VIDEO.load(Ordering::Relaxed) as HWND;
-                if !video.is_null() { place_video(hwnd, video) }
-            }
             WM_SIZE => wake(), // maximized or restored: the strip's height and icon change
             WM_NCCALCSIZE if custom && wp != 0 => unsafe {
                 let p = lp as *mut NCCALCSIZE_PARAMS;
@@ -599,44 +454,10 @@ pub mod overlay {
         def()
     }
 
-    /// The pointer hides over the controls' window while the controls do (the app's poll says
-    /// when). Rune's `Cursor::Hidden` needs a focused window and this one never takes focus, so
-    /// Rune shows the arrow there; this answers the window's WM_SETCURSOR instead.
-    static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
-
-    pub fn hide_cursor(hide: bool) {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, IDC_ARROW, LoadCursorW, SetCursor, WindowFromPoint};
-        if CURSOR_HIDDEN.swap(hide, Ordering::Relaxed) == hide { return }
-        // Now, for a pointer at rest: Windows asks again (WM_SETCURSOR) only when it moves.
-        let mut p = POINT { x: 0, y: 0 };
-        unsafe {
-            GetCursorPos(&mut p);
-            if !window().is_null() && WindowFromPoint(p) == window() {
-                SetCursor(if hide { std::ptr::null_mut() } else { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) });
-            }
-        }
-    }
-
-    unsafe extern "system" fn controls_cursor(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _: usize, _: usize) -> LRESULT {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{SetCursor, WM_SETCURSOR};
-        if msg == WM_SETCURSOR && (lp & 0xFFFF) as u32 == HTCLIENT && CURSOR_HIDDEN.load(Ordering::Relaxed) {
-            unsafe { SetCursor(std::ptr::null_mut()) };
-            return 1;
-        }
-        unsafe { DefSubclassProc(hwnd, msg, wp, lp) }
-    }
-
-    /// mpv's host window while one exists (see `player.rs`), resized by `frame`.
-    static VIDEO: AtomicIsize = AtomicIsize::new(0);
-    pub fn set_video(h: HWND) { VIDEO.store(h as isize, Ordering::Relaxed) }
 }
 
 #[cfg(not(windows))]
-pub mod overlay {
-    pub fn hide_cursor(_: bool) {}
+pub mod chrome {
     pub fn set_main(_: &rune::WindowHandle) {}
     pub fn set_waker(_: rune::Waker) {}
-    pub fn show(w: &rune::WindowHandle, on: bool) { w.set_visible(on) }
-    pub fn keep_keys(_: &rune::WindowHandle) {}
-    pub fn raise() {}
 }
