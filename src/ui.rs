@@ -442,9 +442,13 @@ pub struct Shown {
     pub title: String,
     pub fullscreen: bool,
     pub subs_open: bool,
+    pub quality_open: bool,
     pub addon_subs: Vec<(String, String)>,
     /// The title's logo for the loader, once decoded.
     pub logo: Option<Logo>,
+    /// The playing video's streams, and the URL playing.
+    pub streams: Vec<Stream>,
+    pub playing: String,
 }
 
 /// An image compared by identity, so `Shown` can tell whether to send.
@@ -472,6 +476,28 @@ pub fn ctl_setup(c: &mut Ctl, waker: Waker) {
     c.cache = Some(cache);
 }
 
+/// Resolutions in the order the quality list shows them.
+const RESOLUTIONS: [&str; 5] = ["4K", "1080p", "720p", "480p", "Other"];
+
+/// A stream's resolution, from a word in its name, else its title: `4K`, `1080p`, `720p`,
+/// `480p` or `Other`.
+pub fn resolution(st: &Stream) -> &'static str {
+    let find = |t: &str| t.split(|c: char| !c.is_ascii_alphanumeric()).find_map(|w| match w.to_ascii_lowercase().as_str() {
+        "2160p" | "4k" | "uhd" => Some("4K"),
+        "1080p" | "1080i" => Some("1080p"),
+        "720p" => Some("720p"),
+        "480p" | "576p" => Some("480p"),
+        _ => None,
+    });
+    find(&st.name).or_else(|| find(&st.title)).unwrap_or("Other")
+}
+
+/// Streams grouped by resolution, best first, with their index in `streams`.
+pub fn qualities(streams: &[Stream]) -> Vec<(&'static str, Vec<(usize, &Stream)>)> {
+    RESOLUTIONS.iter().map(|&r| (r, streams.iter().enumerate().filter(|(_, st)| resolution(st) == r).collect::<Vec<_>>()))
+        .filter(|(_, g)| !g.is_empty()).collect()
+}
+
 fn glyph(icons: &Option<Icons>, pick: impl Fn(&Icons) -> &Image, size: f32) -> El {
     let e = el().size(size, size);
     match icons { Some(i) => e.pixels(pick(i).pixels()), None => e }
@@ -489,7 +515,7 @@ fn seek(c: &mut Ctl, d: &mut Drag, _: &mut Tx) {
 }
 
 /// The floating controls, over the whole video: the loader while it loads, the bar on a scrim
-/// along the bottom while the mouse is active, fading in and out, and the Audio & Subtitles panel on the right.
+/// along the bottom while the mouse is active, fading in and out, and the Audio & Subtitles or Quality panel on the right.
 /// Clear elsewhere; double-click toggles fullscreen, and the cursor hides with the controls.
 pub fn controls(c: &Ctl, _: &mut Cx<Ctl>) -> El {
     let v = &c.shown;
@@ -503,7 +529,7 @@ pub fn controls(c: &Ctl, _: &mut Cx<Ctl>) -> El {
             .child(bar(c)));
     }
     let mut root = row().w_full().h_full().cursor(if v.controls { Cursor::Default } else { Cursor::Hidden }).child(stage);
-    if v.subs_open { root = root.child(subtitles(c)) }
+    if v.subs_open { root = root.child(subtitles(c)) } else if v.quality_open { root = root.child(quality(c)) }
     root
 }
 
@@ -527,8 +553,15 @@ fn bar(c: &Ctl) -> El {
         .child(label(v.title.clone(), 15.0, 600.0, Color::WHITE).truncate().max_w(260.0)).child(el().w(6.0));
     if p.started && p.buffering { bar = bar.child(label(format!("Buffering {}%", p.cache_pct as u32), 13.0, 500.0, ink(0.7))) }
     bar = bar.child(time(at)).child(track).child(time(p.dur));
+    if !v.streams.is_empty() {
+        let now = v.streams.iter().find(|st| st.url == v.playing).map_or("Quality", resolution);
+        bar = bar.child(tap(row().key("quality").h(32.0).px(12.0).radius(16.0).center().border(1.0, ink(0.35))
+            .fill(if v.quality_open { ink(0.16) } else { Color::TRANSPARENT }).hover(ink(0.14))
+            .child(label(now, 13.0, 650.0, Color::WHITE)))
+            .on_press(act(|s| { s.quality_open = !s.quality_open; s.subs_open = false })));
+    }
     bar.child(round("subs", v.subs_open).child(glyph(&c.icons, |i| &i.subs, 20.0))
-            .on_press(act(|s| s.subs_open = !s.subs_open)))
+            .on_press(act(|s| { s.subs_open = !s.subs_open; s.quality_open = false })))
         .child(round("fullscreen", false).child(glyph(&c.icons, |i| if v.fullscreen { &i.shrink } else { &i.expand }, 18.0))
             .on_press(act(toggle_fullscreen)))
 }
@@ -554,7 +587,7 @@ fn panel(c: &Ctl, key: &str, title: &str, list: El) -> El {
         .child(row().w_full().px(6.0).center_y()
             .child(label(title.to_string(), 22.0, 700.0, Color::WHITE).grow(1.0))
             .child(tap(row().key("panel-close").size(36.0, 36.0).radius(18.0).center().hover(ink(0.12))
-                .child(glyph(&c.icons, |i| &i.close, 16.0))).on_press(act(|s| s.subs_open = false))))
+                .child(glyph(&c.icons, |i| &i.close, 16.0))).on_press(act(|s| { s.subs_open = false; s.quality_open = false }))))
         .child(list.w_full().gap(2.0).pb(24.0).scroll(ScrollSpec { stick_bottom: false }).grow(1.0).shrink().min_h(0.0))
 }
 
@@ -587,6 +620,23 @@ fn subtitles(c: &Ctl) -> El {
         list = list.child(option(format!("asub-{i}"), format!("{} {n}", language(lang)), "", on).on_press(act(move |s| add_sub(s, &l, &u))));
     }
     panel(c, "subtitles", "Audio & Subtitles", list)
+}
+
+/// The video's streams by resolution, each with its source line; a pick switches to it at the
+/// same position.
+fn quality(c: &Ctl) -> El {
+    let v = &c.shown;
+    let mut list = col();
+    for (res, group) in qualities(&v.streams) {
+        list = list.child(section_title(res));
+        for (i, st) in group {
+            let url = st.url.clone();
+            let source = st.title.lines().next().unwrap_or("");
+            list = list.child(option(format!("q-{i}"), st.name.clone(), source, st.url == v.playing)
+                .on_press(act(move |s| switch_stream(s, &url))));
+        }
+    }
+    panel(c, "quality", "Quality", list)
 }
 
 // ---- root ----

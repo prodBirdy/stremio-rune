@@ -127,6 +127,24 @@ impl Mpv {
         Ok(())
     }
 
+    /// Play `url` instead, from `at` seconds, keeping the audio and subtitle languages. Track ids
+    /// belong to the old file, so the new one picks by language; an addon subtitle comes along.
+    pub fn switch(&self, url: &str, at: f64) -> Result<(), String> {
+        let lang = |kind: &str| self.get(&format!("current-tracks/{kind}/lang"));
+        if let Some(l) = lang("audio") { self.command(&["set", "alang", &l])? }
+        self.command(&["change-list", "sub-files", "clr", ""])?;
+        match (self.get("current-tracks/sub/external-filename"), lang("sub")) {
+            (Some(file), _) => self.command(&["change-list", "sub-files", "append", &file])?,
+            (None, Some(l)) => self.command(&["set", "slang", &l])?,
+            _ => {}
+        }
+        let sub_on = self.get("current-tracks/sub/id").is_some();
+        self.command(&["set", "aid", "auto"])?;
+        self.command(&["set", "sid", if sub_on { "auto" } else { "no" }])?;
+        self.command(&["set", "start", &at.to_string()])?;
+        self.command(&["loadfile", url, "replace"]).map_err(|_| "mpv couldn't load that stream".to_string())
+    }
+
     fn get(&self, name: &str) -> Option<String> {
         let get: unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_char = sym(b"mpv_get_property_string\0").ok()?;
         let free: unsafe extern "C" fn(*mut c_void) = sym(b"mpv_free\0").ok()?;
@@ -175,6 +193,7 @@ impl Mpv {
                 1 => ended = Some(None), // SHUTDOWN: q, or the window closed
                 7 => {                   // END_FILE
                     let end = unsafe { &*(e.data as *const EndFile) };
+                    if end.reason == 2 { continue } // STOP: `switch` replaced the file
                     let msg = (end.reason == 4).then(|| unsafe { CStr::from_ptr(describe(end.error)) });
                     ended = Some(msg.map(|m| format!("Playback failed: {}", m.to_string_lossy())));
                 }
