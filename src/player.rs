@@ -79,8 +79,8 @@ const INT64: c_int = 4;
 const DOUBLE: c_int = 5;
 
 impl Mpv {
-    /// Start `url`, at `start` seconds if given.
-    pub fn play(url: &str, title: &str, waker: Option<Waker>, start: Option<f64>) -> Result<Mpv, String> {
+    /// Start `url`, at `start` seconds if given, with `extra` options (the user's settings) last.
+    pub fn play(url: &str, title: &str, waker: Option<Waker>, start: Option<f64>, extra: Vec<(&'static str, String)>) -> Result<Mpv, String> {
         let create: unsafe extern "C" fn() -> *mut c_void = sym(b"mpv_create\0")?;
         let set: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int = sym(b"mpv_set_option_string\0")?;
         let init: unsafe extern "C" fn(*mut c_void) -> c_int = sym(b"mpv_initialize\0")?;
@@ -97,6 +97,7 @@ impl Mpv {
             ("input-vo-keyboard", "yes".into()), ("ytdl", "no".into()), ("hwdec", "auto-safe".into()),
             ("cursor-autohide", "2500".into()), ("title", title.into())];
         if let Some(at) = start { opts.push(("start", format!("{at}"))) }
+        opts.extend(extra);
         #[cfg(windows)]
         if let Some(h) = &mpv.host { opts.push(("wid", (h.0 as isize).to_string())) }
         unsafe {
