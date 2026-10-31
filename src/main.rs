@@ -11,6 +11,7 @@ mod library;
 mod player;
 mod server;
 mod ui;
+mod update;
 #[cfg(windows)]
 mod video;
 #[cfg(target_os = "macos")]
@@ -83,6 +84,10 @@ enum Msg {
     Discover(Vec<Value>),
     Preview(Value),
     Written(Result<String, String>),
+    /// A newer release on GitHub, if there is one.
+    Update(Option<update::Release>),
+    /// The update's Setup is running.
+    Updating,
 }
 
 #[derive(Clone, PartialEq)]
@@ -154,6 +159,8 @@ struct State {
     /// (video id, seconds) to start at when that video plays, from Continue Watching.
     resume: Option<(String, f64)>,
     status: String,
+    /// A newer release to offer.
+    update: Option<update::Release>,
     /// The streams side sheet on the detail page.
     sheet: bool,
     /// The profile menu under the avatar.
@@ -289,6 +296,7 @@ fn state() -> State {
         streams: vec![],
         resume: None,
         status: String::new(),
+        update: None,
         sheet: false,
         menu: false,
         fullscreen: false,
@@ -860,6 +868,19 @@ fn setup(s: &mut State, waker: Waker) {
     });
     start_image_workers(s);
     load_account(s);
+    // A failed check stays quiet: the next start asks again.
+    if !cfg!(test) { spawn(s, || Ok(Msg::Update(update::check().unwrap_or(None)))) }
+}
+
+/// Install the offered update: run its Setup on Windows, else open its page.
+fn update_now(s: &mut State, tx: &mut Tx) {
+    let Some(r) = s.update.clone() else { return };
+    if cfg!(windows) && r.setup.is_some() {
+        s.status = format!("Downloading stremio-rune {}…", r.version);
+        spawn(s, move || update::install(&r).map(|()| Msg::Updating));
+    } else if let Err(e) = tx.open_url(&r.page) {
+        s.status = format!("Couldn't open the release page ({e:?})");
+    }
 }
 
 fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
@@ -958,6 +979,8 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
             Msg::Discover(list) => s.store.discover = list,
             Msg::Preview(d) => { s.store.preview = Some(d); s.status.clear() }
             Msg::Written(r) => addons::written(s, r),
+            Msg::Update(Some(r)) => s.update = Some(r),
+            Msg::Updating => { s.status.clear(); s.update = None }
             Msg::Streams(vid, list) if vid == s.stream_for => {
                 s.streams.extend(list);
                 s.status.clear();
@@ -1135,6 +1158,7 @@ fn main() {
         on_key: Some(on_key),
         scenes: &[
             ("home", |s| { demo(s); s.page = Page::Home }),
+            ("update", |s| { demo(s); s.page = Page::Home; s.update = Some(update::Release { version: "0.3.0-alpha".into(), page: String::new(), setup: None }) }),
             ("browse", |s| { demo(s); s.page = Page::Browse("movie") }),
             ("detail", |s| {
                 demo(s);

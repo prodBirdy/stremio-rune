@@ -195,6 +195,15 @@ fn toast(s: &State) -> El {
     )
 }
 
+/// A newer release, offered at the bottom right; a press installs it (`update_now`).
+fn update_pill(u: &update::Release) -> El {
+    tap(glass(row().key("update").h(40.0).px(18.0).gap(10.0).radius(20.0).center()).fill(Color::BLACK.alpha(0.55)).hover(Color::BLACK.alpha(0.7)))
+        .pin(None, None, Some(28.0), Some(28.0))
+        .child(label(format!("stremio-rune {} is available", u.version), 14.0, 500.0, ink(0.75)))
+        .child(label("Update", 14.0, 650.0, Color::WHITE))
+        .on_press_tx(update_now)
+}
+
 fn back_button(s: &State) -> El {
     tap(glass(row().key("back").size(44.0, 44.0).radius(22.0).center()).hover(ink(0.16))
         .child(icon(s, |i| &i.back, 20.0)))
@@ -489,5 +498,6 @@ fn page(s: &State) -> El {
     root = root.child(nav(s));
     if s.sheet && s.page == Page::Detail { for e in sheet(s) { root = root.child(e) } }
     if !s.status.is_empty() { root = root.child(toast(s)) }
+    else if let Some(u) = &s.update { root = root.child(update_pill(u)) }
     root
 }
