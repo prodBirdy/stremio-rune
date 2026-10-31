@@ -79,8 +79,8 @@ const INT64: c_int = 4;
 const DOUBLE: c_int = 5;
 
 impl Mpv {
-    /// Start `url`, at `start` seconds if given.
-    pub fn play(url: &str, title: &str, waker: Option<Waker>, start: Option<f64>) -> Result<Mpv, String> {
+    /// Start `url`, at `start` seconds if given, with `extra` options (the user's settings) last.
+    pub fn play(url: &str, title: &str, waker: Option<Waker>, start: Option<f64>, extra: Vec<(&'static str, String)>) -> Result<Mpv, String> {
         let create: unsafe extern "C" fn() -> *mut c_void = sym(b"mpv_create\0")?;
         let set: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int = sym(b"mpv_set_option_string\0")?;
         let init: unsafe extern "C" fn(*mut c_void) -> c_int = sym(b"mpv_initialize\0")?;
@@ -97,6 +97,7 @@ impl Mpv {
             ("input-vo-keyboard", "yes".into()), ("ytdl", "no".into()), ("hwdec", "auto-safe".into()),
             ("cursor-autohide", "2500".into()), ("title", title.into())];
         if let Some(at) = start { opts.push(("start", format!("{at}"))) }
+        opts.extend(extra);
         #[cfg(windows)]
         if let Some(h) = &mpv.host { opts.push(("wid", (h.0 as isize).to_string())) }
         unsafe {
@@ -276,7 +277,9 @@ mod win {
                 CreateWindowExW(0, class.as_ptr(), std::ptr::null(), WS_CHILD | WS_CLIPCHILDREN | SS_BLACKRECT, 0, 0, 0, 0, parent,
                     std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null())
             };
-            (!hwnd.is_null()).then(|| Host(hwnd, Cell::new(None)))
+            if hwnd.is_null() { return None }
+            crate::window::overlay::set_video(hwnd);
+            Some(Host(hwnd, Cell::new(None)))
         }
 
         /// Cover the parent's client area below its title strip, and show.
@@ -295,6 +298,9 @@ mod win {
     }
 
     impl Drop for Host {
-        fn drop(&mut self) { unsafe { DestroyWindow(self.0); } }
+        fn drop(&mut self) {
+            crate::window::overlay::set_video(std::ptr::null_mut());
+            unsafe { DestroyWindow(self.0); }
+        }
     }
 }

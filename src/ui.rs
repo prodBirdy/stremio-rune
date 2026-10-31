@@ -8,6 +8,10 @@ use std::f32::consts::PI;
 
 #[path = "search.rs"]
 pub mod search;
+#[path = "settings.rs"]
+pub mod settings;
+#[path = "addons.rs"]
+pub mod addons;
 
 const PAD: f32 = 56.0;
 const HERO_H: f32 = 560.0;
@@ -109,7 +113,7 @@ fn nav(s: &State) -> El {
         .on_press(search::open);
     let pill = glass(row().key("nav").h(50.0).px(6.0).gap(4.0).radius(25.0).center_y())
         .shadow(10.0, 30.0, Color::BLACK.alpha(0.35))
-        .child(find).child(item("Home", Page::Home)).child(item("Movies", Page::Browse("movie"))).child(item("Shows", Page::Browse("series")))
+        .child(find).child(item("Home", Page::Home)).child(item("Movies", Page::Browse("movie"))).child(item("Shows", Page::Browse("series"))).child(item("Add-ons", Page::Addons))
         .child(el().w(4.0)).child(avatar);
     // The menu hangs off a plain wrapper so the pill's blur layer doesn't clip it.
     let mut anchor = el().child(pill);
@@ -126,7 +130,10 @@ fn menu(s: &State) -> El {
             .child(label("Signed in as", 12.0, 500.0, ink(0.5)))
             .child(label(who, 14.0, 600.0, Color::WHITE).truncate()))
         .child(el().h(1.0).w_full().fill(ink(0.1)))
-        .child(tap(row().key("sign-out").h(40.0).px(12.0).mt(4.0).radius(10.0).center_y().hover(ink(0.08))
+        .child(tap(row().key("settings").h(40.0).px(12.0).mt(4.0).radius(10.0).center_y().hover(ink(0.08))
+            .child(label("Settings", 15.0, 500.0, Color::WHITE)))
+            .on_press(settings::open))
+        .child(tap(row().key("sign-out").h(40.0).px(12.0).radius(10.0).center_y().hover(ink(0.08))
             .child(label("Sign out", 15.0, 500.0, oklch(0.72, 0.15, 25.0))))
             .on_press(sign_out))
 }
@@ -692,6 +699,8 @@ fn page(s: &State) -> El {
         Page::Browse(ty) => browse(s, ty),
         Page::Detail => detail(s),
         Page::Search => search::view(s),
+        Page::Settings => settings::view(s),
+        Page::Addons => addons::view(s),
     };
     let mut root = col().w_full().h_full().fill(bg())
         .on_layout_tx(|s: &mut State, r, tx| { tx.live_only(); s.view_h = r[3] })

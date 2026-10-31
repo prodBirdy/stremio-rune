@@ -10,7 +10,7 @@ mod ui;
 mod window;
 
 use player::{Mpv, Playback};
-use ui::{Ctl, search};
+use ui::{Ctl, addons, search, settings};
 use rune::{AppHandle, AppSpec, Image, ImageCache, Key, KeyEvent, TextEdit, Tween, Tx, Waker, WindowHandle};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -22,8 +22,6 @@ use std::time::{Duration, Instant};
 /// Height of the control bar, and width of the player's side panels, in points.
 const BAR: f32 = 64.0;
 const SUBS_W: f32 = 380.0;
-/// Mouse stillness after which the playback controls hide.
-const IDLE: Duration = Duration::from_millis(2500);
 /// Catalogs shown as rows on Home, and cards per row (Rune has no horizontal scroll yet).
 const HOME_ROWS: usize = 6;
 const ROW_CARDS: usize = 5;
@@ -63,6 +61,12 @@ enum Msg {
     Saved,
     /// Search answers: (query, index into `search.cats`, metas).
     Search(String, usize, Vec<Value>),
+    /// The streaming server's `/settings`, or why not (it's down).
+    Server(Result<Value, String>),
+    /// Community addons to install, an addon fetched from a pasted URL, and how a write went.
+    Discover(Vec<Value>),
+    Preview(Value),
+    Written(Result<String, String>),
 }
 
 #[derive(Clone, PartialEq)]
@@ -71,7 +75,7 @@ struct Stream { name: String, title: String, url: String }
 struct Catalog { base: String, ty: String, id: String, name: String }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Page { Login, Home, Browse(&'static str), Detail, Player, Search }
+enum Page { Login, Home, Browse(&'static str), Detail, Player, Search, Settings, Addons }
 
 struct Icons {
     play: Image, pause: Image, back: Image, close: Image, expand: Image, shrink: Image, subs: Image, search: Image,
@@ -143,6 +147,13 @@ struct State {
     subs_for: String,
     addon_subs: Vec<(String, String)>,
     search: search::Search,
+    settings: settings::Settings,
+    /// The streaming server's settings: none yet, or it's down.
+    server: Option<Result<Value, String>>,
+    /// The settings picker that's unfolded.
+    choice: Option<&'static str>,
+    /// The Add-ons page.
+    store: addons::Store,
     player: Option<Mpv>,
     /// Watch progress for the account's library (see `library.rs`).
     watch: Option<library::Watch>,
@@ -230,6 +241,10 @@ fn state() -> State {
         subs_for: String::new(),
         addon_subs: vec![],
         search: search::Search::default(),
+        settings: if cfg!(test) { Default::default() } else { settings::load(&settings::file()) },
+        server: None,
+        choice: None,
+        store: addons::Store::default(),
         player: None,
         watch: None,
         playback: Playback::default(),
@@ -490,6 +505,7 @@ fn open_catalog(s: &mut State, i: usize) {
 
 fn go(s: &mut State, page: Page) {
     s.page = page;
+    if page == Page::Addons { addons::open(s) }
     if let Page::Browse(ty) = page {
         if let Some(i) = s.catalogs.iter().position(|c| c.ty == ty) { open_catalog(s, i) }
     }
@@ -544,8 +560,11 @@ fn play(s: &mut State, url: &str) {
     stop(s); // close the previous player first
     let title = s.meta.as_ref().and_then(|m| m["name"].as_str()).unwrap_or("Stremio").to_string();
     let start = s.resume.as_ref().filter(|(v, _)| *v == s.stream_for).map(|(_, at)| *at);
-    match Mpv::play(url, &title, s.waker.clone(), start) {
+    match Mpv::play(url, &title, s.waker.clone(), start, settings::mpv_options(&s.settings)) {
         Ok(p) => {
+            // Arrow keys over the video: mpv's own bindings, at the chosen step.
+            let step = s.settings.seek_ms as f64 / 1000.0;
+            for (key, dir) in [("RIGHT", ""), ("LEFT", "-")] { let _ = p.command(&["keybind", key, &format!("seek {dir}{step}")]); }
             s.player = Some(p);
             library::start(s);
             s.playing = url.to_string();
@@ -629,6 +648,10 @@ fn on_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
         Key::Function(11) => toggle_fullscreen(s),
         Key::Text(t) if playing && t == "f" => toggle_fullscreen(s),
         Key::Text(t) if playing && t == " " => mpv(s, &["cycle", "pause"]),
+        Key::Left | Key::Right if playing => {
+            let step = s.settings.seek_ms as f64 / 1000.0 * if ev.key == Key::Left { -1.0 } else { 1.0 };
+            mpv(s, &["seek", &step.to_string()])
+        }
         Key::Escape => escape(s),
         k if playing => {
             let name = match k { Key::Text(t) => t.as_str(), Key::Left => "LEFT", Key::Right => "RIGHT", Key::Up => "UP", Key::Down => "DOWN", _ => return false };
@@ -646,7 +669,9 @@ fn escape(s: &mut State) {
     else if s.fullscreen { toggle_fullscreen(s) }
     else if s.page == Page::Player { stop(s) }
     else if s.page == Page::Detail { s.page = s.back_to }
-    else if s.page == Page::Search { s.page = Page::Home }
+    else if s.choice.is_some() { s.choice = None }
+    else if s.store.confirm.is_some() { s.store.confirm = None }
+    else if matches!(s.page, Page::Search | Page::Settings | Page::Addons) { s.page = Page::Home }
 }
 
 fn mpv(s: &State, args: &[&str]) {
@@ -705,7 +730,7 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
         let cursor = window::cursor();
         if cursor != s.cursor { s.cursor = cursor; s.last_move = Instant::now() }
         let p = &s.playback;
-        s.controls = p.paused || p.loading() || s.bar_hover || s.subs_open || s.quality_open || s.last_move.elapsed() < IDLE;
+        s.controls = p.paused || p.loading() || s.bar_hover || s.subs_open || s.quality_open || s.last_move.elapsed() < Duration::from_millis(s.settings.hide_ms as u64);
         player.fit();
         library::tick(s);
         tx.wake_after(Duration::from_millis(200));
@@ -769,6 +794,10 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
             Msg::Subs(vid, list) if vid == s.subs_for => s.addon_subs.extend(list),
             Msg::LibraryItem(id, item, meta) => library::landed(s, id, item, meta),
             Msg::Saved => {}
+            Msg::Server(r) => s.server = Some(r),
+            Msg::Discover(list) => s.store.discover = list,
+            Msg::Preview(d) => { s.store.preview = Some(d); s.status.clear() }
+            Msg::Written(r) => addons::written(s, r),
             Msg::Streams(vid, list) if vid == s.stream_for => {
                 s.streams.extend(list);
                 s.status.clear();
@@ -894,6 +923,29 @@ fn main() {
                 s.search.results = HashMap::from([(0, s.items[&0].clone()), (1, s.items[&1][..3].to_vec())]);
             }),
             ("menu", |s| { demo(s); s.page = Page::Home; s.menu = true }),
+            ("addons", |s| {
+                demo(s);
+                s.page = Page::Addons;
+                let a = |name: &str, flags: Value, configurable: bool| json!({ "transportUrl": format!("https://{name}/manifest.json"), "transportName": "", "flags": flags,
+                    "manifest": { "id": name, "name": name, "version": "1.2.0", "types": ["movie", "series"], "behaviorHints": { "configurable": configurable },
+                        "description": "Streams and metadata for movies and shows, from a source this addon knows well." } });
+                s.addons = vec![a("Cinemeta", json!({ "official": true, "protected": true }), false), a("OpenSubtitles", json!({ "official": true, "protected": false }), false),
+                    a("Torrentio", json!({ "official": false, "protected": false }), true), a("Streaming Catalogs", json!({ "official": false, "protected": false }), true)];
+                s.store.confirm = Some("https://Streaming Catalogs/manifest.json".into());
+                s.store.url = TextEdit::new("https://example.org/manifest.json");
+                s.store.preview = Some(addons::descriptor("https://example.org/manifest.json", s.addons[2]["manifest"].clone()));
+                s.store.preview.as_mut().unwrap()["manifest"]["name"] = "Example Addon".into();
+            }),
+            ("settings", |s| {
+                demo(s);
+                s.page = Page::Settings;
+                s.choice = Some("sub-lang");
+                s.settings.sub_lang = "eng".into();
+                s.server = Some(Ok(json!({ "options": [{ "id": "remoteHttps", "selections": [{ "name": "Disabled", "val": "" }, { "name": "192.168.1.10", "val": "192.168.1.10" }] }],
+                    "values": { "serverVersion": "4.22.3", "cacheSize": 2147483648u64, "btMaxConnections": 55, "btHandshakeTimeout": 20000, "btRequestTimeout": 4000,
+                        "btDownloadSpeedSoftLimit": 2621440, "btDownloadSpeedHardLimit": 3670016, "btMinPeersForStable": 5, "remoteHttps": "",
+                        "transcodeProfile": null, "allTranscodeProfiles": ["nvenc-win"] } })));
+            }),
         ],
         ..AppSpec::new("Stremio", (1280.0, 800.0), state, ui::view)
     }).on_window(window::overlay::set_main);
@@ -933,7 +985,7 @@ mod tests {
     fn playback_reports_time_pauses_seeks_and_quits_cleanly() {
         // TEST_STREAM: any 10+ minute video; the default needs the Stremio app running.
         let src = std::env::var("TEST_STREAM").unwrap_or_else(|_| "http://127.0.0.1:11470/dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c/-1".into());
-        let p = Mpv::play(&src, "test", None, Some(60.0)).unwrap();
+        let p = Mpv::play(&src, "test", None, Some(60.0), vec![]).unwrap();
         let mut pb = Playback::default();
         let wait = |pb: &mut Playback, done: &dyn Fn(&Playback) -> bool| {
             let t = std::time::Instant::now();
@@ -958,7 +1010,7 @@ mod tests {
     #[ignore = "plays TEST_STREAM; opens a window briefly"]
     fn switching_streams_keeps_the_position() {
         let src = std::env::var("TEST_STREAM").expect("TEST_STREAM: a 10+ minute video");
-        let p = Mpv::play(&src, "test", None, Some(120.0)).unwrap();
+        let p = Mpv::play(&src, "test", None, Some(120.0), vec![]).unwrap();
         let mut pb = Playback::default();
         let wait = |pb: &mut Playback, done: &dyn Fn(&Playback) -> bool| {
             let t = std::time::Instant::now();
@@ -980,7 +1032,7 @@ mod tests {
     fn audio_tracks_are_listed_and_switch() {
         // TEST_AUDIO_STREAM: a clip whose audio tracks are eng then ger (see BRIEF: target	wo-audio.mkv).
         let src = std::env::var("TEST_AUDIO_STREAM").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/target/two-audio.mkv").into());
-        let p = Mpv::play(&src, "test", None, None).unwrap();
+        let p = Mpv::play(&src, "test", None, None, vec![]).unwrap();
         let mut pb = Playback::default();
         let wait = |pb: &mut Playback, done: &dyn Fn(&Playback) -> bool| {
             let t = std::time::Instant::now();
@@ -1088,10 +1140,10 @@ mod tests {
         assert!(!s.quality_open && s.playing == "b");
     }
 
-    fn runtime(scene: fn(&mut State)) -> rune::Runtime<State> {
+    fn runtime(scene: impl FnOnce(&mut State)) -> rune::Runtime<State> {
         let mut s = state();
         scene(&mut s);
-        let mut rt = rune::Runtime::new(s, ui::view, (1280.0, 800.0), rune::Env { system_dark: true, scale: 2.0 });
+        let mut rt = rune::Runtime::new(s, ui::view, (1280.0, 800.0 + window::caption().h), rune::Env { system_dark: true, scale: 2.0 });
         rt.frame(0.0);
         rt
     }
@@ -1101,6 +1153,24 @@ mod tests {
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         for _ in 0..30 { rt.frame(1.0 / 60.0); }
+    }
+
+    #[test]
+    fn title_strip_sits_above_every_page_except_fullscreen() {
+        let caption = window::caption();
+        assert!(caption.h > 20.0 && caption.h < 50.0, "the system caption's height: {caption:?}");
+        for page in [Page::Home, Page::Settings, Page::Addons, Page::Player] {
+            let rt = runtime(move |s| { demo(s); s.page = page });
+            let (min, max, close) = (rt.find("caption-min").unwrap(), rt.find("caption-max").unwrap(), rt.find("caption-close").unwrap());
+            assert!(min.0 < max.0 && max.0 < close.0 && close.0 > 1280.0 - window::CAPTION_BUTTON_W, "buttons at the right");
+            assert!(close.1 < caption.h, "in the strip");
+        }
+        // Content keeps its place on screen: shifted down by the strip the system title bar was.
+        let nav = |caption: window::Caption| runtime(move |s| { demo(s); s.page = Page::Home; s.caption = caption }).find("nav-search").unwrap().1;
+        let none = window::Caption { h: 0.0, ..caption };
+        assert!((nav(caption) - nav(none) - caption.h).abs() < 0.5);
+        let rt = runtime(|s| { demo(s); s.page = Page::Player; s.fullscreen = true });
+        assert!(rt.find("title-bar").is_none(), "fullscreen hides it");
     }
 
     #[test]
@@ -1307,6 +1377,127 @@ mod tests {
         assert_eq!(backdrop(&json!({ "_id": "tt5", "background": "", "poster": "" })).unwrap(), "https://images.metahub.space/background/medium/tt5/img");
         assert_eq!(fallbacks("https://images.metahub.space/background/medium/tt5/img")[1], "https://images.metahub.space/poster/medium/tt5/img");
         assert_eq!(logo(&json!({ "id": "tt5", "logo": "" })).unwrap(), "https://images.metahub.space/logo/medium/tt5/img");
+    }
+
+    #[test]
+    fn settings_round_trip_with_defaults_for_what_is_missing() {
+        let dir = std::env::temp_dir().join(format!("stremio-rune-test-{}", std::process::id()));
+        let f = dir.join("settings.json");
+        assert_eq!(settings::load(&f), settings::Settings::default(), "no file: defaults");
+        let mut p = settings::Settings::default();
+        p.sub_lang = "ger".into();
+        p.seek_ms = 10000;
+        p.hwdec = false;
+        settings::save_to(&f, &p).unwrap();
+        assert_eq!(settings::load(&f), p);
+        std::fs::write(&f, r#"{"sub_size": 150, "unknown": 1}"#).unwrap();
+        assert_eq!(settings::load(&f), settings::Settings { sub_size: 150, ..Default::default() }, "missing fields: defaults");
+        std::fs::write(&f, "not json").unwrap();
+        assert_eq!(settings::load(&f), settings::Settings::default(), "unreadable: defaults");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn settings_become_mpv_options() {
+        let opts = |p: &settings::Settings| settings::mpv_options(p).into_iter().map(|(k, v)| (k.to_string(), v)).collect::<HashMap<_, _>>();
+        let d = opts(&settings::Settings::default());
+        assert_eq!(d["hwdec"], "auto-safe", "today's behaviour");
+        assert_eq!(d["sub-scale"], "1");
+        assert_eq!(d["cursor-autohide"], "2500");
+        assert!(!d.contains_key("alang") && !d.contains_key("slang"), "no language: the file decides");
+        let o = opts(&settings::Settings { audio_lang: "ger".into(), sub_lang: "eng".into(), sub_size: 150, sub_color: "#FFE14D".into(),
+            sub_style: "box".into(), hwdec: false, ..Default::default() });
+        assert_eq!((o["alang"].as_str(), o["slang"].as_str()), ("ger,deu,de", "eng,en"));
+        assert_eq!((o["hwdec"].as_str(), o["sub-scale"].as_str(), o["sub-color"].as_str()), ("no", "1.5", "#FFE14D"));
+        assert_eq!(o["sub-border-style"], "background-box");
+        assert!(o.contains_key("sub-back-color"));
+    }
+
+    #[test]
+    fn server_settings_post_what_stremio_core_posts() {
+        let values = json!({ "serverVersion": "4.22.3", "appPath": "x", "cacheSize": 2147483648u64, "cacheRoot": "C:/c", "btMaxConnections": 55,
+            "btHandshakeTimeout": 20000, "btRequestTimeout": 4000, "btDownloadSpeedSoftLimit": 2621440, "btDownloadSpeedHardLimit": 3670016,
+            "btMinPeersForStable": 5, "remoteHttps": "", "proxyStreamsEnabled": false, "transcodeProfile": null, "allTranscodeProfiles": ["nvenc-win"] });
+        let body = settings::server_body(&values, &json!({ "cacheSize": null }));
+        let o = body.as_object().unwrap();
+        assert_eq!(o.len(), 11, "only the fields the server takes");
+        assert!(o["cacheSize"].is_null() && o["btMaxConnections"] == 55 && o["cacheRoot"] == "C:/c");
+        assert!(!o.contains_key("serverVersion") && !o.contains_key("allTranscodeProfiles"));
+    }
+
+    #[test]
+    fn settings_open_from_the_menu_and_choices_stick() {
+        let mut rt = runtime(|s| { demo(s); s.page = Page::Home });
+        click(&mut rt, "avatar");
+        click(&mut rt, "settings");
+        assert!(rt.state.page == Page::Settings && !rt.state.menu);
+        click(&mut rt, "sub-size-3");
+        assert_eq!(rt.state.settings.sub_size, 150);
+        click(&mut rt, "hwdec");
+        assert!(!rt.state.settings.hwdec);
+        click(&mut rt, "audio-lang");
+        click(&mut rt, "audio-lang-2");
+        assert_eq!((rt.state.settings.audio_lang.as_str(), rt.state.choice), ("ger", None), "picked and folded");
+        click(&mut rt, "settings-sign-out");
+        assert!(rt.state.page == Page::Login);
+    }
+
+    /// An account's collection as the API sends it: keys in its order, a float, an escape.
+    const COLLECTION: &str = r#"[
+        {"transportUrl":"https://v3-cinemeta.strem.io/manifest.json","transportName":"","manifest":{"name":"Cinemeta","id":"com.linvo.cinemeta","version":"3.0.14","zeta":1,"alpha":0.5},"flags":{"official":true,"protected":true}},
+        {"transportUrl":"https://subs/manifest.json","transportName":"","manifest":{"id":"subs","version":"1.0.0","name":"Subs é"},"flags":{"official":true,"protected":false}},
+        {"transportUrl":"https://a/manifest.json","transportName":"","manifest":{"id":"a","version":"1.0.0","name":"A","behaviorHints":{"configurable":true}},"flags":{"official":false,"protected":false}},
+        {"transportUrl":"https://b/manifest.json","transportName":"","manifest":{"version":"2.1.0","id":"b","name":"B","weird":[1e3,-0.1]},"flags":{"protected":false,"official":false}}
+    ]"#;
+
+    #[test]
+    fn addon_edits_change_exactly_one_entry_and_keep_the_rest_as_they_were() {
+        use addons::{Change, apply, descriptor};
+        let list: Vec<Value> = serde_json::from_str(COLLECTION).unwrap();
+        let text = |v: &[Value]| v.iter().map(|a| serde_json::to_string(a).unwrap()).collect::<Vec<_>>();
+        // Install appends, everything before it untouched (byte for byte once serialized).
+        let d = descriptor("https://new/manifest.json", json!({ "id": "new", "name": "New", "version": "0.1.0" }));
+        let out = apply(&list, &Change::Install(d.clone())).unwrap();
+        assert_eq!(out.len(), 5);
+        assert_eq!(text(&out[..4]), text(&list));
+        assert_eq!(out[4], d);
+        assert_eq!(serde_json::to_string(&out[0]).unwrap(), r#"{"transportUrl":"https://v3-cinemeta.strem.io/manifest.json","transportName":"","manifest":{"name":"Cinemeta","id":"com.linvo.cinemeta","version":"3.0.14","zeta":1,"alpha":0.5},"flags":{"official":true,"protected":true}}"#,
+            "key order and numbers survive a round trip");
+        assert!(apply(&list, &Change::Install(list[2].clone())).is_err(), "no duplicates");
+        assert!(apply(&list, &Change::Install(json!({ "transportUrl": "x" }))).is_err(), "not an addon");
+        // Uninstall removes exactly that one, order kept.
+        let out = apply(&list, &Change::Uninstall("https://a/manifest.json".into())).unwrap();
+        assert_eq!(text(&out), [&text(&list)[..2], &text(&list)[3..]].concat());
+        // Official and protected ones stay; so do unknown or doubled ones.
+        assert!(apply(&list, &Change::Uninstall("https://v3-cinemeta.strem.io/manifest.json".into())).is_err());
+        assert!(apply(&list, &Change::Uninstall("https://subs/manifest.json".into())).is_err());
+        assert!(apply(&list, &Change::Uninstall("https://gone/manifest.json".into())).is_err());
+        let doubled = [list.clone(), vec![list[3].clone()]].concat();
+        assert!(apply(&doubled, &Change::Uninstall("https://b/manifest.json".into())).is_err());
+        // An empty read is never written over the account.
+        assert!(apply(&[], &Change::Install(d)).is_err());
+    }
+
+    #[test]
+    fn addons_page_confirms_uninstall_and_never_writes_from_tests() {
+        let mut rt = runtime(|s| {
+            demo(s);
+            s.page = Page::Home;
+            s.auth = Some("test".into());
+            s.addons = serde_json::from_str(COLLECTION).unwrap();
+            s.store.discover = vec![json!({ "transportUrl": "https://a/manifest.json", "transportName": "", "manifest": { "id": "a", "name": "A", "version": "1" } })];
+        });
+        click(&mut rt, "nav-Add-ons");
+        assert!(rt.state.page == Page::Addons);
+        assert!(rt.find("ad-uninstall-0").is_none() && rt.find("ad-uninstall-1").is_none(), "official addons have no Uninstall");
+        assert!(rt.find("ad-config-2").is_some() && rt.find("ad-config-3").is_none(), "Configure only when configurable");
+        click(&mut rt, "ad-uninstall-3");
+        assert_eq!(rt.state.store.confirm.as_deref(), Some("https://b/manifest.json"));
+        assert!(rt.state.status.is_empty(), "the first press only asks");
+        click(&mut rt, "ad-uninstall-3");
+        assert_eq!(rt.state.status, "would write: Uninstalled B");
+        click(&mut rt, "tab-discover");
+        assert!(rt.find("dc-install-0").is_none(), "installed ones say so instead");
     }
 
     #[test]

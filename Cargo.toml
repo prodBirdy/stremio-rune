@@ -7,14 +7,16 @@ edition = "2024"
 # Rune pins `dev` revs; bump the rev to update.
 rune = { git = "https://github.com/anomalyco/rune", rev = "93c7a04b8d3e82efab3ada142989a0207957654d" }
 ureq = { version = "3", features = ["json"] }
-serde_json = "1"
+# preserve_order + float_roundtrip: addons written back to the account keep their key order and numbers.
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+serde = { version = "1", features = ["derive"] }
 libloading = "0.8"
 # Posters: metahub serves WebP, which Rune's ImageCache doesn't decode on desktop.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 [target.'cfg(windows)'.dependencies]
 # The child window mpv draws into, under the app's control bar.
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_UI_Shell"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_UI_Shell", "Win32_Graphics_Dwm"] }
 
 # Image decoding runs on every card; unoptimized it takes ~10× longer (a 1920 px JPEG ~0.5 s).
 [profile.dev.package]

@@ -22,6 +22,9 @@ pub fn toggle_fullscreen() -> bool {
         // that one, and fullscreening it would leave the app as it was.
         let hwnd = Some(overlay::main()).filter(|h| !h.is_null()).unwrap_or_else(|| GetAncestor(GetActiveWindow(), GA_ROOT));
         if hwnd.is_null() { return saved.is_some() }
+        // Hide the windows from the screen while they change, so the switch shows as one cut
+        // instead of a frame repaint, a video at its old size and controls smeared mid-resize.
+        cloak_briefly(&[hwnd, overlay::window()]);
         if let Some((style, place)) = saved.take() {
             SetWindowLongPtrW(hwnd, GWL_STYLE, style);
             SetWindowPlacement(hwnd, &place);
@@ -43,6 +46,22 @@ pub fn toggle_fullscreen() -> bool {
         *saved = Some((style, place));
         true
     }
+}
+
+/// Cloak windows now and uncloak them once the app, mpv and the controls have redrawn at the
+/// new size (a few frames). Null handles are skipped.
+#[cfg(windows)]
+fn cloak_briefly(windows: &[windows_sys::Win32::Foundation::HWND]) {
+    fn cloak(h: isize, on: i32) {
+        use windows_sys::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
+        unsafe { DwmSetWindowAttribute(h as _, DWMWA_CLOAK as _, (&raw const on).cast(), 4) };
+    }
+    let hs: Vec<isize> = windows.iter().filter(|h| !h.is_null()).map(|h| *h as isize).collect();
+    for &h in &hs { cloak(h, 1) }
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        for h in hs { cloak(h, 0) }
+    });
 }
 
 #[cfg(not(windows))]
@@ -152,7 +171,6 @@ pub mod overlay {
 
     /// The app window, from `App::on_window`, and the controls' window once shown.
     static MAIN: AtomicIsize = AtomicIsize::new(0);
-    static OVERLAY: AtomicIsize = AtomicIsize::new(0);
     pub(super) static MAX_HOVER: AtomicBool = AtomicBool::new(false);
     /// Wakes the app's `poll` when the caption changes behind Rune's back.
     static WAKE: OnceLock<rune::Waker> = OnceLock::new();
@@ -173,6 +191,10 @@ pub mod overlay {
 
     /// The app window (null until Rune reports it).
     pub fn main() -> HWND { MAIN.load(Ordering::Relaxed) as HWND }
+
+    /// The controls' window, once attached (null before).
+    static OVERLAY: AtomicIsize = AtomicIsize::new(0);
+    pub fn window() -> HWND { OVERLAY.load(Ordering::Relaxed) as HWND }
 
     /// Show the controls' window over the app window, or hide it.
     pub fn show(w: &rune::WindowHandle, on: bool) {
@@ -217,6 +239,16 @@ pub mod overlay {
         }
     }
 
+    /// mpv's host window, a child of `main`, over the same area (same as `Host::fit`).
+    fn place_video(main: HWND, video: HWND) {
+        unsafe {
+            let mut r: RECT = std::mem::zeroed();
+            GetClientRect(main, &mut r);
+            let top = strip_px(main, GetDpiForWindow(main));
+            SetWindowPos(video, std::ptr::null_mut(), 0, top, r.right, (r.bottom - top).max(0), SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+
     /// The resize border the system keeps above the caption, at `dpi`.
     fn frame_px(dpi: u32) -> i32 {
         unsafe { GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi) }
@@ -249,8 +281,11 @@ pub mod overlay {
         let custom = captioned(hwnd);
         match msg {
             WM_WINDOWPOSCHANGED => {
-                let o = OVERLAY.load(Ordering::Relaxed) as HWND;
-                if !o.is_null() { place(hwnd, o) }
+                if !window().is_null() { place(hwnd, window()) }
+                // The video's window too, in the same instant: waiting for the app's next poll
+                // lags a resize (leaving fullscreen most visibly).
+                let video = VIDEO.load(Ordering::Relaxed) as HWND;
+                if !video.is_null() { place_video(hwnd, video) }
             }
             WM_SIZE => wake(), // maximized or restored: the strip's height and icon change
             WM_NCCALCSIZE if custom && wp != 0 => unsafe {
@@ -296,6 +331,10 @@ pub mod overlay {
         }
         def()
     }
+
+    /// mpv's host window while one exists (see `player.rs`), resized by `frame`.
+    static VIDEO: AtomicIsize = AtomicIsize::new(0);
+    pub fn set_video(h: HWND) { VIDEO.store(h as isize, Ordering::Relaxed) }
 }
 
 #[cfg(not(windows))]
