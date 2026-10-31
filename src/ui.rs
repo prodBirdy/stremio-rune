@@ -238,7 +238,7 @@ fn hero(s: &State) -> El {
         let on = i == s.hero.min(picks.len() - 1);
         let mut dot = el().key(format!("dot-{i}")).h(8.0).w(if on { DOT_W } else { 8.0 }).radius(4.0)
             .fill(ink(0.35)).clip_rounded(4.0).motion(motion::SNAPPY);
-        if on && s.focused { dot = dot.child(dot_fill(s.hero_round)) }
+        if on && s.focused { dot = dot.child(dot_fill(s)) }
         dots = dots.child(tap(dot).on_press(move |s: &mut State| show_hero(s, i)));
     }
     let [image, side, fade, scrim] = backdrop_layer(s, hero_img(backdrop(m)).as_deref());
@@ -251,27 +251,11 @@ fn hero(s: &State) -> El {
         .child(dots.pin(None, None, Some(PAD), Some(56.0)))
 }
 
-/// The current dot's fill over `HERO_EVERY`: segments that light up left to right, each
-/// fading in over its share. Rune runs these opacity cycles at `DOT_FPS`, so Home draws a few
-/// frames a second while the hero waits, not every display refresh. Keyed by round, so each
-/// title's fill starts empty.
-fn dot_fill(round: u64) -> El {
-    const N: usize = DOT_SEGMENTS;
-    static STOPS: [[(f32, f32); 4]; N] = {
-        let mut a = [[(0.0, 0.0); 4]; N];
-        let mut i = 0;
-        while i < N {
-            a[i] = [(0.0, 0.0), (i as f32 / N as f32, 0.0), ((i + 1) as f32 / N as f32, 1.0), (1.0, 1.0)];
-            i += 1;
-        }
-        a
-    };
-    let mut fill = row().key(format!("fill-{round}")).h(8.0).w(DOT_W);
-    for stops in &STOPS {
-        fill = fill.child(el().w(DOT_W / N as f32).h(8.0).fill(Color::WHITE)
-            .cycle(Cycle { period: HERO_EVERY.as_secs_f32(), phase: 0.0, stops, still: 1.0, fps: DOT_FPS }));
-    }
-    fill
+/// The current dot's fill over `HERO_EVERY`: a smooth render-time tween, keyed by round so
+/// each title's fill starts empty. It draws every frame while Home is up and focused (the
+/// hero pauses unfocused, so a background window draws nothing).
+fn dot_fill(s: &State) -> El {
+    el().key(format!("fill-{}", s.hero_round)).h(8.0).w(DOT_W).fill(Color::WHITE).live_rect(&s.hero_fill)
 }
 
 /// A 16:9 card with an optional progress bar over the image, and two lines under it.

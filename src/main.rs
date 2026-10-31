@@ -11,7 +11,7 @@ mod window;
 
 use player::{Mpv, Playback};
 use ui::{Ctl, addons, search, settings};
-use rune::{AppHandle, AppSpec, Image, ImageCache, Key, KeyEvent, TextEdit, Tx, Waker, WindowHandle};
+use rune::{AppHandle, AppSpec, Image, ImageCache, Key, KeyEvent, TextEdit, Tween, Tx, Waker, WindowHandle};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -33,8 +33,6 @@ const HERO_EVERY: Duration = Duration::from_secs(4);
 /// Width of the hero's current dot, which fills over `HERO_EVERY`.
 const DOT_W: f32 = 28.0;
 /// Its fill is this many segments, redrawn this often (see `ui::dot_fill`).
-const DOT_SEGMENTS: usize = 7;
-const DOT_FPS: f32 = 8.0;
 
 /// Decoded image pixels kept; least recently used go first past this. Rune keeps a mip chain of
 /// each on the GPU too (~4/3 of this).
@@ -118,6 +116,8 @@ struct State {
     /// When the hero last changed; it advances `HERO_EVERY` after.
     hero_at: Instant,
     /// Counts hero changes; keys the current dot's fill so each title's starts over.
+    /// The current dot's fill: [x, y, w, h] from empty to full over `HERO_EVERY`.
+    hero_fill: Tween<[f32; 4]>,
     hero_round: u64,
     /// The app window has focus (`on_focus`; a window Windows never activated hears nothing).
     /// Out of focus the hero holds still, so an idle app in the background draws nothing.
@@ -234,6 +234,7 @@ fn state() -> State {
         wheel: (0.0, Instant::now()),
         hero: 0,
         hero_at: Instant::now(),
+        hero_fill: dot_fill(),
         hero_round: 0,
         focused: false,
         images: HashMap::new(),
@@ -1043,8 +1044,11 @@ fn on_focus(s: &mut State, focused: bool, _: &mut Tx) {
 fn show_hero(s: &mut State, i: usize) {
     s.hero = i;
     s.hero_at = Instant::now();
+    s.hero_fill = dot_fill();
     s.hero_round += 1;
 }
+
+fn dot_fill() -> Tween<[f32; 4]> { Tween::linear([0.0, 0.0, 0.0, 8.0], [0.0, 0.0, DOT_W, 8.0], HERO_EVERY) }
 
 /// Fake data for headless `--snap … --scene <name>` renders.
 fn demo(s: &mut State) {
