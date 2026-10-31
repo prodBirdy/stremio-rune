@@ -3,6 +3,7 @@
 //! local streaming server (127.0.0.1:11470, started by the Stremio app) with the libmpv Stremio
 //! ships. Views live in `ui.rs`, playback in `player.rs`.
 
+mod library;
 mod player;
 mod server;
 mod ui;
@@ -46,6 +47,10 @@ enum Msg {
     Streams(String, Vec<Stream>),
     /// Addon subtitles for a video: (language code, url).
     Subs(String, Vec<(String, String)>),
+    /// The account's library item for a title being watched (none yet), with its meta.
+    LibraryItem(String, Option<Value>, Value),
+    /// Watch progress was written to the account.
+    Saved,
     /// Search answers: (query, index into `search.cats`, metas).
     Search(String, usize, Vec<Value>),
 }
@@ -107,6 +112,8 @@ struct State {
     addon_subs: Vec<(String, String)>,
     search: search::Search,
     player: Option<Mpv>,
+    /// Watch progress for the account's library (see `library.rs`).
+    watch: Option<library::Watch>,
     playback: Playback,
     icons: Option<Icons>,
     tx: Sender<Msg>,
@@ -181,6 +188,7 @@ fn state() -> State {
         addon_subs: vec![],
         search: search::Search::default(),
         player: None,
+        watch: None,
         playback: Playback::default(),
         icons: None,
         tx,
@@ -438,6 +446,7 @@ fn play(s: &mut State, url: &str) {
     match Mpv::play(url, &title, s.waker.clone(), start) {
         Ok(p) => {
             s.player = Some(p);
+            library::start(s);
             s.page = Page::Player;
             s.status.clear();
             s.controls = true;
@@ -475,6 +484,7 @@ fn add_sub(s: &mut State, lang: &str, url: &str) {
 }
 
 fn stop(s: &mut State) {
+    if s.player.is_some() { library::finish(s) }
     if s.fullscreen { toggle_fullscreen(s) }
     s.subs_open = false;
     s.controls = true;
@@ -568,6 +578,7 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
         changed |= controls != s.controls;
         s.controls = controls;
         player.fit(if controls { BAR } else { 0.0 }, if s.subs_open { SUBS_W } else { 0.0 }, !p.loading());
+        library::tick(s);
         tx.wake_after(Duration::from_millis(200));
         for m in std::mem::take(&mut s.playback.messages) {
             match m.as_str() { "fullscreen" => toggle_fullscreen(s), "escape" => escape(s), _ => {} }
@@ -631,6 +642,8 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
             }
             Msg::Search(q, i, metas) => search::landed(s, q, i, metas),
             Msg::Subs(vid, list) if vid == s.subs_for => s.addon_subs.extend(list),
+            Msg::LibraryItem(id, item, meta) => library::landed(s, id, item, meta),
+            Msg::Saved => {}
             Msg::Streams(vid, list) if vid == s.stream_for => {
                 s.streams.extend(list);
                 s.status.clear();
