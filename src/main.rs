@@ -823,7 +823,7 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
         if on != s.overlay_on { s.overlay_on = on; window::overlay::show(win, on) }
         if on { window::overlay::keep_keys(win) }
         let v = shown(s);
-        if v != s.pushed { s.pushed = v.clone(); app.update(move |c, _| c.shown = v) }
+        if v != s.pushed { s.pushed = v.clone(); app.update(move |c, tx| ui::push(c, v, tx)) }
     }
     changed
 }
@@ -1162,6 +1162,36 @@ mod tests {
     }
 
     #[test]
+    fn controls_land_at_once_when_the_window_resizes() {
+        // Fullscreen and back: the controls' window jumps to the new size. Nothing in it may
+        // travel there over frames, with or without a panel open.
+        for panel in [false, true] {
+            let mut rt = controls(move |c| { demo_controls(c); c.shown.subs_open = panel });
+            for _ in 0..60 { rt.frame(1.0 / 60.0); }
+            for (w, h) in [(1920.0, 1080.0), (1280.0, 800.0)] {
+                rt.set_viewport((w, h), 2.0);
+                // The app pushes its new state (the fullscreen icon) around the same frame.
+                rt.update(move |c, tx| { let v = ui::Shown { fullscreen: w > 1280.0, ..c.shown.clone() }; ui::push(c, v, tx) });
+                let mut seen = vec![];
+                for _ in 0..20 {
+                    rt.frame(1.0 / 60.0);
+                    seen.push((rt.find("toggle").unwrap(), rt.find("fullscreen").unwrap(), rt.find("back").unwrap()));
+                }
+                assert!(seen.windows(2).all(|p| p[0] == p[1]), "panel {panel}, {w}x{h}: moved over frames: {:?}", &seen[..4]);
+                let (toggle, full, _) = seen[0];
+                assert!((toggle.1 - (h - BAR / 2.0)).abs() < 1.0 && full.0 > w - 60.0 - if panel { SUBS_W } else { 0.0 }, "at the new edges at once");
+            }
+            // Showing and hiding the bars still fades.
+            rt.update(|c, tx| { let v = ui::Shown { controls: false, ..c.shown.clone() }; ui::push(c, v, tx) });
+            rt.frame(1.0 / 60.0);
+            let fading = rt.presented("controls").map(|(_, o)| o);
+            assert!(fading.is_some_and(|o| o > 0.05 && o < 1.0), "fading out, not gone at once: {fading:?}");
+            for _ in 0..30 { rt.frame(1.0 / 60.0); }
+            assert!(rt.find("bar").is_none());
+        }
+    }
+
+    #[test]
     fn volume_slider_drags_scrolls_mutes_and_is_remembered() {
         let mut rt = controls(demo_controls);
         let (x, y) = rt.find("volume").expect("slider");
@@ -1238,7 +1268,7 @@ mod tests {
     }
 
     /// The floating controls' window on its own, as in a scene.
-    fn controls(scene: fn(&mut Ctl)) -> rune::Runtime<Ctl> {
+    fn controls(scene: impl FnOnce(&mut Ctl)) -> rune::Runtime<Ctl> {
         let mut c = Ctl::default();
         scene(&mut c);
         let mut rt = rune::Runtime::new(c, ui::controls, (1280.0, 800.0), rune::Env { system_dark: true, scale: 2.0 });

@@ -511,6 +511,15 @@ fn act(f: impl Fn(&mut State) + Clone + Send + 'static) -> impl Fn(&mut Ctl) + '
     move |c: &mut Ctl| c.send(f.clone())
 }
 
+/// What the app sends: in place at once, unless the bars show or hide (they fade) or a panel
+/// opens or closes (it slides). Above all a window resize (fullscreen) that lands in the same
+/// frame then jumps to the new layout instead of springing there.
+pub fn push(c: &mut Ctl, v: Shown, tx: &mut Tx) {
+    let moves = |v: &Shown| (v.controls, v.subs_open, v.quality_open);
+    if moves(&c.shown) == moves(&v) { tx.instant() }
+    c.shown = v;
+}
+
 pub fn ctl_setup(c: &mut Ctl, waker: Waker) {
     let cache = ImageCache::new(waker);
     c.icons = Some(icons(&cache));
