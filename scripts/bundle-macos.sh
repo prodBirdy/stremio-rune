@@ -4,7 +4,8 @@
 # libmpv and streaming server); copy the bundle to /Applications to keep it.
 set -e
 cd "$(dirname "$0")/.."
-cargo build --release
+# Source paths in panic messages read ~/… rather than this machine's home folder.
+RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$HOME=~" cargo build --release
 
 app="target/release/Stremio Rune.app"
 rm -rf "$app"
