@@ -25,3 +25,7 @@ zune-jpeg = { opt-level = 3 }
 image-webp = { opt-level = 3 }
 png = { opt-level = 3 }
 fdeflate = { opt-level = 3 }
+
+[build-dependencies]
+# The app icon in the exe (build.rs).
+embed-resource = "3"
