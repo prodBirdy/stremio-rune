@@ -722,6 +722,7 @@ fn setup(s: &mut State, waker: Waker) {
 
 fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
+    fullscreen_selftest(s, tx);
     if let Some(player) = &s.player {
         let ended = player.pump(&mut s.playback); // shown in the controls' window, see `shown`
         // Controls show while the mouse moves, and stay while paused, loading, hovered or
@@ -835,6 +836,37 @@ fn shown(s: &State) -> ui::Shown {
         streams: s.streams.clone(),
         playing: s.playing.clone(),
     }
+}
+
+/// `STREMIO_RUNE_FSTEST=<video file>`: play it, enter and leave fullscreen the way the
+/// controls' button does, write the window state at each step to
+/// `%TEMP%\stremio-rune-fstest.txt`, and quit. For diagnosing fullscreen on a real desktop.
+fn fullscreen_selftest(s: &mut State, tx: &mut Tx) {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static START: OnceLock<Instant> = OnceLock::new();
+    static STEP: AtomicU8 = AtomicU8::new(0);
+    let Ok(clip) = std::env::var("STREMIO_RUNE_FSTEST") else { return };
+    let t = START.get_or_init(Instant::now).elapsed().as_secs_f32();
+    tx.wake_after(Duration::from_millis(100));
+    let log = |what: &str| {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("stremio-rune-fstest.txt");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "[{t:.1}s] {what}: {}", window::diag());
+        }
+    };
+    let step = STEP.load(Ordering::Relaxed);
+    let next = match step {
+        0 if t > 2.0 => { window::selftest_front_maximized(); true }
+        1 if t > 3.0 => { s.meta = None; play(s, &clip); true }
+        2 if t > 6.0 => { log("before"); toggle_fullscreen(s); log("toggled"); true }
+        3 if t > 6.4 => { window::selftest_jiggle(); log("fullscreen +0.4s"); true }
+        4 if t > 8.0 => { log("fullscreen +2s"); toggle_fullscreen(s); true }
+        5 if t > 9.0 => { log("restored +1s"); tx.quit(); true }
+        _ => false,
+    };
+    if next { STEP.store(step + 1, Ordering::Relaxed) }
 }
 
 /// Advance the Home hero every `HERO_EVERY`, and schedule the next look. Only on Home.
