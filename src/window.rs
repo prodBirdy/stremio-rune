@@ -117,14 +117,15 @@ fn cloak(h: windows_sys::Win32::Foundation::HWND, on: bool) {
     unsafe { DwmSetWindowAttribute(h, DWMWA_CLOAK as _, (&raw const on).cast(), 4) };
 }
 
-/// Cloak a window now and uncloak it once the app has redrawn at the new size (a few frames).
+/// Cloak a window now and uncloak it once it has redrawn and settled at the new size: the
+/// controls re-lay out for the new window size, and that shouldn't be seen mid-move.
 #[cfg(windows)]
 fn cloak_briefly(h: windows_sys::Win32::Foundation::HWND) {
     if h.is_null() { return }
     cloak(h, true);
     let h = h as isize;
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        std::thread::sleep(std::time::Duration::from_millis(450));
         cloak(h as _, false);
     });
 }
