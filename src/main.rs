@@ -10,7 +10,7 @@ mod ui;
 mod window;
 
 use player::{Mpv, Playback};
-use ui::{search, settings};
+use ui::{addons, search, settings};
 use rune::{AppSpec, Image, ImageCache, Key, KeyEvent, TextEdit, Tween, Tx, Waker};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -63,6 +63,10 @@ enum Msg {
     Search(String, usize, Vec<Value>),
     /// The streaming server's `/settings`, or why not (it's down).
     Server(Result<Value, String>),
+    /// Community addons to install, an addon fetched from a pasted URL, and how a write went.
+    Discover(Vec<Value>),
+    Preview(Value),
+    Written(Result<String, String>),
 }
 
 struct Stream { name: String, title: String, url: String }
@@ -70,7 +74,7 @@ struct Stream { name: String, title: String, url: String }
 struct Catalog { base: String, ty: String, id: String, name: String }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Page { Login, Home, Browse(&'static str), Detail, Player, Search, Settings }
+enum Page { Login, Home, Browse(&'static str), Detail, Player, Search, Settings, Addons }
 
 struct Icons { play: Image, pause: Image, back: Image, close: Image, expand: Image, shrink: Image, subs: Image, search: Image }
 
@@ -134,6 +138,8 @@ struct State {
     server: Option<Result<Value, String>>,
     /// The settings picker that's unfolded.
     choice: Option<&'static str>,
+    /// The Add-ons page.
+    store: addons::Store,
     player: Option<Mpv>,
     /// Watch progress for the account's library (see `library.rs`).
     watch: Option<library::Watch>,
@@ -218,6 +224,7 @@ fn state() -> State {
         settings: if cfg!(test) { Default::default() } else { settings::load(&settings::file()) },
         server: None,
         choice: None,
+        store: addons::Store::default(),
         player: None,
         watch: None,
         playback: Playback::default(),
@@ -478,6 +485,7 @@ fn open_catalog(s: &mut State, i: usize) {
 
 fn go(s: &mut State, page: Page) {
     s.page = page;
+    if page == Page::Addons { addons::open(s) }
     if let Page::Browse(ty) = page {
         if let Some(i) = s.catalogs.iter().position(|c| c.ty == ty) { open_catalog(s, i) }
     }
@@ -621,7 +629,8 @@ fn escape(s: &mut State) {
     else if s.page == Page::Player { stop(s) }
     else if s.page == Page::Detail { s.page = s.back_to }
     else if s.choice.is_some() { s.choice = None }
-    else if matches!(s.page, Page::Search | Page::Settings) { s.page = Page::Home }
+    else if s.store.confirm.is_some() { s.store.confirm = None }
+    else if matches!(s.page, Page::Search | Page::Settings | Page::Addons) { s.page = Page::Home }
 }
 
 fn mpv(s: &State, args: &[&str]) {
@@ -739,6 +748,9 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
             Msg::LibraryItem(id, item, meta) => library::landed(s, id, item, meta),
             Msg::Saved => {}
             Msg::Server(r) => s.server = Some(r),
+            Msg::Discover(list) => s.store.discover = list,
+            Msg::Preview(d) => { s.store.preview = Some(d); s.status.clear() }
+            Msg::Written(r) => addons::written(s, r),
             Msg::Streams(vid, list) if vid == s.stream_for => {
                 s.streams.extend(list);
                 s.status.clear();
@@ -819,6 +831,19 @@ fn main() {
                 s.search.results = HashMap::from([(0, s.items[&0].clone()), (1, s.items[&1][..3].to_vec())]);
             }),
             ("menu", |s| { demo(s); s.page = Page::Home; s.menu = true }),
+            ("addons", |s| {
+                demo(s);
+                s.page = Page::Addons;
+                let a = |name: &str, flags: Value, configurable: bool| json!({ "transportUrl": format!("https://{name}/manifest.json"), "transportName": "", "flags": flags,
+                    "manifest": { "id": name, "name": name, "version": "1.2.0", "types": ["movie", "series"], "behaviorHints": { "configurable": configurable },
+                        "description": "Streams and metadata for movies and shows, from a source this addon knows well." } });
+                s.addons = vec![a("Cinemeta", json!({ "official": true, "protected": true }), false), a("OpenSubtitles", json!({ "official": true, "protected": false }), false),
+                    a("Torrentio", json!({ "official": false, "protected": false }), true), a("Streaming Catalogs", json!({ "official": false, "protected": false }), true)];
+                s.store.confirm = Some("https://Streaming Catalogs/manifest.json".into());
+                s.store.url = TextEdit::new("https://example.org/manifest.json");
+                s.store.preview = Some(addons::descriptor("https://example.org/manifest.json", s.addons[2]["manifest"].clone()));
+                s.store.preview.as_mut().unwrap()["manifest"]["name"] = "Example Addon".into();
+            }),
             ("settings", |s| {
                 demo(s);
                 s.page = Page::Settings;
@@ -1209,6 +1234,64 @@ mod tests {
         assert_eq!((rt.state.settings.audio_lang.as_str(), rt.state.choice), ("ger", None), "picked and folded");
         click(&mut rt, "settings-sign-out");
         assert!(rt.state.page == Page::Login);
+    }
+
+    /// An account's collection as the API sends it: keys in its order, a float, an escape.
+    const COLLECTION: &str = r#"[
+        {"transportUrl":"https://v3-cinemeta.strem.io/manifest.json","transportName":"","manifest":{"name":"Cinemeta","id":"com.linvo.cinemeta","version":"3.0.14","zeta":1,"alpha":0.5},"flags":{"official":true,"protected":true}},
+        {"transportUrl":"https://subs/manifest.json","transportName":"","manifest":{"id":"subs","version":"1.0.0","name":"Subs é"},"flags":{"official":true,"protected":false}},
+        {"transportUrl":"https://a/manifest.json","transportName":"","manifest":{"id":"a","version":"1.0.0","name":"A","behaviorHints":{"configurable":true}},"flags":{"official":false,"protected":false}},
+        {"transportUrl":"https://b/manifest.json","transportName":"","manifest":{"version":"2.1.0","id":"b","name":"B","weird":[1e3,-0.1]},"flags":{"protected":false,"official":false}}
+    ]"#;
+
+    #[test]
+    fn addon_edits_change_exactly_one_entry_and_keep_the_rest_as_they_were() {
+        use addons::{Change, apply, descriptor};
+        let list: Vec<Value> = serde_json::from_str(COLLECTION).unwrap();
+        let text = |v: &[Value]| v.iter().map(|a| serde_json::to_string(a).unwrap()).collect::<Vec<_>>();
+        // Install appends, everything before it untouched (byte for byte once serialized).
+        let d = descriptor("https://new/manifest.json", json!({ "id": "new", "name": "New", "version": "0.1.0" }));
+        let out = apply(&list, &Change::Install(d.clone())).unwrap();
+        assert_eq!(out.len(), 5);
+        assert_eq!(text(&out[..4]), text(&list));
+        assert_eq!(out[4], d);
+        assert_eq!(serde_json::to_string(&out[0]).unwrap(), r#"{"transportUrl":"https://v3-cinemeta.strem.io/manifest.json","transportName":"","manifest":{"name":"Cinemeta","id":"com.linvo.cinemeta","version":"3.0.14","zeta":1,"alpha":0.5},"flags":{"official":true,"protected":true}}"#,
+            "key order and numbers survive a round trip");
+        assert!(apply(&list, &Change::Install(list[2].clone())).is_err(), "no duplicates");
+        assert!(apply(&list, &Change::Install(json!({ "transportUrl": "x" }))).is_err(), "not an addon");
+        // Uninstall removes exactly that one, order kept.
+        let out = apply(&list, &Change::Uninstall("https://a/manifest.json".into())).unwrap();
+        assert_eq!(text(&out), [&text(&list)[..2], &text(&list)[3..]].concat());
+        // Official and protected ones stay; so do unknown or doubled ones.
+        assert!(apply(&list, &Change::Uninstall("https://v3-cinemeta.strem.io/manifest.json".into())).is_err());
+        assert!(apply(&list, &Change::Uninstall("https://subs/manifest.json".into())).is_err());
+        assert!(apply(&list, &Change::Uninstall("https://gone/manifest.json".into())).is_err());
+        let doubled = [list.clone(), vec![list[3].clone()]].concat();
+        assert!(apply(&doubled, &Change::Uninstall("https://b/manifest.json".into())).is_err());
+        // An empty read is never written over the account.
+        assert!(apply(&[], &Change::Install(d)).is_err());
+    }
+
+    #[test]
+    fn addons_page_confirms_uninstall_and_never_writes_from_tests() {
+        let mut rt = runtime(|s| {
+            demo(s);
+            s.page = Page::Home;
+            s.auth = Some("test".into());
+            s.addons = serde_json::from_str(COLLECTION).unwrap();
+            s.store.discover = vec![json!({ "transportUrl": "https://a/manifest.json", "transportName": "", "manifest": { "id": "a", "name": "A", "version": "1" } })];
+        });
+        click(&mut rt, "nav-Add-ons");
+        assert!(rt.state.page == Page::Addons);
+        assert!(rt.find("ad-uninstall-0").is_none() && rt.find("ad-uninstall-1").is_none(), "official addons have no Uninstall");
+        assert!(rt.find("ad-config-2").is_some() && rt.find("ad-config-3").is_none(), "Configure only when configurable");
+        click(&mut rt, "ad-uninstall-3");
+        assert_eq!(rt.state.store.confirm.as_deref(), Some("https://b/manifest.json"));
+        assert!(rt.state.status.is_empty(), "the first press only asks");
+        click(&mut rt, "ad-uninstall-3");
+        assert_eq!(rt.state.status, "would write: Uninstalled B");
+        click(&mut rt, "tab-discover");
+        assert!(rt.find("dc-install-0").is_none(), "installed ones say so instead");
     }
 
     #[test]

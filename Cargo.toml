@@ -7,7 +7,8 @@ edition = "2024"
 # Rune pins `dev` revs; bump the rev to update.
 rune = { git = "https://github.com/anomalyco/rune", rev = "93c7a04b8d3e82efab3ada142989a0207957654d" }
 ureq = { version = "3", features = ["json"] }
-serde_json = "1"
+# preserve_order + float_roundtrip: addons written back to the account keep their key order and numbers.
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 serde = { version = "1", features = ["derive"] }
 libloading = "0.8"
 # Posters: metahub serves WebP, which Rune's ImageCache doesn't decode on desktop.
