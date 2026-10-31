@@ -3,6 +3,10 @@
 //! local streaming server (127.0.0.1:11470, started by the Stremio app) with the libmpv Stremio
 //! ships. Views live in `ui.rs`, playback in `player.rs`.
 
+// Release builds are a windowed app: no console window next to it. Debug builds keep the console
+// for logs and the self-tests.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod library;
 mod player;
 mod server;
