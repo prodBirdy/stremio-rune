@@ -1165,10 +1165,22 @@ mod tests {
             assert!(min.0 < max.0 && max.0 < close.0 && close.0 > 1280.0 - window::CAPTION_BUTTON_W, "buttons at the right");
             assert!(close.1 < caption.h, "in the strip");
         }
-        // Content keeps its place on screen: shifted down by the strip the system title bar was.
-        let nav = |caption: window::Caption| runtime(move |s| { demo(s); s.page = Page::Home; s.caption = caption }).find("nav-search").unwrap().1;
+        // The strip is clear: backdrops start at the window top and grow under it, and content
+        // keeps its place on screen, below where the system title bar was.
+        let at = |page: Page, key: &'static str, caption: window::Caption| runtime(move |s| {
+            demo(s);
+            s.page = page;
+            s.caption = caption;
+            if page == Page::Detail { s.meta = Some(s.items[&0][0].clone()) }
+        }).find(key).unwrap_or_else(|| panic!("no {key}")).1;
         let none = window::Caption { h: 0.0, ..caption };
-        assert!((nav(caption) - nav(none) - caption.h).abs() < 0.5);
+        for (page, key) in [(Page::Home, "nav-search"), (Page::Home, "watch"), (Page::Detail, "back"), (Page::Detail, "play"),
+            (Page::Settings, "settings-sign-out"), (Page::Browse("movie"), "nav-search")] {
+            assert!((at(page, key, caption) - at(page, key, none) - caption.h).abs() < 0.5, "{key} moves down by the strip");
+        }
+        for (page, key) in [(Page::Home, "hero"), (Page::Detail, "detail-hero")] {
+            assert!((at(page, key, caption) - at(page, key, none) - caption.h / 2.0).abs() < 0.5, "{key} starts at the top, taller");
+        }
         let rt = runtime(|s| { demo(s); s.page = Page::Player; s.fullscreen = true });
         assert!(rt.find("title-bar").is_none(), "fullscreen hides it");
     }

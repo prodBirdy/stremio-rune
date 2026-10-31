@@ -118,7 +118,7 @@ fn nav(s: &State) -> El {
     // The menu hangs off a plain wrapper so the pill's blur layer doesn't clip it.
     let mut anchor = el().child(pill);
     if s.menu { anchor = anchor.child(menu(s).pin(None, Some(60.0), Some(0.0), None)) }
-    row().pin(Some(0.0), Some(18.0), Some(0.0), None).justify_center().child(anchor)
+    row().pin(Some(0.0), Some(18.0 + top(s)), Some(0.0), None).justify_center().child(anchor)
 }
 
 fn menu(s: &State) -> El {
@@ -164,7 +164,7 @@ fn sheet(s: &State) -> [El; 2] {
             .child(label(st.title.clone(), 13.0, 400.0, ink(0.62)).font(TextStyle::new(13.0, 400.0).lh(19.0)).wrap().max_lines(4)))
             .on_press(move |s: &mut State| play(s, &url)));
     }
-    let panel = col().key("sheet").w(500.0).pin(None, Some(0.0), Some(0.0), Some(0.0)).pt(28.0).px(24.0).gap(20.0)
+    let panel = col().key("sheet").w(500.0).pin(None, Some(0.0), Some(0.0), Some(0.0)).pt(28.0 + top(s)).px(24.0).gap(20.0)
         .fill(bg().alpha(0.9)).backdrop_blur(30.0).border(1.0, ink(0.08)).shadow(0.0, 40.0, Color::BLACK.alpha(0.5))
         .transition(Transition::offset(500.0, 0.0).combined(Transition::opacity()))
         .child(head)
@@ -189,12 +189,15 @@ fn primary(s: &State, key: &str, words: impl Into<String>) -> El {
         .child(icon(s, |i| &i.play, 18.0)).child(label(words, 18.0, 600.0, Color::WHITE)))
 }
 
-/// Full-bleed backdrop with the scrims that keep text readable over any image.
-fn backdrop_layer(s: &State, url: Option<&str>) -> [El; 3] {
+/// Full-bleed backdrop with the scrims that keep text readable over any image, and the caption
+/// buttons over its top.
+fn backdrop_layer(s: &State, url: Option<&str>) -> [El; 4] {
     [
         all(picture(s, url)),
         all(el()).linear_gradient(PI / 2.0, [(0.0, Color::BLACK.alpha(0.8)), (0.6, Color::BLACK.alpha(0.0))]),
         all(el()).linear_gradient(PI, [(0.35, bg().alpha(0.0)), (1.0, bg())]),
+        el().pin(Some(0.0), Some(0.0), Some(0.0), None).h(top(s) + 72.0)
+            .linear_gradient(PI, [(0.0, Color::BLACK.alpha(0.45)), (1.0, Color::BLACK.alpha(0.0))]),
     ]
 }
 
@@ -216,7 +219,7 @@ fn headline(m: &Value, kicker: Option<String>) -> El {
 
 fn hero(s: &State) -> El {
     let picks: Vec<&Value> = s.items.get(&0).into_iter().flatten().take(HERO_PICKS).collect();
-    let Some(&m) = picks.get(s.hero.min(picks.len().saturating_sub(1))) else { return el().w_full().h(HERO_H) };
+    let Some(&m) = picks.get(s.hero.min(picks.len().saturating_sub(1))) else { return el().w_full().h(HERO_H + top(s)) };
     let (ty, id) = (s_(&m["type"]).to_string(), s_(&m["id"]).to_string());
     let kicker = s.catalogs.first().map(|c| c.name.clone());
     let info = headline(m, kicker).child(el().h(8.0))
@@ -231,11 +234,12 @@ fn hero(s: &State) -> El {
         if on { dot = dot.child(el().key(format!("fill-{}", s.hero_round)).h(8.0).w(DOT_W).fill(Color::WHITE).live_rect(&s.hero_fill)) }
         dots = dots.child(tap(dot).on_press(move |s: &mut State| show_hero(s, i)));
     }
-    let [image, side, fade] = backdrop_layer(s, hero_img(backdrop(m)).as_deref());
+    let [image, side, fade, scrim] = backdrop_layer(s, hero_img(backdrop(m)).as_deref());
     // Keyed by title so a change cross-fades: the old image fades out as the new one fades in.
     let image = image.key(format!("hero-{}", s_(&m["id"])));
-    el().key("hero").w_full().h(HERO_H)
-        .child(image).child(side).child(fade)
+    // From the window top, under the title strip; what's in it stays below the strip.
+    el().key("hero").w_full().h(HERO_H + top(s))
+        .child(image).child(side).child(fade).child(scrim)
         .child(info.pin(Some(PAD), None, None, Some(40.0)))
         .child(dots.pin(None, None, Some(PAD), Some(56.0)))
 }
@@ -329,7 +333,7 @@ fn browse(s: &State, ty: &str) -> El {
 fn detail(s: &State) -> El {
     let back = back_button(s).on_press(|s: &mut State| s.page = s.back_to);
     let Some(m) = &s.meta else {
-        return el().w_full().h(HERO_H).child(back.pin(Some(PAD), Some(24.0), None, None))
+        return el().w_full().h(HERO_H + top(s)).child(back.pin(Some(PAD), Some(24.0 + top(s)), None, None))
     };
     let ty = s_(&m["type"]).to_string();
     let videos = m["videos"].as_array().cloned().unwrap_or_default();
@@ -350,11 +354,11 @@ fn detail(s: &State) -> El {
         let ty = ty.clone();
         info = info.child(primary(s, "play", words).self_start().on_press(move |s: &mut State| pick(s, ty.clone(), vid.clone())));
     }
-    let [image, side, fade] = backdrop_layer(s, hero_img(backdrop(m)).as_deref());
-    let head = el().key("detail-hero").w_full().h(HERO_H)
-        .child(image).child(side).child(fade)
+    let [image, side, fade, scrim] = backdrop_layer(s, hero_img(backdrop(m)).as_deref());
+    let head = el().key("detail-hero").w_full().h(HERO_H + top(s))
+        .child(image).child(side).child(fade).child(scrim)
         .child(info.pin(Some(PAD), None, None, Some(28.0)))
-        .child(back.pin(Some(PAD), Some(22.0), None, None));
+        .child(back.pin(Some(PAD), Some(22.0 + top(s)), None, None));
     let mut page = col().w_full().gap(28.0).pb(56.0).child(head);
     if episodic {
         let mut tabs = row().gap(8.0).flex_wrap();
@@ -390,7 +394,7 @@ fn login(s: &State) -> El {
         .child(field(&s.password, "password", "Password").secure().on_edit(|s: &mut State| &mut s.password).on_submit(sign_in))
         .child(tap(row().key("sign-in").w_full().h(50.0).radius(12.0).center().fill(Color::WHITE).hover(ink(0.85))
             .child(label("Sign in", 16.0, 600.0, Color::BLACK))).on_press_tx(sign_in));
-    col().w_full().h_full().center()
+    col().w_full().h_full().pt(top(s)).center()
         .linear_gradient(PI * 0.8, [(0.0, oklch(0.32, 0.09, 260.0)), (0.55, bg()), (1.0, oklch(0.1, 0.01, 265.0))])
         .child(card)
 }
@@ -669,20 +673,24 @@ fn quality(c: &Ctl) -> El {
 
 // ---- root ----
 
-/// Every page under the app's title strip, which takes the place of the system's title bar
-/// (gone, see `window::caption`): the app's background, the system's drag region, and caption
-/// buttons at the right. Fullscreen has none.
+/// Every page, with the app's title strip over its top where the system's title bar was (gone,
+/// see `window::caption`): clear, the system's drag region, and caption buttons at the right.
+/// Full-bleed backdrops run under it; everything else starts below it (`top`). Fullscreen has none.
 pub fn view(s: &State, _: &mut Cx<State>) -> El {
-    if s.fullscreen || s.caption.h <= 0.0 { return page(s) }
-    col().w_full().h_full().fill(bg()).child(title_bar(s)).child(el().w_full().grow(1.0).min_h(0.0).child(page(s)))
+    let page = page(s);
+    if top(s) <= 0.0 { return page }
+    page.child(title_bar(s).pin(Some(0.0), Some(0.0), Some(0.0), None))
 }
+
+/// Height of the title strip over the page: where content starts.
+fn top(s: &State) -> f32 { if s.fullscreen { 0.0 } else { s.caption.h } }
 
 fn title_bar(s: &State) -> El {
     let c = &s.caption;
     // Hover only: the system hit-tests the strip, so these act on release like its own.
     let button = |key: &str, glyph: fn(&Icons) -> &Image, hover: Color| row().key(key.to_string())
         .w(window::CAPTION_BUTTON_W).h_full().center().hover(hover).child(icon(s, glyph, 10.0));
-    row().key("title-bar").w_full().h(c.h).justify_end()
+    row().key("title-bar").h(c.h).justify_end()
         .child(button("caption-min", |i| &i.minimize, ink(0.08)).on_press(|_: &mut State| window::syscommand(window::SC_MINIMIZE)))
         // Maximize is the system's to hit-test (Windows 11 snap layouts), so its hover comes from there.
         .child(button("caption-max", if c.zoomed { |i| &i.restore } else { |i| &i.maximize }, ink(0.08))
@@ -702,6 +710,7 @@ fn page(s: &State) -> El {
         Page::Settings => settings::view(s),
         Page::Addons => addons::view(s),
     };
+    let body = if matches!(s.page, Page::Home | Page::Detail) { body } else { col().w_full().pt(top(s)).child(body) };
     let mut root = col().w_full().h_full().fill(bg())
         .on_layout_tx(|s: &mut State, r, tx| { tx.live_only(); s.view_h = r[3] })
         .child(body.scroll(ScrollSpec { stick_bottom: false }).w_full().grow(1.0).shrink().min_h(0.0));
