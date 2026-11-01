@@ -40,6 +40,7 @@ cat > "$app/Contents/Info.plist" <<EOF
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.entertainment</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSLocalNetworkUsageDescription</key><string>Stremio Rune looks for TVs on your network to cast to.</string>
 </dict>
 </plist>
 EOF

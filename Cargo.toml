@@ -11,6 +11,8 @@ ureq = { version = "3", features = ["json"] }
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 serde = { version = "1", features = ["derive"] }
 libloading = "0.8"
+# DLNA TV search on each LAN interface (dlna.rs): the multicast interface, which std can't set. Already in the tree via ureq.
+socket2 = "0.6"
 # Posters: metahub serves WebP, which Rune's ImageCache doesn't decode on desktop.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 

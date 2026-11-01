@@ -2703,6 +2703,7 @@ dependencies = [
  "rune",
  "serde",
  "serde_json",
+ "socket2",
  "ureq",
  "windows",
  "windows-sys 0.59.0",

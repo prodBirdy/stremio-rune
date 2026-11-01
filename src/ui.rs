@@ -82,7 +82,7 @@ fn badge(s: impl Into<String>) -> El {
     row().h(24.0).px(7.0).radius(5.0).center().border(1.0, ink(0.45)).child(label(s, 13.0, 600.0, ink(0.9)))
 }
 
-fn s_(v: &Value) -> &str { v.as_str().unwrap_or("") }
+pub fn s_(v: &Value) -> &str { v.as_str().unwrap_or("") }
 
 /// `Drama · Mystery · 2026 · 107 min`
 fn meta_line(m: &Value) -> String {
@@ -257,11 +257,10 @@ fn headline(m: &Value, kicker: Option<String>) -> El {
 // ---- pages ----
 
 fn hero(s: &State) -> El {
-    let picks: Vec<&Value> = s.items.get(&0).into_iter().flatten().take(HERO_PICKS).collect();
-    let Some(&m) = picks.get(s.hero.min(picks.len().saturating_sub(1))) else { return el().w_full().h(HERO_H + top(s)) };
+    let picks = hero_picks(s);
+    let Some((m, kicker, _)) = picks.get(s.hero.min(picks.len().saturating_sub(1))) else { return el().w_full().h(HERO_H + top(s)) };
     let (ty, id) = (s_(&m["type"]).to_string(), s_(&m["id"]).to_string());
-    let kicker = s.catalogs.first().map(|c| c.name.clone());
-    let info = headline(m, kicker).child(el().h(8.0))
+    let info = headline(m, Some(kicker.clone())).child(el().h(8.0))
         .child(primary(s, "watch", "Watch now").self_start().on_press(move |s: &mut State| open_meta(s, ty.clone(), id.clone())));
     // The current dot stretches into a track that fills while its title stays up: a render-time
     // tween, so the fill moves without rebuilding the page.
@@ -305,7 +304,7 @@ fn landscape(s: &State, key: String, url: Option<String>, title: String, sub: St
 /// side it was turned toward while the last one fades. Shift+wheel, a sideways swipe or the
 /// arrow keys over it turn it too.
 fn home_row(s: &State, r: usize, title: &str, card: impl Fn(&Value) -> El) -> El {
-    let name = if r == UP_NEXT { "up".to_string() } else { r.to_string() };
+    let name = match r { UP_NEXT => "up".to_string(), WATCHLIST => "wl".to_string(), _ => r.to_string() };
     let at = row_at(s, r);
     let enter = Transition::offset(160.0 * s.row_dir, 0.0).combined(Transition::opacity());
     let mut page = row().key(format!("page-{name}-{at}")).w_full().equal_columns(ROW_CARDS).gap(GAP)
@@ -343,6 +342,15 @@ fn up_next(s: &State) -> El {
     })
 }
 
+fn watchlist(s: &State) -> El {
+    home_row(s, WATCHLIST, "Watchlist", |item| {
+        let (ty, id) = (s_(&item["type"]).to_string(), s_(&item["_id"]).to_string());
+        let kind = if ty == "movie" { "Movie" } else { "Show" };
+        landscape(s, format!("wl-{id}"), backdrop(item), s_(&item["name"]).to_string(), kind.to_string(), None)
+            .on_press(move |s: &mut State| open_meta(s, ty.clone(), id.clone()))
+    })
+}
+
 fn catalog_row(s: &State, i: usize) -> El {
     home_row(s, i, &s.catalogs[i].name, |m| {
         let (ty, id) = (s_(&m["type"]).to_string(), s_(&m["id"]).to_string());
@@ -354,6 +362,7 @@ fn catalog_row(s: &State, i: usize) -> El {
 fn home(s: &State) -> El {
     let mut page = col().w_full().gap(36.0).pb(56.0).child(hero(s));
     if !s.library.is_empty() { page = page.child(up_next(s)) }
+    if !s.saved.is_empty() { page = page.child(watchlist(s)) }
     // The first catalog feeds the hero; its row starts after the hero's picks (`row_items`).
     for i in 0..s.catalogs.len().min(HOME_ROWS) {
         if s.items.contains_key(&i) { page = page.child(catalog_row(s, i)) }
@@ -424,18 +433,24 @@ fn detail(s: &State) -> El {
     eps.sort_by_key(|v| v["episode"].as_i64());
     // Play: where you left off, else the movie, else this season's first episode.
     let target = s.resume.as_ref().map(|(v, _)| v.clone())
-        .or_else(|| (!episodic).then(|| s.meta_id.clone()))
+        .or_else(|| (!episodic).then(|| movie_video(m, &s.meta_id)))
         .or_else(|| eps.first().map(|v| s_(&v["id"]).to_string()));
     let words = match (s.resume.as_ref().and_then(|(v, _)| episode_of(v)), target.as_deref().and_then(episode_of)) {
         (Some((se, ep)), _) => format!("Resume S{se}, E{ep}"),
         (None, Some((se, ep))) if episodic => format!("Play S{se}, E{ep}"),
         _ => "Play".to_string(),
     };
-    let mut info = headline(m, None).child(el().h(8.0));
+    let mut actions = row().gap(12.0).center_y();
     if let Some(vid) = target {
         let ty = ty.clone();
-        info = info.child(primary(s, "play", words).self_start().on_press(move |s: &mut State| pick(s, ty.clone(), vid.clone())));
+        actions = actions.child(primary(s, "play", words).on_press(move |s: &mut State| pick(s, ty.clone(), vid.clone())));
     }
+    let on = library::on_list(s);
+    actions = actions.child(tap(glass(row().key("watchlist").h(54.0).pl(20.0).pr(24.0).gap(10.0).radius(12.0).center()).fill(ink(if on { 0.16 } else { 0.08 })).hover(ink(0.2))
+        .child(label(if on { "✓" } else { "+" }, 22.0, 600.0, Color::WHITE))
+        .child(label(if on { "On Watchlist" } else { "Watchlist" }, 18.0, 600.0, Color::WHITE)))
+        .on_press(library::toggle));
+    let info = headline(m, None).child(el().h(8.0)).child(actions);
     let [image, side, fade, scrim] = backdrop_layer(s, hero_img(backdrop(m)).as_deref());
     let head = el().key("detail-hero").w_full().h(HERO_H + top(s))
         .child(image).child(side).child(fade).child(scrim)
@@ -443,7 +458,7 @@ fn detail(s: &State) -> El {
         .child(back.pin(Some(PAD), Some(22.0 + top(s)), None, None));
     let mut page = col().w_full().gap(48.0).pb(64.0).child(head);
     if episodic { page = page.child(episodes(s, m, &ty, eps)) }
-    page.child(about(m))
+    page.child(about(s, m))
 }
 
 fn section_title(words: &str) -> El { label(words, 24.0, 600.0, Color::WHITE) }
@@ -477,30 +492,51 @@ fn episodes(s: &State, m: &Value, ty: &str, eps: Vec<&Value>) -> El {
     col().w_full().px(PAD).gap(20.0).child(section_title("Episodes")).child(tabs).child(grid)
 }
 
-/// Credits as a row of people (one card per person, roles merged), the facts the addon gave
-/// in columns, and the whole synopsis when it runs past the hero's three lines.
-fn about(m: &Value) -> El {
+/// The people to credit: directors, the cast, then writers, one per person with their roles
+/// merged and the photo an addon gave (cast from `State::people` when there is one, else
+/// Cinemeta's names).
+pub fn credits(s: &State, m: &Value) -> Vec<(String, Vec<String>, Option<String>)> {
     let names = |k: &str| m[k].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>();
-    let mut people: Vec<(String, Vec<&str>)> = vec![];
-    for (k, role) in [("director", "Director"), ("writer", "Writer"), ("cast", "Cast")] {
-        for n in names(k) {
-            match people.iter_mut().find(|(p, _)| *p == n) {
-                Some((_, roles)) => roles.push(role),
-                None => people.push((n, vec![role])),
-            }
+    let cast: Vec<(String, String, Option<String>)> = if s.people.is_empty() {
+        names("cast").into_iter().map(|n| (n, "Cast".to_string(), None)).collect()
+    } else {
+        s.people.iter().map(|c| (s_(&c["name"]).to_string(), c["character"].as_str().filter(|r| !r.is_empty()).unwrap_or("Cast").to_string(),
+            c["photo"].as_str().filter(|u| !u.is_empty()).map(String::from))).collect()
+    };
+    let crew = |k: &str, role: &str| names(k).into_iter().map(|n| (n, role.to_string(), None)).collect::<Vec<_>>();
+    let mut people: Vec<(String, Vec<String>, Option<String>)> = vec![];
+    for (name, role, photo) in crew("director", "Director").into_iter().chain(cast).chain(crew("writer", "Writer")) {
+        match people.iter_mut().find(|(p, _, _)| *p == name) {
+            Some((_, roles, pic)) => { roles.push(role); if pic.is_none() { *pic = photo } }
+            None => people.push((name, vec![role], photo)),
         }
     }
+    people
+}
+
+/// Credits as a row of people (`credits`), the facts in columns, and the whole synopsis when it
+/// runs past the hero's three lines.
+fn about(s: &State, m: &Value) -> El {
+    let names = |k: &str| m[k].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>();
+    let people = credits(s, m);
     let mut page = col().w_full().px(PAD).gap(48.0);
     if !people.is_empty() {
         let mut row_ = row().w_full().equal_columns(PEOPLE).gap(GAP);
-        for (name, roles) in people.into_iter().take(PEOPLE) {
+        for (i, (name, roles, photo)) in people.into_iter().take(PEOPLE).enumerate() {
             let initials: String = name.split_whitespace().filter_map(|w| w.chars().next()).take(2).collect();
-            row_ = row_.child(col().min_w(0.0).gap(6.0).center()
-                .child(row().size(88.0, 88.0).mb(6.0).radius(44.0).center().border(1.0, ink(0.1))
+            let face = match photo {
+                Some(u) => picture(s, Some(&sized(&u, 88.0))).size(88.0, 88.0).radius(44.0).clip_rounded(44.0),
+                None => row().size(88.0, 88.0).radius(44.0).center()
                     .linear_gradient(PI * 0.75, [(0.0, ink(0.22)), (1.0, ink(0.06))])
-                    .child(label(initials.to_uppercase(), 26.0, 600.0, ink(0.85))))
+                    .child(label(initials.to_uppercase(), 26.0, 600.0, ink(0.85))),
+            };
+            // A press searches their name: their films and shows (`search::find`).
+            let who = name.clone();
+            row_ = row_.child(tap(col().key(format!("person-{i}")).min_w(0.0).gap(6.0).center())
+                .child(face.mb(6.0).border(1.0, ink(0.1)))
                 .child(label(name, 15.0, 600.0, Color::WHITE).truncate())
-                .child(label(roles.join(", "), 13.0, 500.0, ink(0.5)).truncate()));
+                .child(label(roles.join(", "), 13.0, 500.0, ink(0.5)).truncate())
+                .on_press(move |s: &mut State| search::find(s, &who)));
         }
         page = page.child(col().w_full().gap(20.0).child(section_title("Cast & Crew")).child(row_));
     }

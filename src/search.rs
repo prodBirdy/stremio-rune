@@ -81,6 +81,16 @@ pub fn open(s: &mut State) {
     s.search.query.focused = true;
 }
 
+/// Search for `q` at once, as if typed: a person's name from a detail page finds their titles
+/// (addons built on TMDB match people as well as titles; Cinemeta, some of them).
+pub fn find(s: &mut State, q: &str) {
+    open(s);
+    s.search.query = TextEdit::new(q);
+    s.search.query.focused = true;
+    s.search.debounce.cancel();
+    run(s, q.to_string());
+}
+
 fn hint(words: String) -> El {
     label(words, 17.0, 500.0, ink(0.5)).pt(12.0)
 }
@@ -96,7 +106,7 @@ pub fn view(s: &State) -> El {
     let q = s.search.query.text.trim();
     let r = &s.search.results;
     let done = r.len() >= s.search.cats.len();
-    if q.is_empty() { return page.child(hint("Find a movie or show by its title.".into())) }
+    if q.is_empty() { return page.child(hint("Find a movie or show by its title, or an actor's by their name.".into())) }
     if s.search.cats.is_empty() { return page.child(hint("None of your addons offer search.".into())) }
     for (i, c) in s.search.cats.iter().enumerate() {
         let Some(items) = r.get(&i).filter(|v| !v.is_empty()) else { continue };

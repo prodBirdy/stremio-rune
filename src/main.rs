@@ -7,6 +7,8 @@
 // for logs and the self-tests.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod cast;
+mod dlna;
 mod library;
 mod player;
 mod preview;
@@ -42,6 +44,8 @@ const ROW_CARDS: usize = 5;
 const HERO_PICKS: usize = 5;
 /// The Home row of `row_*` maps that pages through the library (others are catalog indexes).
 const UP_NEXT: usize = usize::MAX;
+/// The Watchlist's Home row (the library proper, `State::saved`).
+const WATCHLIST: usize = usize::MAX - 1;
 const HERO_EVERY: Duration = Duration::from_secs(4);
 /// Width of the hero's current dot, which fills over `HERO_EVERY`.
 const DOT_W: f32 = 28.0;
@@ -81,6 +85,13 @@ enum Msg {
     LibraryItem(String, Option<Value>, Value),
     /// Watch progress was written to the account.
     Saved,
+    /// A Watchlist change the account took (see `library::toggle`).
+    Listed(Value),
+    /// Devices the streaming server found to cast to, and a TV's playback status.
+    CastDevices(Vec<Value>),
+    CastStatus(String, Value),
+    /// A title's cast with photos, from one of the addons asked (see `open_meta`).
+    Cast(String, Vec<Value>),
     /// Search answers: (query, index into `search.cats`, metas).
     Search(String, usize, Vec<Value>),
     /// The streaming server's `/settings`, or why not (it's down).
@@ -108,7 +119,7 @@ struct Catalog { base: String, ty: String, id: String, name: String, addon: Stri
 enum Page { Login, Home, Browse(&'static str), Detail, Player, Search, Settings, Addons }
 
 struct Icons {
-    play: Image, pause: Image, back: Image, close: Image, expand: Image, shrink: Image, subs: Image, search: Image, next: Image,
+    play: Image, pause: Image, back: Image, close: Image, expand: Image, shrink: Image, subs: Image, search: Image, next: Image, cast: Image,
     // The caption buttons' glyphs, thin as Windows draws them.
     minimize: Image, maximize: Image, restore: Image, quit: Image,
     volume: Image, muted: Image,
@@ -127,6 +138,11 @@ struct State {
     items: HashMap<usize, Vec<Value>>,
     /// Continue watching, newest first.
     library: Vec<Value>,
+    /// The Watchlist: the account's library proper (`library::listed`).
+    saved: Vec<Value>,
+    /// The open title's cast with photos and roles (an addon's `app_extras.cast`), when an
+    /// addon built on TMDB gives them; Cinemeta's are names only.
+    people: Vec<Value>,
     /// Home rows (catalog index, or `UP_NEXT`): the first card shown, which way the last page
     /// turned (±1), catalogs with a further page on the way or none left, the row under the
     /// mouse (arrow keys page it), and sideways wheel travel since the last turn.
@@ -185,6 +201,11 @@ struct State {
     bar_hover: bool,
     subs_open: bool,
     quality_open: bool,
+    /// The TV list in the player (`cast`), what the streaming server found, and the TV being
+    /// played to.
+    cast_open: bool,
+    cast_devices: Vec<Value>,
+    cast: Option<cast::Session>,
     /// The stream URL playing.
     playing: String,
     /// Seek-bar previews of the stream playing.
@@ -294,6 +315,8 @@ fn state() -> State {
         selected: 0,
         items: HashMap::new(),
         library: vec![],
+        saved: vec![],
+        people: vec![],
         row_at: HashMap::new(),
         row_dir: 1.0,
         more_loading: HashSet::new(),
@@ -332,6 +355,9 @@ fn state() -> State {
         bar_hover: false,
         subs_open: false,
         quality_open: false,
+        cast_open: false,
+        cast_devices: vec![],
+        cast: None,
         playing: String::new(),
         preview: None,
         seek_hover: None,
@@ -410,6 +436,58 @@ fn stream_url(st: &Value) -> Option<String> {
 
 fn type_label(ty: &str) -> &str {
     match ty { "movie" => "Movies", "series" => "Shows", "channel" => "Channels", "tv" => "TV", other => other }
+}
+
+/// A catalog's lasting name (addon, type, id), for `Settings::hero`.
+fn catalog_key(c: &Catalog) -> String { format!("{}|{}|{}", c.base, c.ty, c.id) }
+
+/// Where hero titles come from.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum HeroSource { Catalog(usize), Watchlist, UpNext }
+
+/// The hero's sources (`Settings::heroes`) in the order picked: those still there, an empty
+/// Watchlist or Up Next left out; none left means the first row's.
+fn hero_sources(s: &State) -> Vec<HeroSource> {
+    let v: Vec<HeroSource> = s.settings.heroes.iter().filter_map(|k| match k.as_str() {
+        "watchlist" => (!s.saved.is_empty()).then_some(HeroSource::Watchlist),
+        "upnext" => (!s.library.is_empty()).then_some(HeroSource::UpNext),
+        k => s.catalogs.iter().position(|c| catalog_key(c) == k).map(HeroSource::Catalog),
+    }).collect();
+    if v.is_empty() && !s.catalogs.is_empty() { vec![HeroSource::Catalog(0)] } else { v }
+}
+
+/// The hero's titles with each one's label and source, taken from its sources in turn: five
+/// from one source, two each from several (ten at most).
+fn hero_picks(s: &State) -> Vec<(Value, String, HeroSource)> {
+    let lists: Vec<(Vec<Value>, String, HeroSource)> = hero_sources(s).into_iter().map(|src| match src {
+        HeroSource::Catalog(i) => (s.items.get(&i).cloned().unwrap_or_default(), s.catalogs[i].name.clone(), src),
+        HeroSource::Watchlist | HeroSource::UpNext => {
+            let (items, name) = if src == HeroSource::Watchlist { (&s.saved, "Watchlist") } else { (&s.library, "Up Next") };
+            (items.iter().map(|i| { let mut m = i.clone(); m["id"] = i["_id"].clone(); m }).collect(), name.to_string(), src)
+        }
+    }).collect();
+    let total = (2 * lists.len()).clamp(HERO_PICKS, 2 * HERO_PICKS);
+    let mut picks = vec![];
+    for round in 0..total {
+        let before = picks.len();
+        for (items, name, src) in &lists {
+            if picks.len() < total && let Some(m) = items.get(round) { picks.push((m.clone(), name.clone(), *src)) }
+        }
+        if picks.len() == before { break }
+    }
+    picks
+}
+
+/// How many of catalog `i`'s first titles the hero shows (its Home row starts after them).
+fn hero_taken(s: &State, i: usize) -> usize {
+    if !hero_sources(s).contains(&HeroSource::Catalog(i)) { return 0 }
+    hero_picks(s).iter().filter(|p| p.2 == HeroSource::Catalog(i)).count()
+}
+
+/// The hero's sources changed: start it over, with their catalogs loaded.
+fn hero_changed(s: &mut State) {
+    show_hero(s, 0);
+    for src in hero_sources(s) { if let HeroSource::Catalog(i) = src { fetch_catalog(s, i) } }
 }
 
 /// An addon's name without what follows a `|` (`Watchly | ElfHosted` is Watchly).
@@ -634,8 +712,10 @@ fn fetch_catalog(s: &mut State, i: usize) {
 /// hero's picks).
 fn row_items(s: &State, r: usize) -> &[Value] {
     if r == UP_NEXT { return &s.library }
+    if r == WATCHLIST { return &s.saved }
     let items = s.items.get(&r).map_or(&[][..], |v| &v[..]);
-    if r == 0 && items.len() > HERO_PICKS { &items[HERO_PICKS..] } else { items }
+    let taken = if r < s.catalogs.len() { hero_taken(s, r) } else { 0 };
+    if taken > 0 && items.len() > taken { &items[taken..] } else { items }
 }
 
 fn row_at(s: &State, r: usize) -> usize { s.row_at.get(&r).copied().unwrap_or(0).min(row_items(s, r).len()) }
@@ -718,7 +798,27 @@ fn open_meta(s: &mut State, ty: String, id: String) {
         return;
     };
     let url = format!("{}/meta/{ty}/{id}.json", base(addon));
-    spawn(s, move || Ok(Msg::Meta(id, get(&url)?["meta"].clone())));
+    let others: Vec<String> = s.addons.iter().filter(|a| a["transportUrl"] != addon["transportUrl"] && supports(a, "meta", &ty, &id))
+        .map(|a| format!("{}/meta/{ty}/{id}.json", base(a))).collect();
+    let i = id.clone();
+    spawn(s, move || Ok(Msg::Meta(i, get(&url)?["meta"].clone())));
+    // Photos for the cast: the first other addon with any wins; one that fails stays quiet.
+    s.people.clear();
+    for url in others {
+        let id = id.clone();
+        spawn(s, move || Ok(Msg::Cast(id, get(&url).ok().map(|r| cast_of(&r["meta"])).unwrap_or_default())));
+    }
+}
+
+/// The video a title without episodes plays: the meta's `defaultVideoId` (an IMDb id for one a
+/// catalog lists as `tmdb:…`, which stream addons don't know), else its id.
+fn movie_video(meta: &Value, id: &str) -> String {
+    meta["behaviorHints"]["defaultVideoId"].as_str().or(meta["id"].as_str()).filter(|v| !v.is_empty()).unwrap_or(id).to_string()
+}
+
+/// An addon meta's cast with photos (`app_extras.cast`: name, character, photo).
+fn cast_of(meta: &Value) -> Vec<Value> {
+    meta["app_extras"]["cast"].as_array().into_iter().flatten().filter(|c| c["name"].is_string()).cloned().collect()
 }
 
 /// Continue Watching: open the title with the last video's streams, starting where you left off.
@@ -817,6 +917,8 @@ fn switch_stream(s: &mut State, url: &str) {
 }
 
 fn stop(s: &mut State) {
+    cast::stop(s);
+    s.cast_open = false;
     if s.player.is_some() { library::finish(s) }
     if s.fullscreen { toggle_fullscreen(s) }
     s.subs_open = false;
@@ -903,6 +1005,7 @@ fn icons(cache: &ImageCache) -> Icons {
         subs: icon("M4 6h16v12H4zM7 14h3M12 14h5M7 10.5h6M15 10.5h2"),
         search: icon("M11 4a7 7 0 1 0 0 14a7 7 0 1 0 0-14zM20 20l-4.2-4.2"),
         next: icon("M9 6l6 6-6 6"),
+        cast: icon("M3 8V6a1 1 0 0 1 1-1h16a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1h-6M3 19h.01M3 15.5a3.5 3.5 0 0 1 3.5 3.5M3 12a7 7 0 0 1 7 7"),
         minimize: thin("M1 6h10"),
         maximize: thin("M1.5 1.5h9v9h-9z"),
         restore: thin("M1.5 3.5h7v7h-7zM3.5 3.5v-2h7v7h-2"),
@@ -959,12 +1062,13 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
         let cursor = window::cursor();
         if cursor != s.cursor { s.cursor = cursor; s.last_move = Instant::now() }
         let p = &s.playback;
-        let controls = p.paused || p.loading() || s.bar_hover || s.subs_open || s.quality_open || s.last_move.elapsed() < Duration::from_millis(s.settings.hide_ms as u64);
+        let controls = p.paused || p.loading() || s.bar_hover || s.subs_open || s.quality_open || s.cast_open || s.last_move.elapsed() < Duration::from_millis(s.settings.hide_ms as u64);
         changed |= controls != s.controls;
         s.controls = controls;
         player.set_video_size(s.video_size.0, s.video_size.1);
         remember_volume(s);
         library::tick(s);
+        cast::tick(s);
         tx.wake_after(Duration::from_millis(200));
         for m in std::mem::take(&mut s.playback.messages) {
             match m.as_str() { "fullscreen" => toggle_fullscreen(s), "escape" => escape(s), _ => {} }
@@ -1005,17 +1109,20 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
                 s.more_done.clear();
                 s.status.clear();
                 for i in 0..s.catalogs.len().min(HOME_ROWS) { fetch_catalog(s, i) }
+                // Hero sources further down than Home's rows.
+                for src in hero_sources(s) { if let HeroSource::Catalog(i) = src && i >= HOME_ROWS { fetch_catalog(s, i) } }
             }
             Msg::Library(items) => {
+                s.saved = library::listed(&items);
                 s.library = continue_watching(items);
             }
             // Pictures ask for their images when laid out near the viewport (`ui::picture`).
             Msg::Catalog(i, items) => {
-                // The hero cycles through catalog 0's first titles: fetch all their backdrops now,
+                // The hero cycles through its sources' first titles: fetch all their backdrops now,
                 // so each turn shows its image at once instead of starting a download.
-                let heroes: Vec<String> = if i == 0 { items.iter().take(HERO_PICKS).filter_map(|m| ui::hero_img(backdrop(m))).collect() } else { vec![] };
+                let feeds = hero_sources(s).contains(&HeroSource::Catalog(i));
                 s.items.insert(i, items);
-                want(s, heroes);
+                if feeds { let heroes: Vec<String> = hero_picks(s).iter().filter_map(|(m, _, _)| ui::hero_img(backdrop(m))).collect(); want(s, heroes) }
             }
             Msg::More(r, metas) => more_landed(s, r, metas),
             Msg::Image(url, img) => if let Some(c) = &s.cache {
@@ -1030,16 +1137,32 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
                 s.season = s.resume.as_ref().and_then(|(v, _)| episode_of(v)).map(|(se, _)| se)
                     .or_else(|| ui::seasons(&meta).into_iter().find(|&n| n > 0))
                     .unwrap_or(0);
+                if s.people.is_empty() { s.people = cast_of(&meta) }
                 s.meta = Some(meta);
                 s.status.clear();
                 // Movies preload their streams for Play; Continue Watching opens them at once.
                 if let Some((video, _)) = s.resume.clone() { pick(s, ty, video) }
-                else if !episodic { load_streams(s, ty, id) }
+                else if !episodic { let vid = movie_video(s.meta.as_ref().unwrap(), &id); load_streams(s, ty, vid) }
             }
             Msg::Search(q, i, metas) => search::landed(s, q, i, metas),
             Msg::Subs(vid, list) if vid == s.subs_for => s.addon_subs.extend(list),
             Msg::LibraryItem(id, item, meta) => library::landed(s, id, item, meta),
             Msg::Saved => {}
+            Msg::Listed(item) => library::listed_landed(s, item),
+            Msg::CastDevices(list) => {
+                s.cast_devices = list;
+                // Discovery goes on in the server: look again while the list is open.
+                if s.cast_open && cast::tvs(&s.cast_devices).is_empty() {
+                    let (tx, wake) = (s.tx.clone(), s.waker.clone());
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(2));
+                        let _ = tx.send(Msg::CastDevices(cast::discover()));
+                        if let Some(w) = wake { w() }
+                    });
+                }
+            }
+            Msg::CastStatus(id, status) => cast::landed(s, id, status),
+            Msg::Cast(id, cast) => if id == s.meta_id && s.people.is_empty() { s.people = cast },
             Msg::Server(r) => s.server = Some(r),
             Msg::Discover(list) => s.store.discover = list,
             Msg::Preview(d) => { s.store.preview = Some(d); s.status.clear() }
@@ -1146,7 +1269,7 @@ fn cursor_selftest(s: &mut State, tx: &mut Tx) {
 
 /// Advance the Home hero every `HERO_EVERY`, and schedule the next look. Only on Home.
 fn rotate_hero(s: &mut State, tx: &mut Tx) -> bool {
-    let n = s.items.get(&0).map_or(0, |v| v.len().min(HERO_PICKS));
+    let n = hero_picks(s).len();
     if s.page != Page::Home || n < 2 || !s.focused { return false }
     let left = HERO_EVERY.saturating_sub(s.hero_at.elapsed());
     if !left.is_zero() { tx.wake_after(left); return false }
@@ -1284,6 +1407,12 @@ fn main() {
                 s.search.results = HashMap::from([(0, s.items[&0].clone()), (1, s.items[&1][..3].to_vec())]);
             }),
             ("menu", |s| { demo(s); s.page = Page::Home; s.menu = true }),
+            ("settings-hero", |s| { demo(s); settings::open(s); s.choice = Some("hero"); s.settings.heroes = vec!["watchlist".into(), catalog_key(&s.catalogs[1])] }),
+            ("watchlist", |s| {
+                demo(s);
+                s.page = Page::Home;
+                s.saved = (20..26).map(|n| json!({ "_id": format!("tt{n}"), "type": if n % 2 == 0 { "movie" } else { "series" }, "name": format!("Saved {n}") })).collect();
+            }),
             ("rows", |s| {
                 demo(s);
                 s.page = Page::Home;
@@ -1305,6 +1434,16 @@ fn main() {
                 s.store.preview.as_mut().unwrap()["manifest"]["name"] = "Example Addon".into();
             }),
             ("player", demo_player),
+            ("cast-list", |s| {
+                demo_player(s);
+                s.cast_open = true;
+                s.cast_devices = vec![json!({ "id": "Living-Room", "name": "Living Room TV", "type": "chromecast" }),
+                    json!({ "id": "uuid:1", "name": "Bedroom [LG] webOS TV", "type": "dlna" }), json!({ "id": "vlc", "name": "VLC", "type": "external" })];
+            }),
+            ("casting", |s| {
+                demo_player(s);
+                s.cast = Some(cast::Session::new(json!({ "id": "Living-Room", "name": "Living Room TV", "type": "chromecast" }), 1234.0, 5400.0));
+            }),
             ("loading", |s| { demo_player(s); s.playback = Playback { cache_pct: 40.0, ..Default::default() } }),
             ("quality", |s| { demo_player(s); s.quality_open = true }),
             ("seek-preview", |s| { demo_player(s); s.seek_hover = Some(0.4) }),
@@ -1775,6 +1914,87 @@ mod tests {
         }
         let (rest, worst) = frames(&mut rt, 30);
         println!("open empty: first frame {first:.0} ms; each of 5 arrivals (20 streams): {arrivals:.0?} ms; next 30 frames {rest:.0} ms (worst {worst:.0} ms)");
+    }
+
+    #[test]
+    fn a_movie_listed_by_tmdb_id_asks_for_streams_by_its_imdb_id() {
+        let mut rt = runtime(|s| { demo(s); s.meta_id = "tmdb:680".into(); s.page = Page::Detail });
+        let meta = json!({ "id": "tmdb:680", "type": "movie", "name": "Pulp Fiction", "behaviorHints": { "defaultVideoId": "tt0110912" } });
+        rt.state.tx.send(Msg::Meta("tmdb:680".into(), meta)).unwrap();
+        rt.update(|s, tx| { poll(s, 0.0, tx); });
+        assert_eq!(rt.state.stream_for, "tt0110912");
+        assert_eq!(movie_video(&json!({ "id": "tt1" }), "x"), "tt1");
+        assert_eq!(movie_video(&json!({}), "x"), "x");
+    }
+
+    #[test]
+    fn the_hero_cycles_through_the_chosen_sections() {
+        let mut rt = runtime(|s| { demo(s); s.page = Page::Home });
+        let ids = |s: &State| hero_picks(s).iter().map(|p| p.0["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(ids(&rt.state), ["tt1", "tt2", "tt3", "tt4", "tt5"], "by default the first row's");
+        assert_eq!(row_items(&rt.state, 0).len(), 3, "whose row starts after the hero's picks");
+        let key = catalog_key(&rt.state.catalogs[1]);
+        rt.update(|s, _| { s.settings.heroes = vec![key.clone()]; hero_changed(s) });
+        assert_eq!(ids(&rt.state)[0], "tt9");
+        assert_eq!((row_items(&rt.state, 0).len(), row_items(&rt.state, 1).len()), (8, 3), "now the chosen row skips them");
+        assert_eq!(hero_picks(&rt.state)[0].1, "Popular Shows");
+        rt.update(|s, _| { s.settings.heroes = vec!["watchlist".into()]; hero_changed(s) });
+        assert_eq!(ids(&rt.state)[0], "tt1", "an empty Watchlist: the first row's");
+        // Several: in turn, each title labelled with its section.
+        rt.update(|s, _| { s.saved = vec![json!({ "_id": "tt42", "type": "movie", "name": "Saved" })]; s.settings.heroes = vec!["watchlist".into(), key.clone(), "upnext".into()] });
+        let picks = hero_picks(&rt.state);
+        assert_eq!(ids(&rt.state), ["tt42", "tt9", "tt1", "tt10", "tt2", "tt11"], "round robin, six for three sections");
+        assert_eq!(picks.iter().map(|p| p.1.as_str()).collect::<Vec<_>>(), ["Watchlist", "Popular Shows", "Up Next", "Popular Shows", "Up Next", "Popular Shows"]);
+        assert_eq!(row_items(&rt.state, 1).len(), 5, "the row skips the three the hero shows");
+        rt.update(|s, _| s.settings.heroes = vec!["gone|movie|x".into()]);
+        assert_eq!(ids(&rt.state)[0], "tt1", "a catalog no longer installed: the first row's");
+    }
+
+    #[test]
+    fn a_person_on_a_detail_page_searches_their_name() {
+        let mut rt = runtime(|s| {
+            demo(s);
+            let mut m = s.items[&0][0].clone();
+            for (k, v) in demo_credits().as_object().unwrap() { m[k] = v.clone() }
+            s.meta_id = "tt1".into();
+            s.meta = Some(m);
+            s.page = Page::Detail;
+            s.search.cats = vec![demo_cat("movie", "Movies")];
+        });
+        // Cast & Crew sits under the hero: scroll down to it first.
+        rt.wheel(640.0, 400.0, -400.0);
+        for _ in 0..30 { rt.frame(1.0 / 60.0); }
+        click(&mut rt, "person-1");
+        assert!(rt.state.page == Page::Search);
+        assert_eq!(rt.state.search.query.text, "Ines Kovač");
+        assert!(!rt.state.search.debounce.is_pending(), "asked at once, not after typing");
+        rt.state.tx.send(Msg::Search("Ines Kovač".into(), 0, vec![json!({ "id": "tt7", "type": "movie", "name": "Her Film" })])).unwrap();
+        rt.update(|s, tx| { poll(s, 0.0, tx); });
+        assert_eq!(rt.state.search.results[&0].len(), 1, "the answers for the name land");
+    }
+
+    #[test]
+    fn cast_photos_come_from_the_first_addon_that_has_them() {
+        let mut rt = runtime(|s| {
+            demo(s);
+            let mut m = s.items[&0][0].clone();
+            for (k, v) in demo_credits().as_object().unwrap() { m[k] = v.clone() }
+            s.meta_id = "tt1".into();
+            s.meta = Some(m);
+            s.page = Page::Detail;
+        });
+        let cast = |who: &str| vec![json!({ "name": "Ines Kovač", "character": who, "photo": "https://image.tmdb.org/t/p/face/a.jpg" })];
+        for msg in [Msg::Cast("tt9".into(), cast("Other title")), Msg::Cast("tt1".into(), vec![]),
+            Msg::Cast("tt1".into(), cast("Lena Voss")), Msg::Cast("tt1".into(), cast("Second addon"))] { rt.state.tx.send(msg).unwrap() }
+        rt.update(|s, tx| { poll(s, 0.0, tx); });
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.people.len(), 1);
+        assert_eq!(rt.state.people[0]["character"], "Lena Voss");
+        let people = ui::credits(&rt.state, rt.state.meta.as_ref().unwrap());
+        let ines = people.iter().find(|p| p.0 == "Ines Kovač").unwrap();
+        assert_eq!(ines.1, ["Lena Voss"]);
+        assert!(ines.2.is_some(), "with the addon's photo");
+        assert_eq!(people[0].1, ["Director", "Writer"], "directors first, roles merged");
     }
 
     #[test]

@@ -56,12 +56,15 @@ pub struct Settings {
     pub hwdec: bool,
     /// Playback volume, percent (set from the player's volume control).
     pub volume: u32,
+    /// What the Home hero cycles through, in the order picked: `watchlist`, `upnext`, or catalogs
+    /// by `catalog_key`; empty = the first row's titles (see `hero_sources`).
+    pub heroes: Vec<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings { audio_lang: String::new(), sub_lang: String::new(), sub_size: 100, sub_color: "#FFFFFF".into(),
-            sub_style: "outline".into(), seek_ms: 5000, hide_ms: 2500, hwdec: true, volume: 100 }
+            sub_style: "outline".into(), seek_ms: 5000, hide_ms: 2500, hwdec: true, volume: 100, heroes: vec![] }
     }
 }
 
@@ -213,6 +216,42 @@ fn player_card(s: &State) -> El {
         .child(line("Hardware decoding", toggle("hwdec", p.hwdec).on_press(|s: &mut State| set(s, |p| p.hwdec = !p.hwdec)))))
 }
 
+/// The hero's choices: the first row, the Watchlist, Up Next, then every catalog (a name two
+/// addons share carries the addon's).
+fn hero_choices(s: &State) -> Vec<(String, String)> {
+    let fixed = [("", "First row"), ("watchlist", "Watchlist"), ("upnext", "Up Next")].map(|(k, n)| (k.to_string(), n.to_string()));
+    let shared = |c: &Catalog| s.catalogs.iter().filter(|o| o.name == c.name).count() > 1;
+    fixed.into_iter().chain(s.catalogs.iter().map(|c| (catalog_key(c), if shared(c) { format!("{} · {}", c.name, c.addon) } else { c.name.clone() }))).collect()
+}
+
+/// Pick any number of sections for the hero to cycle through; First row clears the rest. The
+/// choices stay open while picking.
+fn home_card(s: &State) -> El {
+    let choices = hero_choices(s);
+    let picked = |k: &str| if k.is_empty() { s.settings.heroes.is_empty() } else { s.settings.heroes.iter().any(|h| h == k) };
+    let names: Vec<&str> = s.settings.heroes.iter().filter_map(|h| choices.iter().find(|c| &c.0 == h).map(|c| c.1.as_str())).collect();
+    let current = match names.len() { 0 => "First row".to_string(), 1 => names[0].to_string(), n => format!("{n} sections") };
+    let open = s.choice == Some("hero");
+    let head = line("Hero shows", tap(row().key("hero").h(36.0).px(16.0).gap(8.0).radius(18.0).center_y()
+        .fill(if open { ink(0.16) } else { ink(0.08) }).hover(ink(0.14))
+        .child(label(current, 15.0, 600.0, Color::WHITE)).child(label(if open { "▴" } else { "▾" }, 12.0, 500.0, ink(0.6))))
+        .on_press(|s: &mut State| s.choice = if s.choice == Some("hero") { None } else { Some("hero") }));
+    let mut body = col().w_full().child(head);
+    if open {
+        let mut grid = row().w_full().gap(6.0).flex_wrap().px(14.0).pb(12.0);
+        for (i, (k, n)) in choices.iter().enumerate() {
+            let k = k.clone();
+            grid = grid.child(chip(format!("hero-{i}"), n.clone(), picked(&k)).on_press(move |s: &mut State| {
+                let k = k.clone();
+                set(s, |p| if k.is_empty() { p.heroes.clear() } else if let Some(at) = p.heroes.iter().position(|h| *h == k) { p.heroes.remove(at); } else { p.heroes.push(k) });
+                hero_changed(s);
+            }));
+        }
+        body = body.child(label("Pick several to cycle through them.", 13.0, 500.0, ink(0.5)).px(14.0).pb(10.0)).child(grid);
+    }
+    card("HOME", body)
+}
+
 fn quiet(words: &str) -> El { label(words.to_string(), 15.0, 500.0, ink(0.55)) }
 
 fn server_card(s: &State) -> El {
@@ -283,5 +322,5 @@ pub fn view(s: &State) -> El {
     col().w_full().pt(104.0).pb(56.0).items_center().child(
         col().w_full().max_w(880.0).px(PAD).gap(32.0)
             .child(label("Settings", 40.0, 700.0, Color::WHITE).font(TextStyle::new(40.0, 700.0).tracking(-0.8)))
-            .child(account(s)).child(player_card(s)).child(server_card(s)).child(about(s)))
+            .child(account(s)).child(player_card(s)).child(home_card(s)).child(server_card(s)).child(about(s)))
 }

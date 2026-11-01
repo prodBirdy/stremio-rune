@@ -6,6 +6,8 @@
 //! account's copy is fetched first and only its watch state changes; a title watched for the
 //! first time gets a complete new item, flagged `temp` as Stremio does for titles watched
 //! without being added to the library.
+//!
+//! The library proper (added, not `temp`) is the Watchlist: titles go on and off it here too.
 
 use super::*;
 use std::time::SystemTime;
@@ -87,11 +89,68 @@ fn save(s: &mut State, stopping: bool) {
     let mut all: Vec<Value> = s.library.iter().filter(|i| i["_id"] != item["_id"]).cloned().collect();
     all.push(item.clone());
     s.library = continue_watching(all);
+    if let Some(on) = s.saved.iter_mut().find(|i| i["_id"] == item["_id"]) { *on = item.clone() }
     let Some(key) = s.auth.clone() else { return };
     spawn(s, move || {
         api("datastorePut", json!({ "authKey": key, "collection": "libraryItem", "changes": [item] }))?;
         Ok(Msg::Saved)
     });
+}
+
+/// The Watchlist: what Stremio's Library lists (added, not removed, not just watched), the
+/// latest change first.
+pub fn listed(items: &[Value]) -> Vec<Value> {
+    let mut v: Vec<Value> = items.iter().filter(|i| i["removed"] != true && i["temp"] != true && i["type"] != "other").cloned().collect();
+    v.sort_by(|a, b| b["_mtime"].as_str().cmp(&a["_mtime"].as_str()));
+    v
+}
+
+/// The open title's library id (its meta's id, as `start` writes it).
+fn title_id(s: &State) -> String {
+    s.meta.as_ref().and_then(|m| m["id"].as_str()).unwrap_or(&s.meta_id).to_string()
+}
+
+pub fn on_list(s: &State) -> bool {
+    let id = title_id(s);
+    s.saved.iter().any(|i| i["_id"] == id.as_str())
+}
+
+/// Put the open title on the Watchlist or take it off: here at once, then in the account, from
+/// its copy there so the watch state is kept.
+pub fn toggle(s: &mut State) {
+    let Some(m) = s.meta.clone() else { return };
+    let (id, add, now) = (title_id(s), !on_list(s), iso_now());
+    if add {
+        let mut item = new_item(&m, &now);
+        mark(&mut item, true, &now);
+        s.saved.insert(0, item);
+    } else {
+        s.saved.retain(|i| i["_id"] != id.as_str());
+    }
+    let Some(key) = s.auth.clone() else { return };
+    spawn(s, move || {
+        let r = api("datastoreGet", json!({ "authKey": key, "collection": "libraryItem", "ids": [id], "all": false }))?;
+        let mut item = r.as_array().and_then(|a| a.first().cloned()).unwrap_or_else(|| new_item(&m, &now));
+        mark(&mut item, add, &now);
+        api("datastorePut", json!({ "authKey": key, "collection": "libraryItem", "changes": [item.clone()] }))?;
+        Ok(Msg::Listed(item))
+    });
+}
+
+/// On the list: not removed and no longer `temp`; off it: removed, as Stremio's Remove does.
+fn mark(item: &mut Value, add: bool, now: &str) {
+    item["removed"] = (!add).into();
+    item["temp"] = false.into();
+    item["_mtime"] = now.into();
+}
+
+/// The account took a Watchlist change: its item replaces the one shown.
+pub fn listed_landed(s: &mut State, item: Value) {
+    s.saved.retain(|i| i["_id"] != item["_id"]);
+    if item["removed"] != true { s.saved.insert(0, item.clone()) }
+    let mut all: Vec<Value> = s.library.iter().filter(|i| i["_id"] != item["_id"]).cloned().collect();
+    all.push(item);
+    s.library = continue_watching(all);
 }
 
 /// Fold a save into the item's watch state (times in milliseconds, as Stremio stores them).
@@ -169,6 +228,23 @@ mod tests {
         assert_eq!(iso(0), "1970-01-01T00:00:00.000Z");
         assert_eq!(iso(951_782_400_000), "2000-02-29T00:00:00.000Z");
         assert_eq!(iso(1_793_467_752_123), "2026-10-31T17:29:12.123Z");
+    }
+
+    #[test]
+    fn watchlist_is_the_added_items_and_marking_keeps_the_watch_state() {
+        let meta = json!({ "id": "tt1", "type": "movie", "name": "X" });
+        let mut watched = new_item(&meta, "t0");
+        apply(&mut watched, 600.0, 6000.0, 600_000.0, false, "t1");
+        assert!(listed(&[watched.clone()]).is_empty(), "watched without adding: not on the list");
+        mark(&mut watched, true, "t2");
+        assert_eq!((watched["removed"].as_bool(), watched["temp"].as_bool()), (Some(false), Some(false)));
+        assert_eq!(watched["state"]["timeOffset"], 600_000, "progress kept");
+        let mut older = new_item(&json!({ "id": "tt2", "type": "series", "name": "Y" }), "t0");
+        mark(&mut older, true, "t1");
+        let ids: Vec<_> = listed(&[older.clone(), watched.clone()]).iter().map(|i| i["_id"].clone()).collect();
+        assert_eq!(ids, ["tt1", "tt2"], "latest change first");
+        mark(&mut watched, false, "t3");
+        assert_eq!(listed(&[watched]).len(), 0);
     }
 
     #[test]

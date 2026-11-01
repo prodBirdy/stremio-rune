@@ -1,8 +1,8 @@
 //! The player page: the video, drawn by Rune from mpv's frames (`video.rs`), filling the window,
 //! and over it the loader while it loads and, while the mouse is active, back and the title
 //! along the top and the bar along the bottom, each on a scrim and fading in and out, and the
-//! Audio & Subtitles or Quality panel on the right. Double-click toggles fullscreen; the cursor
-//! hides with the controls.
+//! Audio & Subtitles, Quality or Cast panel on the right. Double-click toggles fullscreen; the
+//! cursor hides with the controls. While casting (`cast`), the TV's controls cover the video.
 
 use super::*;
 
@@ -90,10 +90,11 @@ fn fullscreen(s: &mut State, tx: &mut Tx) {
 /// A click on the video plays or pauses; with a side panel open it closes the panel instead.
 /// A double-click toggles pause twice (no change) and switches fullscreen.
 fn click_video(s: &mut State) {
-    if s.subs_open || s.quality_open {
-        (s.subs_open, s.quality_open) = (false, false);
+    if s.subs_open || s.quality_open || s.cast_open {
+        (s.subs_open, s.quality_open, s.cast_open) = (false, false, false);
         return;
     }
+    if s.cast.is_some() { return }
     mpv(s, &["cycle", "pause"]);
 }
 
@@ -154,7 +155,7 @@ pub(super) fn player(s: &State) -> El {
     let p = &s.playback;
     let mut stage = col().grow(1.0).min_w(0.0).h_full()
         .child(el().key("video").w_full().grow(1.0).on_press(click_video).on_double_press_tx(fullscreen));
-    if p.loading() { stage = stage.child(loader(s)) }
+    if let Some(c) = &s.cast { stage = stage.child(casting(s, c)) } else if p.loading() { stage = stage.child(loader(s)) }
     if s.controls {
         // Back and the title along the top, below the title strip, on a scrim of their own.
         stage = stage.child(row().key("top-bar").pin(Some(0.0), Some(0.0), Some(0.0), None).h(BAR + 48.0 + top(s))
@@ -166,10 +167,13 @@ pub(super) fn player(s: &State) -> El {
                 .child(icon(s, |i| &i.back, 20.0))).on_press(stop))
             .child(label(s.meta.as_ref().map(|m| s_(&m["name"]).to_string()).unwrap_or_default(), 17.0, 600.0, Color::WHITE)
                 .truncate().grow(1.0).min_w(0.0)));
-        stage = stage.child(col().key("controls").w_full().pt(72.0)
-            .linear_gradient(0.0, [(0.0, Color::BLACK.alpha(0.82)), (1.0, Color::BLACK.alpha(0.0))])
-            .transition(Transition::opacity())
-            .child(bar(s)));
+        // While casting, the TV's own controls (`casting`) stand in for the bar.
+        if s.cast.is_none() {
+            stage = stage.child(col().key("controls").w_full().pt(72.0)
+                .linear_gradient(0.0, [(0.0, Color::BLACK.alpha(0.82)), (1.0, Color::BLACK.alpha(0.0))])
+                .transition(Transition::opacity())
+                .child(bar(s)));
+        }
     }
     let mut root = row().key("player").w_full().h_full().fill(Color::BLACK)
         .native_surface(&s.video, SurfaceFit::Fit)
@@ -181,8 +185,54 @@ pub(super) fn player(s: &State) -> El {
         })
         .cursor(if s.controls { Cursor::Default } else { Cursor::Hidden })
         .child(stage);
-    if s.subs_open { root = root.child(subtitles(s)) } else if s.quality_open { root = root.child(quality(s)) }
+    if s.subs_open { root = root.child(subtitles(s)) } else if s.quality_open { root = root.child(quality(s)) } else if s.cast_open { root = root.child(tvs(s)) }
     root
+}
+
+/// Over the video while a TV plays: which TV, the title, play/pause, a seek bar and Stop.
+fn casting(s: &State, c: &cast::Session) -> El {
+    let frac = if c.dur > 0.0 { (c.pos / c.dur) as f32 } else { 0.0 };
+    let time = |secs: f64| label(clock(secs), 14.0, 500.0, ink(0.85)).font(TextStyle::new(14.0, 500.0).features("'tnum' 1"));
+    let track = row().key("cast-seek").grow(1.0).min_w(0.0).h(BAR).center_y().cursor(Cursor::Pointer)
+        .on_layout(|s: &mut State, r| s.seek_w = r[2])
+        .on_drag(|s: &mut State, d: &mut Drag, _: &mut Tx| {
+            let Some(dur) = s.cast.as_ref().map(|c| c.dur).filter(|&d| d > 0.0) else { return };
+            if d.phase == Phase::Up && !d.cancelled() { cast::seek(s, (d.x / d.w.max(1.0)).clamp(0.0, 1.0) as f64 * dur) }
+        })
+        .child(progress(frac, 4.0).w_full());
+    let toggle = tap(row().key("cast-toggle").size(64.0, 64.0).radius(32.0).center().fill(ink(0.14)).hover(ink(0.22))
+        .child(icon(s, |i| if c.paused { &i.play } else { &i.pause }, 26.0)))
+        .on_press(cast::toggle_pause);
+    let title = s.meta.as_ref().map(|m| s_(&m["name"]).to_string()).unwrap_or_default();
+    all(el()).key("casting").fill(bg()).center().child(col().w(560.0).gap(18.0).items_center()
+        .child(icon(s, |i| &i.cast, 44.0).opacity(0.85))
+        .child(label(format!("Playing on {}", c.name), 15.0, 600.0, ink(0.6)))
+        .child(label(title, 30.0, 700.0, Color::WHITE).truncate())
+        .child(el().h(8.0))
+        .child(toggle)
+        .child(row().w_full().gap(12.0).center_y().child(time(c.pos)).child(track).child(time(c.dur)))
+        .child(tap(row().key("cast-stop").h(40.0).px(18.0).mt(6.0).radius(20.0).center().fill(ink(0.08)).hover(ink(0.14))
+            .child(label("Stop casting", 15.0, 600.0, Color::WHITE)))
+            .on_press(cast::stop)))
+}
+
+/// The TVs the streaming server found; a pick plays there from here.
+fn tvs(s: &State) -> El {
+    let found = cast::tvs(&s.cast_devices);
+    let mut list = col();
+    if found.is_empty() {
+        list = list.child(row().w_full().px(14.0).py(10.0).gap(12.0).center_y().child(spinner().scale(0.5))
+            .child(label("Looking for TVs on your network…", 15.0, 500.0, ink(0.7))))
+            .child(label("Chromecasts and DLNA TVs on the same Wi-Fi show up here. Stremio's streaming server finds them.", 13.0, 400.0, ink(0.5))
+                .font(TextStyle::new(13.0, 400.0).lh(19.0)).wrap().px(14.0));
+    }
+    for d in found {
+        let (id, name) = (s_(&d["id"]).to_string(), d["name"].as_str().unwrap_or(s_(&d["id"])).to_string());
+        let kind = if d["type"] == "chromecast" { "Chromecast" } else { "TV (DLNA)" };
+        let device = d.clone();
+        list = list.child(option(format!("tv-{id}"), name, kind, false).on_press(move |s: &mut State| cast::start(s, device.clone())));
+    }
+    panel(s, "tvs", "Cast to TV", list)
 }
 
 fn bar(s: &State) -> El {
@@ -228,10 +278,11 @@ fn bar(s: &State) -> El {
         bar = bar.child(tap(row().key("quality").h(32.0).px(12.0).radius(16.0).center().border(1.0, ink(0.35))
             .fill(if s.quality_open { ink(0.16) } else { Color::TRANSPARENT }).hover(ink(0.14))
             .child(label(now, 13.0, 650.0, Color::WHITE)))
-            .on_press(|s: &mut State| { s.quality_open = !s.quality_open; s.subs_open = false }));
+            .on_press(|s: &mut State| { s.quality_open = !s.quality_open; s.subs_open = false; s.cast_open = false }));
     }
-    bar.child(round("subs", s.subs_open).child(icon(s, |i| &i.subs, 20.0))
-            .on_press(|s: &mut State| { s.subs_open = !s.subs_open; s.quality_open = false }))
+    bar.child(round("cast", s.cast_open).child(icon(s, |i| &i.cast, 20.0)).on_press(cast::toggle_list))
+        .child(round("subs", s.subs_open).child(icon(s, |i| &i.subs, 20.0))
+            .on_press(|s: &mut State| { s.subs_open = !s.subs_open; s.quality_open = false; s.cast_open = false }))
         .child(round("fullscreen", false).child(icon(s, |i| if s.fullscreen { &i.shrink } else { &i.expand }, 18.0))
             .on_press_tx(fullscreen))
 }
@@ -257,7 +308,7 @@ fn panel(s: &State, key: &str, title: &str, list: El) -> El {
         .child(row().w_full().px(6.0).center_y()
             .child(label(title.to_string(), 22.0, 700.0, Color::WHITE).grow(1.0))
             .child(tap(row().key("panel-close").size(36.0, 36.0).radius(18.0).center().hover(ink(0.12))
-                .child(icon(s, |i| &i.close, 16.0))).on_press(|s: &mut State| { s.subs_open = false; s.quality_open = false })))
+                .child(icon(s, |i| &i.close, 16.0))).on_press(|s: &mut State| { s.subs_open = false; s.quality_open = false; s.cast_open = false })))
         .child(list.w_full().gap(2.0).pb(24.0).scroll(ScrollSpec { stick_bottom: false }).grow(1.0).shrink().min_h(0.0))
 }
 
