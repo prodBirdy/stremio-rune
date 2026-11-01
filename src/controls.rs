@@ -122,7 +122,9 @@ fn want_preview(s: &mut State, f: f32) {
     if s.playback.dur <= 0.0 || s.playing.is_empty() { return }
     let t = preview::bucket(f as f64 * s.playback.dur);
     if s.images.contains_key(&preview::key(&s.playing, t)) { return }
-    if let Some(p) = &s.preview { p.want(t) }
+    // The preview core opens the stream on the first hover, not with every playback.
+    let p = s.preview.get_or_insert_with(|| preview::Preview::start(s.playing.clone(), s.tx.clone(), s.waker.clone()));
+    p.want(t)
 }
 
 /// A soft light band sweeping across a `w`×`h` box, left to right: something on its way.
@@ -141,7 +143,7 @@ fn seek_preview(s: &State, f: f32) -> El {
     let b = preview::bucket(t);
     let made = |x: f64| s.images.get(&preview::key(&s.playing, x));
     let exact = made(b);
-    let near = exact.or_else(|| (1..=6).flat_map(|k| [b - k as f64 * preview::BUCKET, b + k as f64 * preview::BUCKET]).find_map(made));
+    let near = exact.or_else(|| (1..=preview::AHEAD).flat_map(|k| [b - k as f64 * preview::BUCKET, b + k as f64 * preview::BUCKET]).find_map(made));
     let mut frame = el().w(W).h(W * 9.0 / 16.0).radius(10.0).clip_rounded(10.0).fill(Color::BLACK).border(1.0, ink(0.2));
     if let Some(img) = near { frame = frame.pixels_fit(img.pixels(), SurfaceFit::Fit) }
     if exact.is_none() { frame = frame.child(shimmer(W, W * 9.0 / 16.0)) }

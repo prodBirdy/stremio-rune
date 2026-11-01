@@ -1,10 +1,11 @@
 //! Seek-bar previews, YouTube-style: a frame of the playing video at the time under the
-//! pointer. A second, hidden mpv core opens the same stream (no audio, no cache, software
-//! decoding), jumps to the keyframe at or before the time and draws that frame small with the
+//! pointer. A second, hidden mpv core opens the same stream on the first hover (no audio, no
+//! cache, hardware decoding where there is some), jumps to the keyframe at or before the time and draws that frame small with the
 //! player's own renderer (`video::Snapshot`), so it looks like the video; it lands in the app's
 //! images like a poster (`Msg::Image`, under `key`), so the image budget covers it.
 //! Only the newest request is worked on: sweeping the bar doesn't queue up seeks. Between
-//! requests it makes the rest, outward from the last one, so most hovers find theirs ready.
+//! requests it makes the ones within `AHEAD` buckets of the last, outward, so nearby hovers find
+//! theirs ready; never while the player is waiting for data (`hold`), so it doesn't compete.
 
 use crate::Msg;
 use crate::player::{command, sym};
@@ -23,8 +24,10 @@ pub const BUCKET: f64 = 10.0;
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 180;
 /// Rest between previews made ahead, so they take a share of the bandwidth, not all of it.
-// ponytail: a fixed pause, not paced by playback's cache; make it wait while the player buffers if previews ever starve it.
 const AHEAD_PAUSE: Duration = Duration::from_secs(1);
+/// Previews made ahead reach this many buckets either side of the last request: as far as the
+/// seek bar looks for a nearby one to show meanwhile (controls.rs).
+pub const AHEAD: i64 = 6;
 
 // mpv event ids (client.h).
 const SHUTDOWN: c_int = 1;
@@ -46,13 +49,15 @@ pub fn bucket(t: f64) -> f64 { (t.max(0.0) / BUCKET).floor() * BUCKET }
 fn next_ahead(center: f64, dur: f64, made: &HashSet<u64>) -> Option<f64> {
     let n = (dur / BUCKET).ceil() as i64;
     let c = (center / BUCKET) as i64;
-    (0..=n.max(c)).flat_map(|k| [c + k, c - k]).find(|i| (0..n).contains(i) && !made.contains(&(*i as u64))).map(|i| i as f64 * BUCKET)
+    (0..=AHEAD).flat_map(|k| [c + k, c - k]).find(|i| (0..n).contains(i) && !made.contains(&(*i as u64))).map(|i| i as f64 * BUCKET)
 }
 
 /// Previews of one stream, made on a thread of their own. Drop it to stop.
 pub struct Preview {
     want: Arc<(Mutex<Option<f64>>, Condvar)>,
     quit: Arc<AtomicBool>,
+    /// The player is waiting for data: make no previews ahead meanwhile.
+    hold: Arc<AtomicBool>,
     /// The last time asked for: the pointer moving within one bucket asks once.
     asked: std::cell::Cell<f64>,
 }
@@ -61,10 +66,18 @@ impl Preview {
     /// Start opening `url`; previews land in `tx` as `Msg::Image`, then `wake` runs.
     pub fn start(url: String, tx: Sender<Msg>, wake: Option<Waker>) -> Preview {
         let want = Arc::new((Mutex::new(None), Condvar::new()));
-        let quit = Arc::new(AtomicBool::new(false));
-        let (w, q) = (want.clone(), quit.clone());
-        std::thread::spawn(move || if let Err(e) = run(&url, &w, &q, &tx, wake.as_ref()) { eprintln!("preview: {e}") });
-        Preview { want, quit, asked: std::cell::Cell::new(-1.0) }
+        let (quit, hold) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (w, q, h) = (want.clone(), quit.clone(), hold.clone());
+        let thread = std::thread::spawn(move || if let Err(e) = run(&url, &w, &q, &h, &tx, wake.as_ref()) { eprintln!("preview: {e}") });
+        let mut threads = THREADS.lock().unwrap();
+        threads.retain(|t| !t.2.is_finished());
+        threads.push((quit.clone(), want.clone(), thread));
+        Preview { want, quit, hold, asked: std::cell::Cell::new(-1.0) }
+    }
+
+    /// Whether the player is waiting for data (buffering, seeking): previews ahead wait for it.
+    pub fn hold(&self, on: bool) {
+        if self.hold.swap(on, Ordering::Relaxed) && !on { self.want.1.notify_one() }
     }
 
     /// Make the preview at `t` (a bucket start) next, instead of any still waiting.
@@ -75,6 +88,25 @@ impl Preview {
     }
 }
 
+/// Every preview thread not known to have ended: its quit flag, its wake-up, its handle.
+type Thread = (Arc<AtomicBool>, Arc<(Mutex<Option<f64>>, Condvar)>, std::thread::JoinHandle<()>);
+static THREADS: Mutex<Vec<Thread>> = Mutex::new(Vec::new());
+
+/// Stop every preview thread and wait for them to tear their mpv down, for up to `limit`: a
+/// process exiting under one (its decoder's driver unloading first) can crash.
+pub fn shutdown(limit: Duration) {
+    let threads = std::mem::take(&mut *THREADS.lock().unwrap());
+    for (quit, want, _) in &threads {
+        quit.store(true, Ordering::Relaxed);
+        want.1.notify_one();
+    }
+    let until = Instant::now() + limit;
+    for (_, _, t) in threads {
+        while !t.is_finished() && Instant::now() < until { std::thread::sleep(Duration::from_millis(5)) }
+        if t.is_finished() { let _ = t.join(); }
+    }
+}
+
 impl Drop for Preview {
     fn drop(&mut self) {
         self.quit.store(true, Ordering::Relaxed);
@@ -82,7 +114,7 @@ impl Drop for Preview {
     }
 }
 
-fn run(url: &str, want: &(Mutex<Option<f64>>, Condvar), quit: &AtomicBool, tx: &Sender<Msg>, wake: Option<&Waker>) -> Result<(), String> {
+fn run(url: &str, want: &(Mutex<Option<f64>>, Condvar), quit: &AtomicBool, hold: &AtomicBool, tx: &Sender<Msg>, wake: Option<&Waker>) -> Result<(), String> {
     let create: unsafe extern "C" fn() -> *mut c_void = sym(b"mpv_create\0")?;
     let set: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int = sym(b"mpv_set_option_string\0")?;
     let init: unsafe extern "C" fn(*mut c_void) -> c_int = sym(b"mpv_initialize\0")?;
@@ -93,9 +125,10 @@ fn run(url: &str, want: &(Mutex<Option<f64>>, Condvar), quit: &AtomicBool, tx: &
     let ctx = unsafe { create() };
     if ctx.is_null() { return Err("mpv_create failed".into()) }
     let result = (|| {
-        // vd-lavc-skiploopfilter: HEVC/H.264 decode faster without deblocking, unseen at this size.
+        // Hardware decoding: a 4K HEVC keyframe on the CPU takes cores. vd-lavc-skiploopfilter:
+        // software decoding (no hardware for the codec) skips deblocking, unseen at this size.
         for (k, v) in [("vo", "libmpv"), ("aid", "no"), ("sid", "no"), ("pause", "yes"), ("keep-open", "always"), ("cache", "no"),
-            ("hr-seek", "no"), ("hwdec", "no"), ("video-latency-hacks", "yes"), ("vd-lavc-skiploopfilter", "all"), ("ytdl", "no"),
+            ("hr-seek", "no"), ("hwdec", "auto-safe"), ("video-latency-hacks", "yes"), ("vd-lavc-skiploopfilter", "all"), ("ytdl", "no"),
             ("load-scripts", "no"), ("osc", "no"), ("input-default-bindings", "no")] {
             let (k, v) = (CString::new(k).unwrap(), CString::new(v).unwrap());
             unsafe { set(ctx, k.as_ptr(), v.as_ptr()) };
@@ -134,8 +167,9 @@ fn run(url: &str, want: &(Mutex<Option<f64>>, Condvar), quit: &AtomicBool, tx: &
         let dur: f64 = prop(c"duration").and_then(|d| d.parse().ok()).unwrap_or(0.0);
         let (mut made, mut center) = (HashSet::new(), None);
         loop {
-            // A request first; else, after a rest, the next one ahead of the last request.
-            let ahead = center.and_then(|c| next_ahead(c, dur, &made));
+            // A request first; else, after a rest, the next one ahead of the last request, unless
+            // the player is waiting for data.
+            let ahead = center.filter(|_| !hold.load(Ordering::Relaxed)).and_then(|c| next_ahead(c, dur, &made));
             let t = {
                 let mut w = want.0.lock().unwrap();
                 if w.is_none() && ahead.is_some() { w = want.1.wait_timeout(w, AHEAD_PAUSE).unwrap().0 }
@@ -185,6 +219,8 @@ mod tests {
         assert_eq!(next_ahead(30.0, 60.0, &made), None, "all six made");
         assert_eq!(next_ahead(100.0, 60.0, &HashSet::new()), Some(50.0), "a center past the end");
         assert_eq!(next_ahead(0.0, 0.0, &HashSet::new()), None, "no duration: nothing ahead");
+        let near: HashSet<u64> = (94..=106).collect();
+        assert_eq!(next_ahead(1000.0, 7200.0, &near), None, "only within AHEAD buckets of the last request");
     }
 
     /// TEST_STREAM: a video (file or URL). Previews at 60 s (opening the stream first) and then
@@ -210,5 +246,7 @@ mod tests {
             eprintln!("preview at {at} s: {}x{} in {:.2} s", img.width(), img.height(), t.elapsed().as_secs_f64());
             img.save(std::env::temp_dir().join("stremio-rune-preview-test.png")).unwrap();
         }
+        drop(p);
+        shutdown(Duration::from_secs(5));
     }
 }

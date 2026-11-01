@@ -890,8 +890,8 @@ fn play(s: &mut State, url: &str) {
             s.player = Some(p);
             library::start(s);
             s.playing = url.to_string();
-            // Seek-bar previews open the stream now, so the first hover needn't wait for it.
-            s.preview = Some(preview::Preview::start(url.to_string(), s.tx.clone(), s.waker.clone()));
+            s.preview = None; // opened on the first hover over the seek bar
+
             s.page = Page::Player;
             s.status.clear();
             s.controls = true;
@@ -936,7 +936,7 @@ fn switch_stream(s: &mut State, url: &str) {
     match p.switch(url, s.playback.pos) {
         Ok(()) => {
             s.playing = url.to_string();
-            s.preview = Some(preview::Preview::start(url.to_string(), s.tx.clone(), s.waker.clone()));
+            s.preview = None;
             s.playback.started = false; // the loader shows until the new stream's first frame
         }
         Err(e) => s.status = e,
@@ -1096,6 +1096,7 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
         let controls = p.paused || p.loading() || s.bar_hover || s.subs_open || s.quality_open || s.cast_open || s.last_move.elapsed() < Duration::from_millis(s.settings.hide_ms as u64);
         changed |= controls != s.controls;
         s.controls = controls;
+        if let Some(pv) = &s.preview { pv.hold(s.playback.loading()) }
         player.set_video_size(s.video_size.0, s.video_size.1);
         remember_volume(s);
         library::tick(s);
@@ -1512,6 +1513,7 @@ fn main() {
     }).on_window(window::chrome::set_main).on_focus(on_focus);
     let app = match std::env::var_os("STREMIO_RUNE_PACING") { Some(path) => app.on_frame_encoded(pacing(path.into())), None => app };
     app.run();
+    preview::shutdown(Duration::from_secs(2));
 }
 
 /// `STREMIO_RUNE_PACING=<file>`: every 10 s, append the frame pacing of the last 10 s to the
