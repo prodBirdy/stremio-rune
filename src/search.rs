@@ -63,7 +63,7 @@ pub fn run(s: &mut State, q: String) {
     for (i, c) in s.search.cats.iter().enumerate() {
         let (url, q) = (format!("{}/catalog/{}/{}/search={enc}.json", c.base, c.ty, c.id), q.clone());
         // Quiet on failure: one addon down shouldn't toast over the others' results.
-        spawn(s, move || Ok(Msg::Search(q, i, get(&url).map(|v| v["metas"].as_array().cloned().unwrap_or_default()).unwrap_or_default())));
+        spawn(s, move || Ok(Msg::Search(q, i, get(&url).map(metas).unwrap_or_default())));
     }
 }
 
@@ -93,7 +93,7 @@ fn hint(words: String) -> El {
 }
 
 pub fn view(s: &State) -> El {
-    let field = glass(text_input(&s.search.query, TextStyle::new(28.0, 500.0)).key("search-field").single_line()
+    let field = glass_flat(text_input(&s.search.query, TextStyle::new(28.0, 500.0)).key("search-field").single_line()
         .w_full().px(24.0).py(18.0).radius(18.0)).color(Color::WHITE)
         .placeholder("Search movies and shows".to_string(), ink(0.4))
         .on_edit(|s: &mut State| &mut s.search.query).on_input_change(typed)

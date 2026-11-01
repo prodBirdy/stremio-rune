@@ -131,7 +131,7 @@ fn addon_card(s: &State, a: &Value, key: String, actions: El) -> El {
     let m = &a["manifest"];
     let logo = m["logo"].as_str().filter(|u| u.starts_with("http")).map(|u| sized(u, 56.0));
     let types: Vec<&str> = m["types"].as_array().into_iter().flatten().map(|t| type_label(s_(t))).collect();
-    glass(row().key(key).w_full().padding(16.0).gap(16.0).radius(18.0))
+    glass_flat(row().key(key).w_full().padding(16.0).gap(16.0).radius(18.0))
         .child(picture(s, logo.as_deref()).size(56.0, 56.0).radius(12.0).clip_rounded(12.0))
         .child(col().grow(1.0).min_w(0.0).gap(6.0)
             .child(row().gap(8.0).center_y()
@@ -187,7 +187,7 @@ fn discover(s: &State) -> El {
 }
 
 fn from_url(s: &State) -> El {
-    let field = glass(text_input(&s.store.url, TextStyle::new(16.0, 400.0)).key("addon-url").single_line()
+    let field = glass_flat(text_input(&s.store.url, TextStyle::new(16.0, 400.0)).key("addon-url").single_line()
         .grow(1.0).min_w(0.0).px(16.0).py(12.0).radius(12.0)).color(Color::WHITE)
         .placeholder("Install from URL: paste an addon's manifest.json link".to_string(), ink(0.4))
         .on_edit(|s: &mut State| &mut s.store.url).on_submit(fetch);
