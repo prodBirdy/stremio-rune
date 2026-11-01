@@ -9,6 +9,7 @@
 
 mod library;
 mod player;
+mod preview;
 mod server;
 mod ui;
 mod update;
@@ -179,6 +180,11 @@ struct State {
     quality_open: bool,
     /// The stream URL playing.
     playing: String,
+    /// Seek-bar previews of the stream playing, once the bar has been hovered.
+    preview: Option<preview::Preview>,
+    /// Where the pointer is over the seek bar (a fraction of the video), and the bar's width.
+    seek_hover: Option<f32>,
+    seek_w: f32,
     /// Where mpv's frames land (`video.rs`), drawn by the player page, and the size they're
     /// rendered at (the video element's, in device pixels).
     video: rune::NativeSurface,
@@ -309,6 +315,9 @@ fn state() -> State {
         subs_open: false,
         quality_open: false,
         playing: String::new(),
+        preview: None,
+        seek_hover: None,
+        seek_w: 0.0,
         video: rune::NativeSurface::new(),
         video_size: (0, 0),
         scrub: None,
@@ -752,6 +761,7 @@ fn switch_stream(s: &mut State, url: &str) {
     match p.switch(url, s.playback.pos) {
         Ok(()) => {
             s.playing = url.to_string();
+            s.preview = None;
             s.playback.started = false; // the loader shows until the new stream's first frame
         }
         Err(e) => s.status = e,
@@ -764,6 +774,8 @@ fn stop(s: &mut State) {
     s.subs_open = false;
     s.quality_open = false;
     s.playing.clear();
+    s.preview = None;
+    s.seek_hover = None;
     s.controls = true;
     s.player = None; // stops mpv and its renderer
     s.video.clear();
@@ -1204,6 +1216,7 @@ fn main() {
             ("player", demo_player),
             ("loading", |s| { demo_player(s); s.playback = Playback { cache_pct: 40.0, ..Default::default() } }),
             ("quality", |s| { demo_player(s); s.quality_open = true }),
+            ("seek-preview", |s| { demo_player(s); s.seek_hover = Some(0.4) }),
             ("audio", |s| {
                 demo_player(s);
                 s.subs_open = true;

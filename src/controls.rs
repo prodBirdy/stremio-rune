@@ -109,11 +109,32 @@ fn volume_drag(s: &mut State, d: &mut Drag, _: &mut Tx) {
 
 fn seek(s: &mut State, d: &mut Drag, _: &mut Tx) {
     let f = (d.x / d.w.max(1.0)).clamp(0.0, 1.0);
-    if d.phase != Phase::Up { s.scrub = Some(f); return }
+    if d.phase != Phase::Up { s.scrub = Some(f); want_preview(s, f); return }
     s.scrub = None;
     if d.cancelled() || s.playback.dur <= 0.0 { return }
     s.playback.pos = f as f64 * s.playback.dur;
     mpv(s, &["seek", &s.playback.pos.to_string(), "absolute"]);
+}
+
+/// The seek-bar preview at fraction `f` of the video: asked for unless it's made.
+fn want_preview(s: &mut State, f: f32) {
+    if s.playback.dur <= 0.0 || s.playing.is_empty() { return }
+    let t = preview::bucket(f as f64 * s.playback.dur);
+    if s.images.contains_key(&preview::key(&s.playing, t)) { return }
+    let (url, tx, wake) = (s.playing.clone(), s.tx.clone(), s.waker.clone());
+    s.preview.get_or_insert_with(|| preview::Preview::start(url, tx, wake)).want(t);
+}
+
+/// Above the seek bar at fraction `f`: the frame there (once made) and its time.
+fn seek_preview(s: &State, f: f32) -> El {
+    const W: f32 = 224.0;
+    let t = f as f64 * s.playback.dur;
+    let mut frame = el().w(W).h(W * 9.0 / 16.0).radius(10.0).clip_rounded(10.0).fill(Color::BLACK).border(1.0, ink(0.2));
+    if let Some(img) = s.images.get(&preview::key(&s.playing, preview::bucket(t))) { frame = frame.pixels_fit(img.pixels(), SurfaceFit::Fit) }
+    let x = (f * s.seek_w - W / 2.0).clamp(0.0, (s.seek_w - W).max(0.0));
+    col().key("seek-preview").w(W).gap(6.0).items_center().pin(Some(x), None, None, Some(BAR / 2.0 + 14.0))
+        .child(frame.shadow(8.0, 24.0, Color::BLACK.alpha(0.5)))
+        .child(label(clock(t), 13.0, 600.0, Color::WHITE).font(TextStyle::new(13.0, 600.0).features("'tnum' 1")))
 }
 
 pub(super) fn player(s: &State) -> El {
@@ -161,8 +182,17 @@ fn bar(s: &State) -> El {
         .on_press(|s: &mut State| mpv(s, &["cycle", "pause"]));
     let time = |secs: f64| label(clock(secs), 14.0, 500.0, ink(0.85)).font(TextStyle::new(14.0, 500.0).features("'tnum' 1"));
     // The whole bar height is the drag target; the thin track is just its picture.
-    let track = row().key("seek").grow(1.0).min_w(0.0).h(BAR).center_y().cursor(Cursor::Pointer).on_drag(seek)
+    // Hovering it shows the frame at that point (`seek_preview`), as does scrubbing.
+    let mut track = row().key("seek").grow(1.0).min_w(0.0).h(BAR).center_y().cursor(Cursor::Pointer).on_drag(seek)
+        .on_layout(|s: &mut State, r| s.seek_w = r[2])
+        .on_pointer_move_local(|s: &mut State, e, _| {
+            let f = (e.x / s.seek_w.max(1.0)).clamp(0.0, 1.0);
+            s.seek_hover = Some(f);
+            want_preview(s, f);
+        })
+        .on_hover_change(|s: &mut State, inside, _| if !inside { s.seek_hover = None })
         .child(progress(frac, if s.scrub.is_some() { 6.0 } else { 4.0 }).w_full());
+    if let Some(f) = s.scrub.or(s.seek_hover).filter(|_| p.dur > 0.0) { track = track.child(seek_preview(s, f)) }
     let mut bar = row().key("bar").w_full().h(BAR).px(14.0).gap(10.0).center_y()
         .on_hover_change(|s: &mut State, inside, _| s.bar_hover = inside)
         .child(toggle);

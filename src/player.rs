@@ -92,7 +92,7 @@ struct Core(*mut c_void);
 #[cfg(any(windows, target_os = "macos"))]
 unsafe impl Send for Core {}
 
-fn command(ctx: *mut c_void, args: &[&str]) -> Result<(), String> {
+pub(crate) fn command(ctx: *mut c_void, args: &[&str]) -> Result<(), String> {
     let command: unsafe extern "C" fn(*mut c_void, *const *const c_char) -> c_int = sym(b"mpv_command\0")?;
     let args: Vec<CString> = args.iter().map(|a| cs(a)).collect();
     let argv: Vec<*const c_char> = args.iter().map(|a| a.as_ptr()).chain([std::ptr::null()]).collect();
