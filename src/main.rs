@@ -256,7 +256,8 @@ fn auth_file() -> PathBuf {
 /// in the storage files, so `setup` asks the API which one still works.
 #[cfg(not(target_os = "macos"))]
 fn stremio_desktop_auth() -> Vec<String> {
-    let dir = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+    let Some(local) = std::env::var_os("LOCALAPPDATA") else { return vec![] };
+    let dir = PathBuf::from(local)
         .join(r"Programs\Stremio\stremio-shell-ng.exe.WebView2\EBWebView\Default\Local Storage\leveldb");
     let mut files: Vec<_> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).collect();
     files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
