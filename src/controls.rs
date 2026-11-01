@@ -121,16 +121,29 @@ fn want_preview(s: &mut State, f: f32) {
     if s.playback.dur <= 0.0 || s.playing.is_empty() { return }
     let t = preview::bucket(f as f64 * s.playback.dur);
     if s.images.contains_key(&preview::key(&s.playing, t)) { return }
-    let (url, tx, wake) = (s.playing.clone(), s.tx.clone(), s.waker.clone());
-    s.preview.get_or_insert_with(|| preview::Preview::start(url, tx, wake)).want(t);
+    if let Some(p) = &s.preview { p.want(t) }
 }
 
-/// Above the seek bar at fraction `f`: the frame there (once made) and its time.
+/// A soft light band sweeping across a `w`×`h` box, left to right: something on its way.
+fn shimmer(w: f32, h: f32) -> El {
+    let band = w * 0.6;
+    el().w(band).h(h).absolute(0.0, 0.0)
+        .linear_gradient(PI / 2.0, [(0.0, Color::TRANSPARENT), (0.5, ink(0.16)), (1.0, Color::TRANSPARENT)])
+        .looping(rune::LoopSpec::slide(1.3, [-1.0, 0.0], [w / band, 0.0]).easing(rune::Easing::LINEAR))
+}
+
+/// Above the seek bar at fraction `f`: the frame there and its time. Until that frame is made,
+/// the nearest one made (within a minute) under a shimmer, or just the shimmer.
 fn seek_preview(s: &State, f: f32) -> El {
     const W: f32 = 224.0;
     let t = f as f64 * s.playback.dur;
+    let b = preview::bucket(t);
+    let made = |x: f64| s.images.get(&preview::key(&s.playing, x));
+    let exact = made(b);
+    let near = exact.or_else(|| (1..=6).flat_map(|k| [b - k as f64 * preview::BUCKET, b + k as f64 * preview::BUCKET]).find_map(made));
     let mut frame = el().w(W).h(W * 9.0 / 16.0).radius(10.0).clip_rounded(10.0).fill(Color::BLACK).border(1.0, ink(0.2));
-    if let Some(img) = s.images.get(&preview::key(&s.playing, preview::bucket(t))) { frame = frame.pixels_fit(img.pixels(), SurfaceFit::Fit) }
+    if let Some(img) = near { frame = frame.pixels_fit(img.pixels(), SurfaceFit::Fit) }
+    if exact.is_none() { frame = frame.child(shimmer(W, W * 9.0 / 16.0)) }
     let x = (f * s.seek_w - W / 2.0).clamp(0.0, (s.seek_w - W).max(0.0));
     col().key("seek-preview").w(W).gap(6.0).items_center().pin(Some(x), None, None, Some(BAR / 2.0 + 14.0))
         .child(frame.shadow(8.0, 24.0, Color::BLACK.alpha(0.5)))

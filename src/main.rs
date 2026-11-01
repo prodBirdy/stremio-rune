@@ -180,7 +180,7 @@ struct State {
     quality_open: bool,
     /// The stream URL playing.
     playing: String,
-    /// Seek-bar previews of the stream playing, once the bar has been hovered.
+    /// Seek-bar previews of the stream playing.
     preview: Option<preview::Preview>,
     /// Where the pointer is over the seek bar (a fraction of the video), and the bar's width.
     seek_hover: Option<f32>,
@@ -717,6 +717,8 @@ fn play(s: &mut State, url: &str) {
             s.player = Some(p);
             library::start(s);
             s.playing = url.to_string();
+            // Seek-bar previews open the stream now, so the first hover needn't wait for it.
+            s.preview = Some(preview::Preview::start(url.to_string(), s.tx.clone(), s.waker.clone()));
             s.page = Page::Player;
             s.status.clear();
             s.controls = true;
@@ -761,7 +763,7 @@ fn switch_stream(s: &mut State, url: &str) {
     match p.switch(url, s.playback.pos) {
         Ok(()) => {
             s.playing = url.to_string();
-            s.preview = None;
+            s.preview = Some(preview::Preview::start(url.to_string(), s.tx.clone(), s.waker.clone()));
             s.playback.started = false; // the loader shows until the new stream's first frame
         }
         Err(e) => s.status = e,

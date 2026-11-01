@@ -16,7 +16,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Previews are made every this many seconds of the video.
-const BUCKET: f64 = 10.0;
+pub const BUCKET: f64 = 10.0;
 /// Width of a preview frame, in pixels.
 const WIDTH: u32 = 320;
 /// Rest between previews made ahead, so they take a share of the bandwidth, not all of it.
@@ -91,21 +91,29 @@ fn run(url: &str, want: &(Mutex<Option<f64>>, Condvar), quit: &AtomicBool, tx: &
     if ctx.is_null() { return Err("mpv_create failed".into()) }
     let result = (|| {
         let scale = format!("scale={WIDTH}:-2");
+        // vd-lavc-skiploopfilter: HEVC/H.264 decode faster without deblocking, unseen at this size.
         for (k, v) in [("vo", "null"), ("aid", "no"), ("sid", "no"), ("pause", "yes"), ("keep-open", "always"), ("cache", "no"),
-            ("hr-seek", "no"), ("hwdec", "no"), ("video-latency-hacks", "yes"), ("ytdl", "no"), ("load-scripts", "no"), ("osc", "no"), ("input-default-bindings", "no"),
-            ("vf", &scale), ("screenshot-format", "jpg")] {
+            ("hr-seek", "no"), ("hwdec", "no"), ("video-latency-hacks", "yes"), ("vd-lavc-skiploopfilter", "all"), ("ytdl", "no"),
+            ("load-scripts", "no"), ("osc", "no"), ("input-default-bindings", "no"), ("vf", &scale), ("screenshot-format", "jpg")] {
             let (k, v) = (CString::new(k).unwrap(), CString::new(v).unwrap());
             unsafe { set(ctx, k.as_ptr(), v.as_ptr()) };
         }
         if unsafe { init(ctx) } < 0 { return Err("mpv_initialize failed".to_string()) }
         command(ctx, &["loadfile", url])?;
-        // Wait for event `id`; false on the stream ending, quitting or `secs` passing.
-        let until = |id: c_int, secs: f64| {
+        let prop = |name: &std::ffi::CStr| unsafe {
+            let p = get(ctx, name.as_ptr());
+            let v = (!p.is_null()).then(|| CStr::from_ptr(p).to_string_lossy().into_owned());
+            if !p.is_null() { free(p.cast()) }
+            v
+        };
+        // Wait for event `id`; false on the stream ending, quitting, `secs` passing or, when
+        // `yield_to_request`, a request coming in (the newest request wins over the work at hand).
+        let until = |id: c_int, secs: f64, yield_to_request: bool| {
             let end = Instant::now() + Duration::from_secs_f64(secs);
-            while !quit.load(Ordering::Relaxed) {
+            while !quit.load(Ordering::Relaxed) && !(yield_to_request && want.0.lock().unwrap().is_some()) {
                 let left = end.saturating_duration_since(Instant::now()).as_secs_f64();
                 if left <= 0.0 { return false }
-                match unsafe { (*wait(ctx, left.min(0.25))).id } {
+                match unsafe { (*wait(ctx, left.min(0.1))).id } {
                     e if e == id => return true,
                     SHUTDOWN | END_FILE => return false,
                     _ => {}
@@ -113,13 +121,17 @@ fn run(url: &str, want: &(Mutex<Option<f64>>, Condvar), quit: &AtomicBool, tx: &
             }
             false
         };
-        if !until(FILE_LOADED, 30.0) { return Err("the stream didn't open".to_string()) }
-        let dur = unsafe {
-            let p = get(ctx, c"duration".as_ptr());
-            let d = if p.is_null() { 0.0 } else { CStr::from_ptr(p).to_str().ok().and_then(|d| d.parse().ok()).unwrap_or(0.0) };
-            if !p.is_null() { free(p.cast()) }
-            d
-        };
+        // The first frame (paused at the start) tells whether the video is HDR.
+        if !until(FILE_LOADED, 30.0, false) { return Err("the stream didn't open".to_string()) }
+        until(PLAYBACK_RESTART, 15.0, false);
+        let dur: f64 = prop(c"duration").and_then(|d| d.parse().ok()).unwrap_or(0.0);
+        // HDR frames saved as they are look pale and far too bright: convert them to SDR (mpv's
+        // own conversion; highlights clip), after scaling down so it costs next to nothing, and
+        // lift them a little, as HDR's whites sit above SDR's.
+        if matches!(prop(c"video-params/gamma").as_deref(), Some("pq" | "hlg")) {
+            let sdr = format!("scale={WIDTH}:-2,format=gamma=bt.1886:primaries=bt.709:convert=yes,eq=gamma=1.35:saturation=1.25");
+            if command(ctx, &["set", "vf", &sdr]).is_err() { eprintln!("preview: no HDR conversion") }
+        }
         let (mut made, mut center) = (HashSet::new(), None);
         let file = std::env::temp_dir().join(format!("stremio-rune-preview-{}.jpg", std::process::id()));
         let file_arg = file.to_string_lossy().into_owned();
@@ -136,8 +148,13 @@ fn run(url: &str, want: &(Mutex<Option<f64>>, Condvar), quit: &AtomicBool, tx: &
                     None => match ahead { Some(t) => t, None => continue },
                 }
             };
+            if command(ctx, &["seek", &t.to_string(), "absolute+keyframes"]).is_err() { made.insert((t / BUCKET) as u64); continue }
+            // A seek given up for a newer request may still land first: wait for this one's frame
+            // (a keyframe at or before `t`, within a bucket).
+            let landed = (0..3).any(|_| until(PLAYBACK_RESTART, 10.0, true)
+                && prop(c"time-pos").and_then(|p| p.parse::<f64>().ok()).is_some_and(|p| p > t - BUCKET && p < t + BUCKET));
+            if !landed { continue } // a newer request: this one is asked for again if still wanted
             made.insert((t / BUCKET) as u64);
-            if command(ctx, &["seek", &t.to_string(), "absolute+keyframes"]).is_err() || !until(PLAYBACK_RESTART, 10.0) { continue }
             if command(ctx, &["screenshot-to-file", &file_arg, "video"]).is_err() { continue }
             let Ok(img) = image::open(&file) else { continue };
             if tx.send(Msg::Image(key(url, t), img.to_rgba8())).is_err() { break }
