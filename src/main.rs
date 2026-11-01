@@ -459,29 +459,44 @@ fn hero_sources(s: &State) -> Vec<HeroSource> {
 /// The hero's titles with each one's label and source, taken from its sources in turn: five
 /// from one source, two each from several (ten at most).
 fn hero_picks(s: &State) -> Vec<(Value, String, HeroSource)> {
-    let lists: Vec<(Vec<Value>, String, HeroSource)> = hero_sources(s).into_iter().map(|src| match src {
-        HeroSource::Catalog(i) => (s.items.get(&i).cloned().unwrap_or_default(), s.catalogs[i].name.clone(), src),
-        HeroSource::Watchlist | HeroSource::UpNext => {
-            let (items, name) = if src == HeroSource::Watchlist { (&s.saved, "Watchlist") } else { (&s.library, "Up Next") };
-            (items.iter().map(|i| { let mut m = i.clone(); m["id"] = i["_id"].clone(); m }).collect(), name.to_string(), src)
-        }
-    }).collect();
-    let total = (2 * lists.len()).clamp(HERO_PICKS, 2 * HERO_PICKS);
-    let mut picks = vec![];
+    hero_order(s).into_iter().map(|(src, n)| {
+        let (items, name) = match src {
+            HeroSource::Catalog(i) => (s.items.get(&i).map_or(&[][..], |v| &v[..]), s.catalogs[i].name.as_str()),
+            HeroSource::Watchlist => (&s.saved[..], "Watchlist"),
+            HeroSource::UpNext => (&s.library[..], "Up Next"),
+        };
+        let mut m = items[n].clone();
+        // library items carry their id as `_id`
+        if m["id"].is_null() { m["id"] = m["_id"].clone() }
+        (m, name.to_string(), src)
+    }).collect()
+}
+
+/// Which title of which source each hero turn shows (source, index into it): the sources in
+/// turn, five turns for one source, two each for several (ten at most). Copies nothing, so
+/// rows can ask often.
+fn hero_order(s: &State) -> Vec<(HeroSource, usize)> {
+    let sources = hero_sources(s);
+    let len = |src: &HeroSource| match src {
+        HeroSource::Catalog(i) => s.items.get(i).map_or(0, Vec::len),
+        HeroSource::Watchlist => s.saved.len(),
+        HeroSource::UpNext => s.library.len(),
+    };
+    let total = (2 * sources.len()).clamp(HERO_PICKS, 2 * HERO_PICKS);
+    let mut order = vec![];
     for round in 0..total {
-        let before = picks.len();
-        for (items, name, src) in &lists {
-            if picks.len() < total && let Some(m) = items.get(round) { picks.push((m.clone(), name.clone(), *src)) }
+        let before = order.len();
+        for src in &sources {
+            if order.len() < total && round < len(src) { order.push((*src, round)) }
         }
-        if picks.len() == before { break }
+        if order.len() == before { break }
     }
-    picks
+    order
 }
 
 /// How many of catalog `i`'s first titles the hero shows (its Home row starts after them).
 fn hero_taken(s: &State, i: usize) -> usize {
-    if !hero_sources(s).contains(&HeroSource::Catalog(i)) { return 0 }
-    hero_picks(s).iter().filter(|p| p.2 == HeroSource::Catalog(i)).count()
+    hero_order(s).iter().filter(|p| p.0 == HeroSource::Catalog(i)).count()
 }
 
 /// The hero's sources changed: start it over, with their catalogs loaded.
@@ -1269,8 +1284,9 @@ fn cursor_selftest(s: &mut State, tx: &mut Tx) {
 
 /// Advance the Home hero every `HERO_EVERY`, and schedule the next look. Only on Home.
 fn rotate_hero(s: &mut State, tx: &mut Tx) -> bool {
-    let n = hero_picks(s).len();
-    if s.page != Page::Home || n < 2 || !s.focused { return false }
+    if s.page != Page::Home || !s.focused { return false }
+    let n = hero_order(s).len();
+    if n < 2 { return false }
     let left = HERO_EVERY.saturating_sub(s.hero_at.elapsed());
     if !left.is_zero() { tx.wake_after(left); return false }
     show_hero(s, (s.hero + 1) % n);
