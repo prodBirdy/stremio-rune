@@ -40,6 +40,13 @@ fn glass(e: El) -> El {
     e.fill(ink(0.07)).border(1.0, ink(0.12)).backdrop_blur(24.0)
 }
 
+/// `glass`'s look without its blur, for what always sits on the page's flat background, where
+/// blurring shows the same colour: it costs no blur passes, and leaves Rune's few blurs a frame
+/// (four) to glass over content, such as the nav.
+fn glass_flat(e: El) -> El {
+    e.fill(ink(0.07)).border(1.0, ink(0.12))
+}
+
 fn tap(e: El) -> El { e.cursor(Cursor::Pointer).press_scale(0.97) }
 
 fn all(e: El) -> El { e.pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)) }
@@ -324,7 +331,7 @@ fn home_row(s: &State, r: usize, title: &str, card: impl Fn(&Value) -> El) -> El
     for m in row_items(s, r)[at..].iter().take(ROW_CARDS) { page = page.child(card(m)) }
     let arrow = |dir: i32| {
         let on = can_page(s, r, dir);
-        let b = glass(row().key(format!("{}-{name}", if dir < 0 { "prev" } else { "next" })).size(36.0, 36.0).radius(18.0).center())
+        let b = glass_flat(row().key(format!("{}-{name}", if dir < 0 { "prev" } else { "next" })).size(36.0, 36.0).radius(18.0).center())
             .opacity(if on { 1.0 } else { 0.35 })
             .child(icon(s, move |i| if dir < 0 { &i.back } else { &i.next }, 16.0));
         if on { tap(b).hover(ink(0.16)).on_press(move |s: &mut State| page_row(s, r, dir)) } else { b }
@@ -472,7 +479,7 @@ fn browse(s: &State, ty: &str) -> El {
 /// over up/down chevrons; a press opens `genre_menu` under it.
 fn genre_button(s: &State, c: &Catalog) -> El {
     let chevron = |turn: f32| icon(s, |i| &i.next, 9.0).rotate(turn).opacity(0.7);
-    let button = tap(glass(row().key("genre").h(36.0).pl(16.0).pr(12.0).gap(10.0).radius(18.0).center_y())
+    let button = tap(glass_flat(row().key("genre").h(36.0).pl(16.0).pr(12.0).gap(10.0).radius(18.0).center_y())
         .fill(if s.genre_open { ink(0.16) } else { ink(0.07) }).hover(ink(0.14))
         .child(label(s.genre.clone().unwrap_or_else(|| "All Genres".into()), 15.0, 600.0, Color::WHITE))
         .child(col().gap(-1.0).child(chevron(-PI / 2.0)).child(chevron(PI / 2.0))))
@@ -711,7 +718,7 @@ fn page(s: &State) -> El {
     let body = if matches!(s.page, Page::Home | Page::Detail) { body } else { col().w_full().pt(top(s)).child(body) };
     let mut root = col().w_full().h_full().fill(bg())
         .on_layout_tx(|s: &mut State, r, tx| { tx.live_only(); s.view_h = r[3] })
-        .child(body.scroll(ScrollSpec { stick_bottom: false }).w_full().grow(1.0).shrink().min_h(0.0));
+        .child(body.key("page-scroll").scroll(ScrollSpec { stick_bottom: false }).w_full().grow(1.0).shrink().min_h(0.0));
     // A click anywhere outside the open menu closes it.
     if s.menu { root = root.child(all(el()).key("menu-scrim").on_press(|s: &mut State| s.menu = false)) }
     root = root.child(nav(s));

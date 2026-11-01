@@ -2276,7 +2276,7 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 [[package]]
 name = "rune"
 version = "0.0.1"
-source = "git+https://github.com/prodBirdy/rune?branch=stremio-linux-import#2f91a3cf9af2a76a3275ccc8c441261dd12f05da"
+source = "git+https://github.com/prodBirdy/rune?branch=stremio-linux-import#bce39fabb6d0d7cb358bc608521f0d19e208366d"
 dependencies = [
  "arboard",
  "blake3",
@@ -2342,12 +2342,12 @@ dependencies = [
 [[package]]
 name = "rune-motion"
 version = "0.1.0"
-source = "git+https://github.com/prodBirdy/rune?branch=stremio-linux-import#2f91a3cf9af2a76a3275ccc8c441261dd12f05da"
+source = "git+https://github.com/prodBirdy/rune?branch=stremio-linux-import#bce39fabb6d0d7cb358bc608521f0d19e208366d"
 
 [[package]]
 name = "rune-staging"
 version = "0.0.1"
-source = "git+https://github.com/prodBirdy/rune?branch=stremio-linux-import#2f91a3cf9af2a76a3275ccc8c441261dd12f05da"
+source = "git+https://github.com/prodBirdy/rune?branch=stremio-linux-import#bce39fabb6d0d7cb358bc608521f0d19e208366d"
 dependencies = [
  "wgpu",
 ]
@@ -2694,7 +2694,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stremio-rune"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "embed-resource",
  "image",

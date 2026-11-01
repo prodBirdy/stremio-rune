@@ -50,11 +50,18 @@ const WATCHLIST: usize = usize::MAX - 1;
 const HERO_EVERY: Duration = Duration::from_secs(4);
 /// Width of the hero's current dot, which fills over `HERO_EVERY`.
 const DOT_W: f32 = 28.0;
-/// Its fill is this many segments, redrawn this often (see `ui::dot_fill`).
 
-/// Decoded image pixels kept; least recently used go first past this. Rune keeps a mip chain of
-/// each on the GPU too (~4/3 of this).
-const IMAGE_BUDGET: usize = 160 << 20;
+/// Decoded image pixels kept; least recently used go first past this. Pictures ask for their
+/// images within a screen above the viewport and two below (`ui::picture`): three screens of
+/// pixels at most, sized as images are (`sized`), so about 70 MB on a laptop and 200 MB at 5K.
+/// Rune keeps a mip chain of each in memory (~4/3 of this) and the shown ones on the GPU.
+fn image_budget() -> usize {
+    let w = window::screen_w() * window::scale().min(2.0);
+    (w * w * 10.0 / 16.0 * 4.0 * 3.0) as usize
+}
+/// Downloaded image files kept, so an image dropped from the decoded ones decodes again
+/// without the network (a card's file is a tenth of its pixels).
+const FILE_BUDGET: usize = 32 << 20;
 /// Image fetch threads: enough to hide latency, few enough that the first images aren't starved.
 const IMAGE_WORKERS: usize = 6;
 
@@ -188,6 +195,8 @@ struct State {
     requested: HashSet<String>,
     /// Images waiting for a worker, best first, and the page they were wanted for.
     queue: Arc<(Mutex<VecDeque<String>>, Condvar)>,
+    /// Image files downloaded, for `load_image`.
+    files: Arc<Mutex<Files>>,
     queue_page: Page,
     /// Height of the window in points, for what counts as near the viewport.
     view_h: f32,
@@ -363,6 +372,7 @@ fn state() -> State {
         tick: 0,
         requested: HashSet::new(),
         queue: Default::default(),
+        files: Default::default(),
         queue_page: Page::Login,
         view_h: 800.0,
         meta_id: String::new(),
@@ -422,6 +432,20 @@ fn url_enc(v: &str) -> String {
     v.bytes().map(|b| match b {
         b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
         _ => format!("%{b:02X}"),
+    }).collect()
+}
+
+/// The fields of a catalog's titles the app reads; the rest (trailers, links, cast, ...) the
+/// detail page fetches again with the title's meta.
+const SHOWN: [&str; 15] = ["id", "type", "name", "poster", "posterShape", "background", "logo", "releaseInfo", "released", "year",
+    "genres", "genre", "runtime", "imdbRating", "description"];
+
+/// A catalog answer's titles, each with only the `SHOWN` fields.
+fn metas(mut answer: Value) -> Vec<Value> {
+    let Some(Value::Array(list)) = answer.get_mut("metas").map(Value::take) else { return vec![] };
+    list.into_iter().map(|m| match m {
+        Value::Object(o) => Value::Object(o.into_iter().filter(|(k, _)| SHOWN.contains(&k.as_str())).collect()),
+        other => other,
     }).collect()
 }
 
@@ -647,15 +671,44 @@ fn sized_px(url: &str, px: u32) -> String {
     format!("{}#w{px}", parts.join("/"))
 }
 
-/// Fetch and decode an image key (a URL, sized by `sized` or else capped at 1280 px wide).
-/// Decoding here also covers WebP, which metahub serves and Rune's ImageCache can't decode on
-/// desktop.
-fn load_image(key: &str) -> Option<image::RgbaImage> {
+/// Downloaded image files by URL, least recently used first, within `FILE_BUDGET`.
+#[derive(Default)]
+struct Files { by_url: HashMap<String, Arc<[u8]>>, order: VecDeque<String>, bytes: usize }
+
+impl Files {
+    fn get(&mut self, url: &str) -> Option<Arc<[u8]>> {
+        let file = self.by_url.get(url)?.clone();
+        if let Some(at) = self.order.iter().position(|u| u == url) { self.order.remove(at); }
+        self.order.push_back(url.to_string());
+        Some(file)
+    }
+
+    fn put(&mut self, url: &str, file: Arc<[u8]>) {
+        self.bytes += file.len();
+        if let Some(old) = self.by_url.insert(url.to_string(), file) { self.bytes -= old.len() } else { self.order.push_back(url.to_string()) }
+        while self.bytes > FILE_BUDGET && let Some(u) = self.order.pop_front() {
+            self.bytes -= self.by_url.remove(&u).map_or(0, |f| f.len());
+        }
+    }
+}
+
+/// Fetch (or find in `files`) and decode an image key (a URL, sized by `sized` or else capped
+/// at 1280 px wide). Decoding here also covers WebP, which metahub serves and Rune's ImageCache
+/// can't decode on desktop.
+fn load_image(key: &str, files: &Mutex<Files>) -> Option<image::RgbaImage> {
     let (url, w) = key.rsplit_once("#w").and_then(|(u, w)| Some((u, w.parse().ok()?))).unwrap_or((key, 1280));
     let fetch = |u: &String| {
-        let bytes = ureq::get(u).call().ok()?.body_mut().read_to_vec().ok()?;
-        DOWNLOADED.fetch_add(bytes.len(), std::sync::atomic::Ordering::Relaxed);
-        image::load_from_memory(&bytes).ok()
+        let file = files.lock().unwrap().get(u);
+        let file = match file {
+            Some(f) => f,
+            None => {
+                let f: Arc<[u8]> = ureq::get(u).call().ok()?.body_mut().read_to_vec().ok()?.into();
+                DOWNLOADED.fetch_add(f.len(), std::sync::atomic::Ordering::Relaxed);
+                files.lock().unwrap().put(u, f.clone());
+                f
+            }
+        };
+        image::load_from_memory(&file).ok()
     };
     let img = fallbacks(url).iter().find_map(fetch)?;
     Some(if img.width() > w { img.thumbnail(w, w * 4) } else { img }.to_rgba8())
@@ -664,14 +717,14 @@ fn load_image(key: &str) -> Option<image::RgbaImage> {
 /// The fetch pool: workers take the queue's front, so the first wanted loads first.
 fn start_image_workers(s: &State) {
     for _ in 0..IMAGE_WORKERS {
-        let (queue, tx, wake) = (s.queue.clone(), s.tx.clone(), s.waker.clone());
+        let (queue, files, tx, wake) = (s.queue.clone(), s.files.clone(), s.tx.clone(), s.waker.clone());
         std::thread::spawn(move || loop {
             let key = {
                 let (q, ready) = &*queue;
                 ready.wait_while(q.lock().unwrap(), |q| q.is_empty()).unwrap().pop_front().unwrap()
             };
             // A codec panic on a bad file fails that image, not the worker.
-            let Some(img) = std::panic::catch_unwind(|| load_image(&key)).ok().flatten() else { continue };
+            let Some(img) = std::panic::catch_unwind(|| load_image(&key, &files)).ok().flatten() else { continue };
             let _ = tx.send(Msg::Image(key, img));
             if let Some(w) = &wake { w() }
         });
@@ -768,7 +821,7 @@ fn fetch_catalog(s: &mut State, i: usize) {
     if s.items.contains_key(&i) || s.catalog_loading.contains(&i) || s.catalog_err.contains_key(&i) { return }
     let url = format!("{}/catalog/{}/{}.json", c.base, c.ty, c.id);
     s.catalog_loading.insert(i);
-    spawn(s, move || Ok(Msg::Catalog(i, get(&url).map(|v| v["metas"].as_array().cloned().unwrap_or_default()))));
+    spawn(s, move || Ok(Msg::Catalog(i, get(&url).map(metas))));
 }
 
 /// The titles a Home row pages through: the library, or a catalog's (the first one's after the
@@ -807,7 +860,7 @@ fn more(s: &mut State, r: usize) {
     let url = format!("{}/catalog/{}/{}/skip={}.json", c.base, c.ty, c.id, s.items.get(&r).map_or(0, Vec::len));
     s.more_loading.insert(r);
     // a failed page counts as the end; no retry until the addons reload
-    spawn(s, move || Ok(Msg::More(r, get(&url).map(|v| v["metas"].as_array().cloned().unwrap_or_default()).unwrap_or_default())));
+    spawn(s, move || Ok(Msg::More(r, get(&url).map(metas).unwrap_or_default())));
 }
 
 /// A further page landed: append the titles not shown yet; none new means the catalog ended.
@@ -852,7 +905,7 @@ fn pick_genre(s: &mut State, g: Option<String>) {
     s.by_genre = None;
     let Some(c) = s.catalogs.get(i) else { return };
     let url = format!("{}/catalog/{}/{}/genre={}.json", c.base, c.ty, c.id, url_enc(&g));
-    spawn(s, move || Ok(Msg::Genre(i, g, get(&url).map(|v| v["metas"].as_array().cloned().unwrap_or_default()))));
+    spawn(s, move || Ok(Msg::Genre(i, g, get(&url).map(metas))));
 }
 
 /// The Browse page's titles: the open catalog's in its genre, or why they didn't come (`None`
@@ -1146,6 +1199,7 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
     changed |= fullscreen_selftest(s, tx);
     cursor_selftest(s, tx);
+    memory_selftest(s, tx);
     if let Some(player) = &s.player {
         // Redraw when a shown value changes: whole seconds, not every position update.
         let shown = |p: &Playback| { let mut p = p.clone(); (p.pos, p.cache_pct) = (p.pos.trunc(), p.cache_pct.trunc()); p.messages.clear(); p };
@@ -1221,11 +1275,11 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
             }
             Msg::Catalog(i, Ok(items)) => {
                 s.catalog_loading.remove(&i);
-                // The hero cycles through its sources' first titles: fetch all their backdrops now,
-                // so each turn shows its image at once instead of starting a download.
+                // The hero cycles through its sources' first titles: fetch the shown one's backdrop
+                // and the next's now; each turn then fetches the one after (`show_hero`).
                 let feeds = hero_sources(s).contains(&HeroSource::Catalog(i));
                 s.items.insert(i, items);
-                if feeds { let heroes: Vec<String> = hero_picks(s).iter().filter_map(|(m, _, _)| ui::hero_img(backdrop(m))).collect(); want(s, heroes) }
+                if feeds { let heroes: Vec<String> = hero_picks(s).iter().take(2).filter_map(|(m, _, _)| ui::hero_img(backdrop(m))).collect(); want(s, heroes) }
             }
             // Only for the genre still picked; an older pick's answer is dropped.
             Msg::Genre(i, g, r) => if i == s.selected && s.genre.as_ref() == Some(&g) { s.by_genre = Some((i, g, r)) },
@@ -1234,7 +1288,7 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
                 s.tick += 1;
                 s.lru.insert(url.clone(), (img.as_raw().len(), s.tick));
                 s.images.insert(url, c.rgba(img.width(), img.height(), img.into_raw()));
-                evict(s, IMAGE_BUDGET);
+                evict(s, image_budget());
             },
             Msg::Meta(id, meta) if id == s.meta_id => {
                 let ty = meta["type"].as_str().unwrap_or("movie").to_string();
@@ -1305,6 +1359,64 @@ fn remember_volume(s: &mut State) {
         s.volume_moved = None;
     }
 }
+
+/// `STREMIO_RUNE_MEMTEST=<file>`: once Home has its catalogs, scroll it to the bottom a page at
+/// a time and back to the top, appending the process's memory and the image cache's state at
+/// each stop to the file, then quit. For measuring what browsing Home costs.
+fn memory_selftest(s: &mut State, tx: &mut Tx) {
+    use std::sync::Mutex;
+    static RUN: Mutex<Option<(Instant, u32)>> = Mutex::new(None);
+    let Some(path) = std::env::var_os("STREMIO_RUNE_MEMTEST") else { return };
+    tx.wake_after(Duration::from_millis(100));
+    let mut run = RUN.lock().unwrap();
+    if run.is_none() {
+        if s.page != Page::Home || s.catalogs.is_empty() || s.items.is_empty() { return }
+        *run = Some((Instant::now(), 0));
+    }
+    let (start, step) = run.as_mut().unwrap();
+    let t = start.elapsed().as_secs_f32();
+    let log = |what: &str, s: &State| {
+        let decoded: usize = s.lru.values().map(|e| e.0).sum();
+        let metas: usize = s.items.values().map(Vec::len).sum();
+        let json: usize = s.items.values().flatten().map(|m| m.to_string().len()).sum();
+        let line = format!("[{t:5.1}s] {what}: images {} ({} MB decoded), catalogs {}/{} loaded, {metas} titles ({} KB as JSON)",
+            s.images.len(), decoded >> 20, s.items.len(), s.catalogs.len(), json >> 10);
+        let path = PathBuf::from(&path);
+        // vmmap takes a moment: off the UI thread, so the scrolling it measures isn't held up.
+        let pid = std::process::id().to_string();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let vmmap = || std::process::Command::new("vmmap").args(["--summary", &pid]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+            // The footprint as it stands, then once malloc has handed back what's free: the
+            // difference is memory freed but not yet returned to the system.
+            let before = vmmap();
+            #[cfg(target_os = "macos")]
+            unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+            let after = vmmap();
+            let pick = |out: &str| out.lines().filter(|l| l.starts_with("Physical footprint") || ["MALLOC_", "IOAccelerator", "IOSurface", "owned unmapped", "TOTAL"].iter().any(|k| l.trim_start().starts_with(k)))
+                .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join("\n    ");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(f, "{line}\n  as it stands:\n    {}\n  after malloc relief:\n    {}", pick(&before), pick(&after));
+            }
+        });
+    };
+    // Settle on top, a page down every 0.6 s to the bottom, settle, back to the top, settle.
+    const PAGES: u32 = 40;
+    let at = |n: u32| 6.0 + 0.6 * n as f32;
+    let next = match *step {
+        0 if t > 5.0 => { log("top, settled", s); true }
+        n @ 1..=PAGES if t > at(n) => { tx.scroll_page("page-scroll", 1); true }
+        n if n == PAGES + 1 && t > at(PAGES) + 6.0 => { log("bottom, settled", s); true }
+        n if n == PAGES + 2 && t > at(PAGES) + 7.0 => { tx.scroll_to_y("page-scroll", 0.0); true }
+        n if n == PAGES + 3 && t > at(PAGES) + 13.0 => { log("top again, settled", s); true }
+        n if n == PAGES + 4 && t > at(PAGES) + 16.0 => { tx.quit(); true }
+        _ => false,
+    };
+    if next { *step += 1 }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; }
 
 /// `STREMIO_RUNE_FSTEST=<video file>`: play it, enter and leave fullscreen the way the
 /// controls' button does, write the window state at each step to
@@ -1395,8 +1507,11 @@ fn on_focus(s: &mut State, focused: bool, _: &mut Tx) {
     if focused { show_hero(s, s.hero) }
 }
 
-/// Show hero title `i` for a full `HERO_EVERY`, its dot filling from empty.
+/// Show hero title `i` for a full `HERO_EVERY`, its dot filling from empty, and fetch the next
+/// one's backdrop so it shows at once when its turn comes.
 fn show_hero(s: &mut State, i: usize) {
+    let picks = hero_picks(s);
+    if let Some(next) = picks.get((i + 1) % picks.len().max(1)).and_then(|(m, _, _)| ui::hero_img(backdrop(m))) { want(s, [next]) }
     s.hero = i;
     s.hero_at = Instant::now();
     s.hero_fill = dot_fill();
@@ -2447,16 +2562,33 @@ mod tests {
     }
 
     #[test]
-    fn every_hero_backdrop_is_fetched_when_the_hero_titles_arrive() {
+    fn the_hero_fetches_its_backdrop_and_the_next_one_only() {
         let mut rt = runtime(|s| { demo(s); s.page = Page::Home; s.items.clear() });
         let titles: Vec<Value> = (1..9).map(|n| json!({ "id": format!("tt{n}"), "type": "movie", "name": "x" })).collect();
         rt.state.tx.send(Msg::Catalog(0, Ok(titles.clone()))).unwrap();
         rt.update(|s, tx| { poll(s, 0.0, tx); });
-        let queued: Vec<String> = rt.state.queue.0.lock().unwrap().iter().cloned().collect();
-        for m in titles.iter().take(HERO_PICKS) {
-            let key = ui::hero_img(backdrop(m)).unwrap();
-            assert!(queued.contains(&key) || rt.state.requested.contains(&key), "hero image queued before it shows: {key}");
-        }
+        let asked = |s: &State, n: usize| { let k = ui::hero_img(backdrop(&titles[n])).unwrap(); s.requested.contains(&k) };
+        assert!(asked(&rt.state, 0) && asked(&rt.state, 1), "the shown one and the next, before they show");
+        assert!(!asked(&rt.state, 2), "not the rest: each holds 8 MB decoded");
+        show_hero(&mut rt.state, 1);
+        assert!(asked(&rt.state, 2), "each turn asks for the one after");
+    }
+
+    #[test]
+    fn catalog_titles_keep_only_the_fields_shown_and_image_files_stay_within_their_budget() {
+        let answer = json!({ "metas": [{ "id": "tt1", "type": "movie", "name": "A", "description": "d", "trailers": [{ "source": "x" }],
+            "links": [{ "name": "y" }], "behaviorHints": { "a": 1 }, "genres": ["Drama"] }] });
+        let m = &metas(answer)[0];
+        assert_eq!(m.as_object().unwrap().keys().collect::<Vec<_>>(), ["id", "type", "name", "description", "genres"]);
+
+        let mut files = Files::default();
+        let file = |n: usize| -> Arc<[u8]> { vec![0u8; n].into() };
+        files.put("a", file(FILE_BUDGET / 2));
+        files.put("b", file(FILE_BUDGET / 2));
+        assert!(files.get("a").is_some(), "both fit; a is now the most recent");
+        files.put("c", file(FILE_BUDGET / 2));
+        assert!(files.get("b").is_none() && files.get("a").is_some() && files.get("c").is_some(), "the least recently used goes");
+        assert!(files.bytes <= FILE_BUDGET);
     }
 
     #[test]

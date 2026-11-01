@@ -131,7 +131,7 @@ fn set_server(s: &mut State, patch: Value) {
 fn card(title: &str, body: El) -> El {
     col().w_full().gap(12.0)
         .child(label(title.to_string(), 13.0, 600.0, ink(0.5)).px(4.0))
-        .child(glass(body.w_full().padding(8.0).gap(2.0).radius(18.0)))
+        .child(glass_flat(body.w_full().padding(8.0).gap(2.0).radius(18.0)))
 }
 
 /// A setting: its name on the left, the control on the right.
