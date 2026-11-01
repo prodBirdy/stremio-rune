@@ -71,7 +71,9 @@ fn log(line: &str) {
 fn setup(t: &mut T, waker: Waker) {
     t.surface.set_waker(waker.clone());
     let surface = Some(t.surface.clone());
-    match Mpv::play(&t.clip, "videotest", (!knob("VIDEOTEST_NO_MPV_WAKE")).then_some(waker), None, vec![("hwdec", "auto-safe".into()), ("mute", "yes".into())] /* silent: test clips carry a tone */, surface) {
+    // VIDEOTEST_START=<seconds>: start there.
+    let start = std::env::var("VIDEOTEST_START").ok().and_then(|v| v.parse().ok());
+    match Mpv::play(&t.clip, "videotest", (!knob("VIDEOTEST_NO_MPV_WAKE")).then_some(waker), start, vec![("hwdec", "auto-safe".into()), ("mute", "yes".into())] /* silent: test clips carry a tone */, surface) {
         Ok(m) => t.mpv = Some(m),
         Err(e) => { log(&format!("play failed: {e}")); t.done = true }
     }

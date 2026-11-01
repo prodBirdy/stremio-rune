@@ -30,6 +30,7 @@ const PARAM_API_TYPE: c_int = 1;
 const PARAM_OPENGL_INIT_PARAMS: c_int = 2;
 const PARAM_OPENGL_FBO: c_int = 3;
 const PARAM_FLIP_Y: c_int = 4;
+const PARAM_BLOCK_FOR_TARGET_TIME: c_int = 12;
 /// mpv_render_update_flag: a new frame should be rendered.
 const UPDATE_FRAME: u64 = 1;
 /// Buffers the pool keeps, and the most it makes: one on screen, one being drawn, spares.
@@ -44,6 +45,8 @@ const CGL_OGLP_VERSION_3_2_CORE: i32 = 0x3200;
 
 // GL enums.
 const GL_TEXTURE_RECTANGLE: u32 = 0x84F5;
+const GL_TEXTURE_2D: u32 = 0x0DE1;
+const GL_UNSIGNED_BYTE: u32 = 0x1401;
 const GL_RGBA: u32 = 0x1908;
 const GL_RGBA8: u32 = 0x8058;
 const GL_BGRA: u32 = 0x80E1;
@@ -121,6 +124,8 @@ unsafe extern "C" {
     fn glDeleteSync(sync: *mut c_void);
     fn glFinish();
     fn glGetError() -> u32;
+    fn glTexImage2D(target: u32, level: i32, internal_format: i32, w: i32, h: i32, border: i32, format: u32, ty: u32, pixels: *const c_void);
+    fn glReadPixels(x: i32, y: i32, w: i32, h: i32, format: u32, ty: u32, pixels: *mut c_void);
 }
 
 unsafe extern "C" {
@@ -253,34 +258,124 @@ unsafe extern "C" fn get_proc_address(_: *mut c_void, name: *const c_char) -> *m
     unsafe { dlsym(RTLD_DEFAULT, name) }
 }
 
+/// An offscreen OpenGL context (mpv only ever draws into framebuffers made on it), made current
+/// on this thread.
+unsafe fn cgl_context() -> Result<*mut c_void, String> {
+    unsafe {
+        let attrs = [CGL_PFA_OPENGL_PROFILE, CGL_OGLP_VERSION_3_2_CORE, CGL_PFA_ACCELERATED, CGL_PFA_ALLOW_OFFLINE_RENDERERS, 0];
+        let (mut pix, mut n) = (std::ptr::null_mut(), 0);
+        if CGLChoosePixelFormat(attrs.as_ptr(), &mut pix, &mut n) != 0 || pix.is_null() { return Err("no OpenGL pixel format".into()) }
+        let mut cgl = std::ptr::null_mut();
+        let made = CGLCreateContext(pix, std::ptr::null_mut(), &mut cgl);
+        CGLDestroyPixelFormat(pix);
+        if made != 0 || cgl.is_null() { return Err(format!("CGLCreateContext failed ({made})")) }
+        CGLSetCurrentContext(cgl);
+        Ok(cgl)
+    }
+}
+
+/// mpv's OpenGL renderer for core `mpv`, on the GL context current on this thread.
+unsafe fn mpv_gl(mpv: *mut c_void) -> Result<*mut c_void, String> {
+    let create: unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *mut Param) -> c_int = sym(b"mpv_render_context_create\0")?;
+    let mut init = GlInit { get_proc_address, ctx: std::ptr::null_mut(), extra_exts: std::ptr::null() };
+    let mut params = [
+        Param { ty: PARAM_API_TYPE, data: c"opengl".as_ptr() as *mut c_void },
+        Param { ty: PARAM_OPENGL_INIT_PARAMS, data: (&raw mut init).cast() },
+        Param { ty: PARAM_INVALID, data: std::ptr::null_mut() },
+    ];
+    let mut render = std::ptr::null_mut();
+    if unsafe { create(&mut render, mpv, params.as_mut_ptr()) } < 0 || render.is_null() {
+        return Err("mpv's OpenGL renderer didn't start".into());
+    }
+    Ok(render)
+}
+
+/// mpv's frames drawn small, offscreen, and read back: seek-bar previews (preview.rs). The same
+/// renderer as the player's draws them, so they look the same, HDR tone-mapped alike.
+pub struct Snapshot {
+    cgl: *mut c_void,
+    render: *mut c_void,
+    fbo: u32,
+    tex: u32,
+    size: (u32, u32),
+}
+
+impl Snapshot {
+    /// mpv's renderer for core `mpv` (before it loads a file), drawing at `w`x`h`.
+    pub fn new(mpv: *mut c_void, w: u32, h: u32) -> Result<Snapshot, String> {
+        unsafe {
+            let mut s = Snapshot { cgl: cgl_context()?, render: std::ptr::null_mut(), fbo: 0, tex: 0, size: (w, h) };
+            glGenTextures(1, &mut s.tex);
+            glBindTexture(GL_TEXTURE_2D, s.tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8 as i32, w as i32, h as i32, 0, GL_RGBA, GL_UNSIGNED_BYTE, std::ptr::null());
+            glGenFramebuffers(1, &mut s.fbo);
+            glBindFramebuffer(GL_FRAMEBUFFER, s.fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s.tex, 0);
+            if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE { return Err("preview framebuffer incomplete".into()) }
+            s.render = mpv_gl(mpv)?;
+            Ok(s)
+        }
+    }
+
+    /// Draw mpv's frame if it has a new one; true if it did. mpv waits for its frames to be
+    /// drawn, so call this often while waiting on it.
+    pub fn pump(&mut self) -> bool {
+        let Ok(update) = sym::<unsafe extern "C" fn(*mut c_void) -> u64>(b"mpv_render_context_update\0") else { return false };
+        let Ok(draw) = sym::<unsafe extern "C" fn(*mut c_void, *mut Param) -> c_int>(b"mpv_render_context_render\0") else { return false };
+        if unsafe { update(self.render) } & UPDATE_FRAME == 0 { return false }
+        let mut fbo = Fbo { fbo: self.fbo as c_int, w: self.size.0 as c_int, h: self.size.1 as c_int, internal_format: GL_RGBA8 as c_int };
+        // Top row first, as `grab` reads it back.
+        let (mut flip, mut block): (c_int, c_int) = (0, 0);
+        let mut params = [
+            Param { ty: PARAM_OPENGL_FBO, data: (&raw mut fbo).cast() },
+            Param { ty: PARAM_FLIP_Y, data: (&raw mut flip).cast() },
+            Param { ty: PARAM_BLOCK_FOR_TARGET_TIME, data: (&raw mut block).cast() },
+            Param { ty: PARAM_INVALID, data: std::ptr::null_mut() },
+        ];
+        unsafe { draw(self.render, params.as_mut_ptr()) };
+        true
+    }
+
+    /// The frame drawn last, as RGBA.
+    pub fn grab(&self) -> Option<image::RgbaImage> {
+        let (w, h) = self.size;
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        unsafe {
+            glBindFramebuffer(GL_FRAMEBUFFER, self.fbo);
+            glReadPixels(0, 0, w as i32, h as i32, GL_RGBA, GL_UNSIGNED_BYTE, px.as_mut_ptr().cast());
+        }
+        image::RgbaImage::from_raw(w, h, px)
+    }
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        unsafe {
+            // mpv's renderer first, with its GL context current.
+            if !self.render.is_null() && let Ok(free) = sym::<unsafe extern "C" fn(*mut c_void)>(b"mpv_render_context_free\0") { free(self.render) }
+            glDeleteFramebuffers(1, &self.fbo);
+            glDeleteTextures(1, &self.tex);
+            CGLSetCurrentContext(std::ptr::null_mut());
+            CGLDestroyContext(self.cgl);
+        }
+    }
+}
+
 impl Renderer {
     fn new(mpv: *mut c_void, kick: SyncSender<()>) -> Result<Renderer, String> {
         unsafe {
-            // An offscreen context: mpv only ever draws into the framebuffers made here.
-            let attrs = [CGL_PFA_OPENGL_PROFILE, CGL_OGLP_VERSION_3_2_CORE, CGL_PFA_ACCELERATED, CGL_PFA_ALLOW_OFFLINE_RENDERERS, 0];
-            let (mut pix, mut n) = (std::ptr::null_mut(), 0);
-            if CGLChoosePixelFormat(attrs.as_ptr(), &mut pix, &mut n) != 0 || pix.is_null() { return Err("no OpenGL pixel format".into()) }
-            let mut cgl = std::ptr::null_mut();
-            let made = CGLCreateContext(pix, std::ptr::null_mut(), &mut cgl);
-            CGLDestroyPixelFormat(pix);
-            if made != 0 || cgl.is_null() { return Err(format!("CGLCreateContext failed ({made})")) }
-            CGLSetCurrentContext(cgl);
+            let cgl = cgl_context()?;
             // mpv's renderer, on this GL context.
-            let create: unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *mut Param) -> c_int = sym(b"mpv_render_context_create\0")?;
             let set_update: unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void), *mut c_void) =
                 sym(b"mpv_render_context_set_update_callback\0")?;
-            let mut init = GlInit { get_proc_address, ctx: std::ptr::null_mut(), extra_exts: std::ptr::null() };
-            let mut params = [
-                Param { ty: PARAM_API_TYPE, data: c"opengl".as_ptr() as *mut c_void },
-                Param { ty: PARAM_OPENGL_INIT_PARAMS, data: (&raw mut init).cast() },
-                Param { ty: PARAM_INVALID, data: std::ptr::null_mut() },
-            ];
-            let mut render = std::ptr::null_mut();
-            if create(&mut render, mpv, params.as_mut_ptr()) < 0 || render.is_null() {
-                CGLSetCurrentContext(std::ptr::null_mut());
-                CGLDestroyContext(cgl);
-                return Err("mpv's OpenGL renderer didn't start".into());
-            }
+            let render = match mpv_gl(mpv) {
+                Ok(r) => r,
+                Err(e) => {
+                    CGLSetCurrentContext(std::ptr::null_mut());
+                    CGLDestroyContext(cgl);
+                    return Err(e);
+                }
+            };
             let kick = Box::into_raw(Box::new(kick));
             set_update(render, on_update, kick.cast());
             Ok(Renderer { cgl, render, kick, pool: None, targets: HashMap::new(), frame_id: 0, size: (0, 0) })

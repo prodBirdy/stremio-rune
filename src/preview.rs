@@ -1,13 +1,15 @@
 //! Seek-bar previews, YouTube-style: a frame of the playing video at the time under the
 //! pointer. A second, hidden mpv core opens the same stream (no audio, no cache, software
-//! decoding), jumps to the keyframe at or before the time and saves that frame small; it lands
-//! in the app's images like a poster (`Msg::Image`, under `key`), so the image budget covers it.
+//! decoding), jumps to the keyframe at or before the time and draws that frame small with the
+//! player's own renderer (`video::Snapshot`), so it looks like the video; it lands in the app's
+//! images like a poster (`Msg::Image`, under `key`), so the image budget covers it.
 //! Only the newest request is worked on: sweeping the bar doesn't queue up seeks. Between
 //! requests it makes the rest, outward from the last one, so most hovers find theirs ready.
 
 use crate::Msg;
 use crate::player::{command, sym};
 use rune::Waker;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,8 +19,9 @@ use std::time::{Duration, Instant};
 
 /// Previews are made every this many seconds of the video.
 pub const BUCKET: f64 = 10.0;
-/// Width of a preview frame, in pixels.
+/// Size of a preview frame, in pixels: 16:9, as the player's (other shapes letterboxed alike).
 const WIDTH: u32 = 320;
+const HEIGHT: u32 = 180;
 /// Rest between previews made ahead, so they take a share of the bandwidth, not all of it.
 // ponytail: a fixed pause, not paced by playback's cache; make it wait while the player buffers if previews ever starve it.
 const AHEAD_PAUSE: Duration = Duration::from_secs(1);
@@ -90,15 +93,18 @@ fn run(url: &str, want: &(Mutex<Option<f64>>, Condvar), quit: &AtomicBool, tx: &
     let ctx = unsafe { create() };
     if ctx.is_null() { return Err("mpv_create failed".into()) }
     let result = (|| {
-        let scale = format!("scale={WIDTH}:-2");
         // vd-lavc-skiploopfilter: HEVC/H.264 decode faster without deblocking, unseen at this size.
-        for (k, v) in [("vo", "null"), ("aid", "no"), ("sid", "no"), ("pause", "yes"), ("keep-open", "always"), ("cache", "no"),
+        for (k, v) in [("vo", "libmpv"), ("aid", "no"), ("sid", "no"), ("pause", "yes"), ("keep-open", "always"), ("cache", "no"),
             ("hr-seek", "no"), ("hwdec", "no"), ("video-latency-hacks", "yes"), ("vd-lavc-skiploopfilter", "all"), ("ytdl", "no"),
-            ("load-scripts", "no"), ("osc", "no"), ("input-default-bindings", "no"), ("vf", &scale), ("screenshot-format", "jpg")] {
+            ("load-scripts", "no"), ("osc", "no"), ("input-default-bindings", "no")] {
             let (k, v) = (CString::new(k).unwrap(), CString::new(v).unwrap());
             unsafe { set(ctx, k.as_ptr(), v.as_ptr()) };
         }
         if unsafe { init(ctx) } < 0 { return Err("mpv_initialize failed".to_string()) }
+        // Drawn by the player's own renderer, so a preview looks like the video (HDR included).
+        let snap = RefCell::new(crate::video::Snapshot::new(ctx, WIDTH, HEIGHT)?);
+        // Whether `snap` has drawn a frame since this was last cleared.
+        let drew = Cell::new(false);
         command(ctx, &["loadfile", url])?;
         let prop = |name: &std::ffi::CStr| unsafe {
             let p = get(ctx, name.as_ptr());
@@ -106,14 +112,17 @@ fn run(url: &str, want: &(Mutex<Option<f64>>, Condvar), quit: &AtomicBool, tx: &
             if !p.is_null() { free(p.cast()) }
             v
         };
-        // Wait for event `id`; false on the stream ending, quitting, `secs` passing or, when
-        // `yield_to_request`, a request coming in (the newest request wins over the work at hand).
+        // Wait for event `id` (or, with `id` 0, a frame drawn), drawing mpv's frames meanwhile;
+        // false on the stream ending, quitting, `secs` passing or, when `yield_to_request`, a
+        // request coming in (the newest request wins over the work at hand).
         let until = |id: c_int, secs: f64, yield_to_request: bool| {
             let end = Instant::now() + Duration::from_secs_f64(secs);
             while !quit.load(Ordering::Relaxed) && !(yield_to_request && want.0.lock().unwrap().is_some()) {
+                if snap.borrow_mut().pump() { drew.set(true) }
+                if id == 0 && drew.get() { return true }
                 let left = end.saturating_duration_since(Instant::now()).as_secs_f64();
                 if left <= 0.0 { return false }
-                match unsafe { (*wait(ctx, left.min(0.1))).id } {
+                match unsafe { (*wait(ctx, left.min(0.01))).id } {
                     e if e == id => return true,
                     SHUTDOWN | END_FILE => return false,
                     _ => {}
@@ -121,20 +130,9 @@ fn run(url: &str, want: &(Mutex<Option<f64>>, Condvar), quit: &AtomicBool, tx: &
             }
             false
         };
-        // The first frame (paused at the start) tells whether the video is HDR.
         if !until(FILE_LOADED, 30.0, false) { return Err("the stream didn't open".to_string()) }
-        until(PLAYBACK_RESTART, 15.0, false);
         let dur: f64 = prop(c"duration").and_then(|d| d.parse().ok()).unwrap_or(0.0);
-        // HDR frames saved as they are look pale and far too bright: convert them to SDR (mpv's
-        // own conversion; highlights clip), after scaling down so it costs next to nothing, and
-        // lift them a little, as HDR's whites sit above SDR's.
-        if matches!(prop(c"video-params/gamma").as_deref(), Some("pq" | "hlg")) {
-            let sdr = format!("scale={WIDTH}:-2,format=gamma=bt.1886:primaries=bt.709:convert=yes,eq=gamma=1.35:saturation=1.25");
-            if command(ctx, &["set", "vf", &sdr]).is_err() { eprintln!("preview: no HDR conversion") }
-        }
         let (mut made, mut center) = (HashSet::new(), None);
-        let file = std::env::temp_dir().join(format!("stremio-rune-preview-{}.jpg", std::process::id()));
-        let file_arg = file.to_string_lossy().into_owned();
         loop {
             // A request first; else, after a rest, the next one ahead of the last request.
             let ahead = center.and_then(|c| next_ahead(c, dur, &made));
@@ -149,18 +147,17 @@ fn run(url: &str, want: &(Mutex<Option<f64>>, Condvar), quit: &AtomicBool, tx: &
                 }
             };
             if command(ctx, &["seek", &t.to_string(), "absolute+keyframes"]).is_err() { made.insert((t / BUCKET) as u64); continue }
+            drew.set(false);
             // A seek given up for a newer request may still land first: wait for this one's frame
-            // (a keyframe at or before `t`, within a bucket).
+            // (a keyframe at or before `t`, within a bucket), then for it to be drawn.
             let landed = (0..3).any(|_| until(PLAYBACK_RESTART, 10.0, true)
                 && prop(c"time-pos").and_then(|p| p.parse::<f64>().ok()).is_some_and(|p| p > t - BUCKET && p < t + BUCKET));
-            if !landed { continue } // a newer request: this one is asked for again if still wanted
+            if !landed || !until(0, 2.0, true) { continue } // a newer request: this one is asked for again if still wanted
             made.insert((t / BUCKET) as u64);
-            if command(ctx, &["screenshot-to-file", &file_arg, "video"]).is_err() { continue }
-            let Ok(img) = image::open(&file) else { continue };
-            if tx.send(Msg::Image(key(url, t), img.to_rgba8())).is_err() { break }
+            let Some(img) = snap.borrow().grab() else { continue };
+            if tx.send(Msg::Image(key(url, t), img)).is_err() { break }
             if let Some(w) = wake { w() }
         }
-        let _ = std::fs::remove_file(&file);
         Ok(())
     })();
     unsafe { destroy(ctx) };
