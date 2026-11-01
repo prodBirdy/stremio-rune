@@ -23,6 +23,10 @@ const PAD: f32 = 56.0;
 const HERO_H: f32 = 560.0;
 /// Space between cards.
 const GAP: f32 = 22.0;
+/// People in a detail page's Cast & Crew row.
+const PEOPLE: usize = 8;
+/// A synopsis longer than this (in bytes) is cut off in the hero, so Details shows it whole.
+const LONG_SYNOPSIS: usize = 200;
 
 fn bg() -> Color { oklch(0.15, 0.012, 265.0) }
 fn ink(a: f32) -> Color { Color::WHITE.alpha(a) }
@@ -84,6 +88,16 @@ fn s_(v: &Value) -> &str { v.as_str().unwrap_or("") }
 fn meta_line(m: &Value) -> String {
     let genres = m["genres"].as_array().or(m["genre"].as_array()).into_iter().flatten().take(2).map(s_);
     genres.chain([s_(&m["releaseInfo"]), s_(&m["runtime"])]).filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" · ")
+}
+
+/// `Jan 28, 2008` from an ISO date; empty when it isn't one.
+pub fn date(iso: &str) -> String {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let mut p = iso.get(..10).unwrap_or("").split('-').map(|x| x.parse::<usize>().ok());
+    match (p.next().flatten(), p.next().flatten(), p.next().flatten()) {
+        (Some(y), Some(m @ 1..=12), Some(d)) => format!("{} {d}, {y}", MONTHS[m - 1]),
+        _ => String::new(),
+    }
 }
 
 pub fn seasons(m: &Value) -> Vec<i64> {
@@ -365,18 +379,37 @@ fn poster_card(s: &State, m: &Value, key: String) -> El {
         .on_press(move |s: &mut State| open_meta(s, t.clone(), id.clone()))
 }
 
+/// The catalogs of a type: a tab per addon, chips for the open addon's catalogs, and the open
+/// catalog's posters.
 fn browse(s: &State, ty: &str) -> El {
-    let mut chips = row().w_full().gap(10.0).flex_wrap();
-    for (i, c) in s.catalogs.iter().enumerate().filter(|(_, c)| c.ty == ty) {
-        chips = chips.child(chip(format!("cat-{i}"), c.name.clone(), i == s.selected).on_press(move |s: &mut State| open_catalog(s, i)));
+    let cats: Vec<(usize, &Catalog)> = s.catalogs.iter().enumerate().filter(|(_, c)| c.ty == ty).collect();
+    let open = s.catalogs.get(s.selected).filter(|c| c.ty == ty).map(|c| c.addon.as_str());
+    let mut addons: Vec<(&str, usize)> = vec![];
+    for (i, c) in &cats { if !addons.iter().any(|(a, _)| *a == c.addon) { addons.push((&c.addon, *i)) } }
+    let mut page = col().w_full().pt(104.0).px(PAD).pb(56.0).gap(24.0)
+        .child(label(type_label(ty), 40.0, 700.0, Color::WHITE).font(TextStyle::new(40.0, 700.0).tracking(-0.8)));
+    // One addon needs no tabs.
+    if addons.len() > 1 {
+        let mut tabs = row().w_full().gap(28.0).flex_wrap();
+        for (a, first) in addons {
+            let on = open == Some(a);
+            tabs = tabs.child(tap(col().key(format!("source-{first}")).gap(8.0)
+                .child(label(a, 16.0, if on { 600.0 } else { 500.0 }, if on { Color::WHITE } else { ink(0.5) }))
+                .child(el().h(2.0).w_full().radius(1.0).fill(if on { Color::WHITE } else { Color::TRANSPARENT })))
+                .on_press(move |s: &mut State| open_catalog(s, first)));
+        }
+        page = page.child(col().w_full().gap(0.0).child(tabs).child(el().h(1.0).w_full().fill(ink(0.08))));
+    }
+    let mut chips = row().w_full().gap(8.0).flex_wrap();
+    for (i, c) in cats.iter().filter(|(_, c)| open.is_none_or(|a| a == c.addon)) {
+        let i = *i;
+        chips = chips.child(chip(format!("cat-{i}"), c.title.clone(), i == s.selected).on_press(move |s: &mut State| open_catalog(s, i)));
     }
     let mut grid = row().w_full().equal_columns(7).gap(GAP);
     for m in s.items.get(&s.selected).into_iter().flatten() {
         grid = grid.child(poster_card(s, m, format!("p-{}", s_(&m["id"]))));
     }
-    col().w_full().pt(104.0).px(PAD).pb(56.0).gap(28.0)
-        .child(label(type_label(ty), 40.0, 700.0, Color::WHITE).font(TextStyle::new(40.0, 700.0).tracking(-0.8)))
-        .child(chips).child(grid)
+    page.child(chips).child(grid)
 }
 
 fn detail(s: &State) -> El {
@@ -408,28 +441,87 @@ fn detail(s: &State) -> El {
         .child(image).child(side).child(fade).child(scrim)
         .child(info.pin(Some(PAD), None, None, Some(28.0)))
         .child(back.pin(Some(PAD), Some(22.0 + top(s)), None, None));
-    let mut page = col().w_full().gap(28.0).pb(56.0).child(head);
-    if episodic {
-        let mut tabs = row().gap(8.0).flex_wrap();
-        for n in seasons(m) {
-            let name = if n == 0 { "Specials".to_string() } else { format!("Season {n}") };
-            tabs = tabs.child(chip(format!("season-{n}"), name, n == s.season).on_press(move |s: &mut State| s.season = n));
-        }
-        let mut list = col().gap(4.0);
-        for v in eps {
-            let vid = s_(&v["id"]).to_string();
-            let on = vid == s.stream_for;
-            let ty = ty.clone();
-            list = list.child(tap(row().key(format!("ep-{vid}")).h(52.0).px(14.0).gap(14.0).radius(12.0).center_y()
-                .fill(if on { ink(0.12) } else { Color::TRANSPARENT }).hover(ink(0.08))
-                .child(label(format!("{}", v["episode"].as_i64().unwrap_or(0)), 15.0, 600.0, ink(0.45)).w(28.0))
-                .child(label(v["title"].as_str().or(v["name"].as_str()).unwrap_or("").to_string(), 16.0, 500.0, Color::WHITE).truncate().grow(1.0).min_w(0.0)))
-                .on_press(move |s: &mut State| pick(s, ty.clone(), vid.clone())));
-        }
-        page = page.child(col().w_full().max_w(980.0).px(PAD).gap(16.0)
-            .child(label("Episodes", 22.0, 600.0, Color::WHITE)).child(tabs).child(list));
+    let mut page = col().w_full().gap(48.0).pb(64.0).child(head);
+    if episodic { page = page.child(episodes(s, m, &ty, eps)) }
+    page.child(about(m))
+}
+
+fn section_title(words: &str) -> El { label(words, 24.0, 600.0, Color::WHITE) }
+
+/// The season's episodes as cards across the page; the one whose streams are open is outlined.
+fn episodes(s: &State, m: &Value, ty: &str, eps: Vec<&Value>) -> El {
+    let mut tabs = row().gap(8.0).flex_wrap();
+    for n in seasons(m) {
+        let name = if n == 0 { "Specials".to_string() } else { format!("Season {n}") };
+        tabs = tabs.child(chip(format!("season-{n}"), name, n == s.season).on_press(move |s: &mut State| s.season = n));
     }
-    page
+    let mut grid = row().w_full().equal_columns(4).gap(GAP);
+    for v in eps {
+        let vid = s_(&v["id"]).to_string();
+        let on = vid == s.stream_for;
+        let n = v["episode"].as_i64().or(v["number"].as_i64()).unwrap_or(0);
+        let image = picture(s, card_img(v["thumbnail"].as_str().map(String::from)).as_deref()).w_full().aspect_ratio(16.0 / 9.0)
+            .radius(12.0).clip_rounded(12.0).border(if on { 2.0 } else { 1.0 }, if on { Color::WHITE } else { ink(0.08) })
+            .child(row().h(24.0).px(8.0).radius(6.0).center().fill(Color::BLACK.alpha(0.6)).child(label(format!("E{n}"), 12.0, 700.0, Color::WHITE))
+                .pin(Some(10.0), None, None, Some(10.0)));
+        let rating = v["rating"].as_str().filter(|r| !r.is_empty() && *r != "0").map(|r| format!("★ {r}"));
+        let facts = [date(s_(&v["released"])), rating.unwrap_or_default()].into_iter().filter(|f| !f.is_empty()).collect::<Vec<_>>().join(" · ");
+        let overview = v["overview"].as_str().or(v["description"].as_str()).unwrap_or("").to_string();
+        let ty = ty.to_string();
+        let mut card = tap(col().key(format!("ep-{vid}")).gap(8.0).min_w(0.0)).child(image)
+            .child(label(v["title"].as_str().or(v["name"].as_str()).unwrap_or("").to_string(), 16.0, 600.0, Color::WHITE).truncate());
+        if !facts.is_empty() { card = card.child(label(facts, 13.0, 500.0, ink(0.5))) }
+        if !overview.is_empty() { card = card.child(label(overview, 14.0, 400.0, ink(0.62)).font(TextStyle::new(14.0, 400.0).lh(20.0)).wrap().max_lines(3)) }
+        grid = grid.child(card.on_press(move |s: &mut State| pick(s, ty.clone(), vid.clone())));
+    }
+    col().w_full().px(PAD).gap(20.0).child(section_title("Episodes")).child(tabs).child(grid)
+}
+
+/// Credits as a row of people (one card per person, roles merged), the facts the addon gave
+/// in columns, and the whole synopsis when it runs past the hero's three lines.
+fn about(m: &Value) -> El {
+    let names = |k: &str| m[k].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>();
+    let mut people: Vec<(String, Vec<&str>)> = vec![];
+    for (k, role) in [("director", "Director"), ("writer", "Writer"), ("cast", "Cast")] {
+        for n in names(k) {
+            match people.iter_mut().find(|(p, _)| *p == n) {
+                Some((_, roles)) => roles.push(role),
+                None => people.push((n, vec![role])),
+            }
+        }
+    }
+    let mut page = col().w_full().px(PAD).gap(48.0);
+    if !people.is_empty() {
+        let mut row_ = row().w_full().equal_columns(PEOPLE).gap(GAP);
+        for (name, roles) in people.into_iter().take(PEOPLE) {
+            let initials: String = name.split_whitespace().filter_map(|w| w.chars().next()).take(2).collect();
+            row_ = row_.child(col().min_w(0.0).gap(6.0).center()
+                .child(row().size(88.0, 88.0).mb(6.0).radius(44.0).center().border(1.0, ink(0.1))
+                    .linear_gradient(PI * 0.75, [(0.0, ink(0.22)), (1.0, ink(0.06))])
+                    .child(label(initials.to_uppercase(), 26.0, 600.0, ink(0.85))))
+                .child(label(name, 15.0, 600.0, Color::WHITE).truncate())
+                .child(label(roles.join(", "), 13.0, 500.0, ink(0.5)).truncate()));
+        }
+        page = page.child(col().w_full().gap(20.0).child(section_title("Cast & Crew")).child(row_));
+    }
+    let genres = names("genres").into_iter().chain(names("genre")).take(4).collect::<Vec<_>>();
+    let released = Some(date(s_(&m["released"]))).filter(|d| !d.is_empty()).unwrap_or_else(|| s_(&m["releaseInfo"]).to_string());
+    let facts = [("Released", released), ("Runtime", s_(&m["runtime"]).to_string()), ("Genres", genres.join(", ")),
+        ("Country", s_(&m["country"]).to_string()), ("Status", s_(&m["status"]).to_string()), ("Awards", s_(&m["awards"]).to_string())];
+    let facts: Vec<_> = facts.into_iter().filter(|(_, v)| !v.is_empty()).collect();
+    let synopsis = s_(&m["description"]);
+    if facts.is_empty() && synopsis.len() <= LONG_SYNOPSIS { return page }
+    let mut details = col().w_full().gap(20.0).child(section_title("Details"));
+    if synopsis.len() > LONG_SYNOPSIS {
+        details = details.child(label(synopsis.to_string(), 17.0, 400.0, ink(0.75)).font(TextStyle::new(17.0, 400.0).lh(27.0)).wrap().max_w(860.0));
+    }
+    let mut grid = row().w_full().equal_columns(4).gap(GAP);
+    for (k, v) in facts {
+        grid = grid.child(col().min_w(0.0).gap(6.0).pb(10.0)
+            .child(label(k, 13.0, 500.0, ink(0.5)))
+            .child(label(v, 15.0, 500.0, ink(0.9)).font(TextStyle::new(15.0, 500.0).lh(22.0)).wrap()));
+    }
+    page.child(details.child(grid))
 }
 
 fn login(s: &State) -> El {

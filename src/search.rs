@@ -39,7 +39,7 @@ pub fn catalogs(addons: &[Value]) -> Vec<Catalog> {
             let ty = s_(&c["type"]).to_string();
             let name = if seen.insert(ty.clone()) { type_label(&ty).to_string() }
                 else { format!("{} · {}", s_(&a["manifest"]["name"]), type_label(&ty)) };
-            out.push(Catalog { base: base(a), id: s_(&c["id"]).into(), ty, name, skip: false });
+            out.push(Catalog { base: base(a), id: s_(&c["id"]).into(), ty, name, ..Default::default() });
         }
     }
     out

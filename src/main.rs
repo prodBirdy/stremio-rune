@@ -57,11 +57,15 @@ const IMAGE_WORKERS: usize = 6;
 static DOWNLOADED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 const API: &str = "https://api.strem.io/api/";
+/// The API's answer to an authKey it no longer knows (signed out or expired).
+const NO_SESSION: &str = "Session does not exist";
 const SERVER: &str = "http://127.0.0.1:11470";
 
 enum Msg {
     Error(String),
     Auth(String),
+    /// The API no longer knows the session (signed out elsewhere or expired).
+    SignedOut,
     User(String),
     Addons(Vec<Value>),
     Library(Vec<Value>),
@@ -94,8 +98,11 @@ enum Msg {
 #[derive(Clone, PartialEq)]
 struct Stream { name: String, title: String, url: String }
 
+/// `name`: the catalog's name with its type, for Home rows; `title`: without the type or a
+/// repeat of the addon's name, for the Browse chips under the addon's tab (`addon`).
 /// `skip`: the catalog pages with the `skip` extra.
-struct Catalog { base: String, ty: String, id: String, name: String, skip: bool }
+#[derive(Default)]
+struct Catalog { base: String, ty: String, id: String, name: String, addon: String, title: String, skip: bool }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page { Login, Home, Browse(&'static str), Detail, Player, Search, Settings, Addons }
@@ -223,22 +230,27 @@ fn auth_file() -> PathBuf {
     dir.unwrap_or_default().join("stremio-rune").join("authKey")
 }
 
-/// The session of the installed Stremio desktop app (stremio-web's `profile` in WebView2
-/// localStorage), so a signed-in Stremio needs no second login.
+/// The sessions found in the installed Stremio desktop app (stremio-web's `profile` in WebView2
+/// localStorage), likeliest first, so a signed-in Stremio needs no second login. Old keys linger
+/// in the storage files, so `setup` asks the API which one still works.
 #[cfg(not(target_os = "macos"))]
-fn stremio_desktop_auth() -> Option<String> {
+fn stremio_desktop_auth() -> Vec<String> {
     let dir = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
         .join(r"Programs\Stremio\stremio-shell-ng.exe.WebView2\EBWebView\Default\Local Storage\leveldb");
-    let mut files: Vec<_> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).collect();
+    let mut files: Vec<_> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).collect();
     files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-    // byte scan of LevelDB, newest record wins; misses a key only in a snappy-compressed table
-    files.iter().rev().filter_map(|p| std::fs::read(p).ok()).find_map(|b| last_auth_key(&b))
+    // byte scan of LevelDB, newest file first; misses a key only in a snappy-compressed table
+    let mut keys = vec![];
+    for b in files.iter().rev().filter_map(|p| std::fs::read(p).ok()) { add_keys(&mut keys, &b) }
+    keys
 }
 
 /// The same on macOS, where Stremio's web UI runs in WebKit: its localStorage is SQLite under
-/// `~/Library/WebKit/<bundle id>`, values in UTF-16, so the scan drops the zero bytes first.
+/// `~/Library/WebKit/<bundle id>` (Stremio 6 keeps 5's), values in UTF-16, so the scan also
+/// drops the zero bytes. SQLite leaves replaced values in free pages: the last key in a file
+/// isn't always the current one.
 #[cfg(target_os = "macos")]
-fn stremio_desktop_auth() -> Option<String> {
+fn stremio_desktop_auth() -> Vec<String> {
     fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
         for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
             let p = e.path();
@@ -246,25 +258,31 @@ fn stremio_desktop_auth() -> Option<String> {
         }
     }
     let mut files = Vec::new();
-    walk(&PathBuf::from(std::env::var_os("HOME")?).join("Library/WebKit/com.westbridge.stremio5-mac"), &mut files);
+    let Some(home) = std::env::var_os("HOME") else { return vec![] };
+    walk(&PathBuf::from(home).join("Library/WebKit/com.westbridge.stremio5-mac"), &mut files);
     files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-    files.iter().rev().filter_map(|p| std::fs::read(p).ok())
-        .find_map(|b| last_auth_key(&b).or_else(|| last_auth_key(&b.into_iter().filter(|&c| c != 0).collect::<Vec<_>>())))
+    let mut keys = vec![];
+    for b in files.iter().rev().filter_map(|p| std::fs::read(p).ok()) {
+        add_keys(&mut keys, &b);
+        add_keys(&mut keys, &b.into_iter().filter(|&c| c != 0).collect::<Vec<_>>());
+    }
+    keys
 }
 
-/// The last `"auth":{"key":"…"` in a blob, unless a later `"auth":null` says it signed out.
-fn last_auth_key(bytes: &[u8]) -> Option<String> {
-    let find = |n: &[u8]| bytes.windows(n.len()).rposition(|w| w == n);
+/// Every `"auth":{"key":"…"` in a blob not yet in `keys`, the last one first.
+fn add_keys(keys: &mut Vec<String>, bytes: &[u8]) {
     let needle = br#""auth":{"key":""#;
-    let at = find(needle)?;
-    if find(br#""auth":null"#).is_some_and(|out| out > at) { return None }
-    let key: String = bytes[at + needle.len()..].iter().take_while(|b| b.is_ascii_alphanumeric()).map(|&b| b as char).collect();
-    (key.len() >= 16).then_some(key)
+    let mut end = bytes.len();
+    while let Some(at) = bytes[..end].windows(needle.len()).rposition(|w| w == needle) {
+        let key: String = bytes[at + needle.len()..].iter().take_while(|b| b.is_ascii_alphanumeric()).map(|&b| b as char).collect();
+        if key.len() >= 16 && !keys.contains(&key) { keys.push(key) }
+        end = at;
+    }
 }
 
 fn state() -> State {
     let (tx, rx) = channel();
-    let auth = std::fs::read_to_string(auth_file()).ok().filter(|k| !k.is_empty()).or_else(stremio_desktop_auth);
+    let auth = std::fs::read_to_string(auth_file()).ok().filter(|k| !k.is_empty());
     State {
         page: if auth.is_some() { Page::Home } else { Page::Login },
         email: TextEdit::new(""),
@@ -394,18 +412,33 @@ fn type_label(ty: &str) -> &str {
     match ty { "movie" => "Movies", "series" => "Shows", "channel" => "Channels", "tv" => "TV", other => other }
 }
 
+/// An addon's name without what follows a `|` (`Watchly | ElfHosted` is Watchly).
+fn addon_name(a: &Value) -> String {
+    let n = a["manifest"]["name"].as_str().unwrap_or("");
+    n.split('|').next().unwrap_or(n).trim().to_string()
+}
+
+/// A catalog's name without a leading repeat of its addon's (`Multiboxd - Watchlist` is Watchlist).
+fn catalog_title(name: &str, addon: &str) -> String {
+    let rest = name.get(..addon.len()).filter(|p| !addon.is_empty() && p.eq_ignore_ascii_case(addon))
+        .map(|_| name[addon.len()..].trim_start_matches([' ', '-', ':', '|', '·', '–']));
+    rest.filter(|r| !r.is_empty()).unwrap_or(name).to_string()
+}
+
 fn catalogs(addons: &[Value]) -> Vec<Catalog> {
     addons.iter().flat_map(|a| {
         let b = base(a);
+        let addon = addon_name(a);
         a["manifest"]["catalogs"].as_array().cloned().unwrap_or_default().into_iter()
             .filter(|c| !c["extra"].as_array().into_iter().flatten().any(|e| e["isRequired"] == true)
                 && c["extraRequired"].as_array().is_none_or(|r| r.is_empty()))
             .map(move |c| {
                 let ty = c["type"].as_str().unwrap_or("").to_string();
-                let name = format!("{} {}", c["name"].as_str().unwrap_or("?"), type_label(&ty));
+                let raw = c["name"].as_str().unwrap_or("?");
+                let (name, title) = (format!("{raw} {}", type_label(&ty)), catalog_title(raw, &addon));
                 let skip = c["extra"].as_array().into_iter().flatten().any(|e| e["name"] == "skip")
                     || c["extraSupported"].as_array().is_some_and(|x| x.iter().any(|e| e == "skip"));
-                Catalog { base: b.clone(), id: c["id"].as_str().unwrap_or("").into(), ty, name, skip }
+                Catalog { base: b.clone(), id: c["id"].as_str().unwrap_or("").into(), ty, name, addon: addon.clone(), title, skip }
             })
     }).collect()
 }
@@ -556,14 +589,27 @@ fn sign_out(s: &mut State) {
     s.status.clear();
 }
 
-/// Addons, library and the account's email, in parallel.
+/// Sign in with the first session from the Stremio app (see `stremio_desktop_auth`) the API
+/// still knows; none leaves the login page as it is.
+fn reuse_desktop_session(s: &mut State) {
+    s.status = "Looking for your Stremio session…".into();
+    spawn(s, || {
+        let key = stremio_desktop_auth().into_iter()
+            .find(|k| api("getUser", json!({ "type": "GetUser", "authKey": k })).is_ok());
+        key.map(Msg::Auth).ok_or_else(String::new)
+    });
+}
+
+/// Addons, library and the account's email, in parallel. A session the API no longer knows
+/// signs out.
 fn load_account(s: &mut State) {
     let Some(key) = s.auth.clone() else { return };
     s.status = "Loading your addons…".into();
     let k = key.clone();
-    spawn(s, move || {
-        let r = api("addonCollectionGet", json!({ "type": "AddonCollectionGet", "authKey": k, "update": true }))?;
-        Ok(Msg::Addons(r["addons"].as_array().cloned().unwrap_or_default()))
+    spawn(s, move || match api("addonCollectionGet", json!({ "type": "AddonCollectionGet", "authKey": k, "update": true })) {
+        Ok(r) => Ok(Msg::Addons(r["addons"].as_array().cloned().unwrap_or_default())),
+        Err(e) if e == NO_SESSION => Ok(Msg::SignedOut),
+        Err(e) => Err(e),
     });
     let k = key.clone();
     spawn(s, move || {
@@ -881,7 +927,7 @@ fn setup(s: &mut State, waker: Waker) {
         if let Some(w) = wake { w() }
     });
     start_image_workers(s);
-    load_account(s);
+    if s.auth.is_some() { load_account(s) } else if !cfg!(test) { reuse_desktop_session(s) }
     // A failed check stays quiet: the next start asks again.
     if !cfg!(test) { spawn(s, || Ok(Msg::Update(update::check().unwrap_or(None)))) }
 }
@@ -943,6 +989,10 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
                 s.page = Page::Home;
                 s.password.clear();
                 load_account(s);
+            }
+            Msg::SignedOut => {
+                sign_out(s);
+                s.status = "Your session ended. Sign in again.".into();
             }
             Msg::User(email) => s.user = email,
             Msg::Addons(addons) => {
@@ -1126,8 +1176,8 @@ fn demo(s: &mut State) {
     s.auth = None; // keep the real account from loading over the fake data
     s.focused = true;
     s.catalogs = vec![
-        Catalog { base: String::new(), ty: "movie".into(), id: "top".into(), name: "Popular Movies".into(), skip: false },
-        Catalog { base: String::new(), ty: "series".into(), id: "top".into(), name: "Popular Shows".into(), skip: false },
+        Catalog { ty: "movie".into(), id: "top".into(), name: "Popular Movies".into(), addon: "Cinemeta".into(), title: "Popular".into(), ..Default::default() },
+        Catalog { ty: "series".into(), id: "top".into(), name: "Popular Shows".into(), addon: "Cinemeta".into(), title: "Popular".into(), ..Default::default() },
     ];
     let item = |n: usize| json!({ "id": format!("tt{n}"), "type": "movie", "name": format!("The Long Quiet {n}"), "releaseInfo": "2026",
         "genres": ["Drama", "Mystery"], "runtime": "107 min", "imdbRating": "7.5",
@@ -1139,8 +1189,26 @@ fn demo(s: &mut State) {
     s.user = "jonas@example.com".into();
 }
 
+/// Credits and facts the way Cinemeta gives them.
+fn demo_credits() -> Value {
+    json!({ "director": ["Mara Ellison"], "writer": ["Mara Ellison", "Tomas Reyes"], "cast": ["Ines Kovač", "Daniel Okafor", "Ruth Amari", "Pavel Lind", "June Hartley"],
+        "released": "2026-03-14T00:00:00.000Z", "country": "United States, Morocco", "awards": "2 wins & 9 nominations" })
+}
+
+/// A series with credits and a season of episodes.
+fn demo_series(s: &State) -> Value {
+    let mut m = s.items[&0][0].clone();
+    for (k, v) in demo_credits().as_object().unwrap() { m[k] = v.clone() }
+    m["type"] = "series".into();
+    m["status"] = "Continuing".into();
+    m["releaseInfo"] = "2026–".into();
+    m["videos"] = (1..9).map(|e| json!({ "id": format!("tt1:1:{e}"), "season": 1, "episode": e, "title": format!("Episode {e}"), "rating": "8.1",
+        "released": format!("2026-03-{:02}T00:00:00.000Z", 3 * e), "overview": "The survey team reaches the dry lake and finds tracks that end in the middle of nowhere." })).collect();
+    m
+}
+
 fn demo_cat(ty: &str, name: &str) -> Catalog {
-    Catalog { base: String::new(), ty: ty.into(), id: "top".into(), name: name.into(), skip: false }
+    Catalog { ty: ty.into(), id: "top".into(), name: name.into(), ..Default::default() }
 }
 
 /// Demo playback for the player scenes.
@@ -1175,17 +1243,38 @@ fn main() {
         scenes: &[
             ("home", |s| { demo(s); s.page = Page::Home }),
             ("update", |s| { demo(s); s.page = Page::Home; s.update = Some(update::Release { version: "0.3.0-alpha".into(), page: String::new(), asset: None }) }),
-            ("browse", |s| { demo(s); s.page = Page::Browse("movie") }),
+            ("browse", |s| {
+                demo(s);
+                s.page = Page::Browse("movie");
+                let cat = |addon: &str, name: &str| Catalog { ty: "movie".into(), name: format!("{name} Movies"), addon: addon.into(),
+                    title: catalog_title(name, addon), ..Default::default() };
+                s.catalogs.push(cat("Cinemeta", "Featured"));
+                for n in ["Netflix", "Disney+", "Prime Video", "Apple TV+", "HBO Max", "Sky Go"] { s.catalogs.push(cat("Streaming Catalogs", n)) }
+                for n in ["Trending This Week", "Now Playing", "Sci-Fi Gems", "90s Classics"] { s.catalogs.push(cat("TMDB Discover+", n)) }
+                for n in ["Multiboxd - Watchlist", "Multiboxd - Recommended for You"] { s.catalogs.push(cat("Multiboxd", n)) }
+            }),
             ("detail", |s| {
                 demo(s);
                 s.page = Page::Detail;
-                let mut m = s.items[&0][0].clone();
-                m["type"] = "series".into();
-                m["videos"] = (1..9).map(|e| json!({ "id": format!("tt1:1:{e}"), "season": 1, "episode": e, "title": format!("Episode {e}") })).collect();
-                s.meta = Some(m);
+                s.meta = Some(demo_series(s));
                 s.stream_for = "tt1:1:2".into();
                 s.sheet = true;
                 s.streams = (1..5).map(|n| Stream { name: format!("Torrentio {n}080p"), title: "The.Long.Quiet.S01E02.1080p.WEB.h264\n👤 120 💾 2.1 GB".into(), url: String::new() }).collect();
+            }),
+            ("detail-movie", |s| {
+                demo(s);
+                s.page = Page::Detail;
+                let mut m = s.items[&0][0].clone();
+                for (k, v) in demo_credits().as_object().unwrap() { m[k] = v.clone() }
+                s.meta_id = "tt1".into();
+                s.meta = Some(m);
+            }),
+            ("detail-series", |s| {
+                demo(s);
+                s.page = Page::Detail;
+                s.meta = Some(demo_series(s));
+                s.stream_for = "tt1:1:2".into();
+                s.season = 1;
             }),
             ("search", |s| {
                 demo(s);
@@ -1700,6 +1789,9 @@ mod tests {
             s.page = Page::Detail;
         });
         assert!(!rt.state.sheet);
+        // The episodes sit under the hero: scroll down to them first.
+        rt.wheel(640.0, 400.0, -400.0);
+        for _ in 0..30 { rt.frame(1.0 / 60.0); }
         click(&mut rt, "ep-tt1:1:2");
         assert!(rt.state.sheet && rt.state.stream_for == "tt1:1:2");
         assert!(rt.find("sheet").is_some());
@@ -1829,7 +1921,7 @@ mod tests {
         let mut rt = runtime(|s| {
             demo(s);
             for i in 2..HOME_ROWS {
-                s.catalogs.push(Catalog { base: String::new(), ty: "movie".into(), id: format!("c{i}"), name: format!("Row {i}"), skip: false });
+                s.catalogs.push(Catalog { ty: "movie".into(), id: format!("c{i}"), name: format!("Row {i}"), ..Default::default() });
                 s.items.insert(i, (i * 10..i * 10 + 5).map(|n| json!({ "id": format!("tt{n}"), "name": "x",
                     "poster": format!("https://images.metahub.space/poster/small/tt{n}/img") })).collect());
             }
@@ -2118,9 +2210,17 @@ mod tests {
 
         let k = "0123456789abcdef0123";
         let old = format!(r#"x"auth":{{"key":"old0123456789abcdef","user":{{}}}}y"auth":{{"key":"{k}","user":{{}}}}"#);
-        assert_eq!(last_auth_key(old.as_bytes()).as_deref(), Some(k));
-        assert_eq!(last_auth_key(format!(r#"{old}"auth":null"#).as_bytes()), None);
-        assert_eq!(last_auth_key(b"nothing here"), None);
+        let mut keys = vec![];
+        add_keys(&mut keys, old.as_bytes());
+        add_keys(&mut keys, old.as_bytes());
+        add_keys(&mut keys, b"nothing here");
+        assert_eq!(keys, [k, "old0123456789abcdef"]);
+        assert_eq!(catalog_title("Multiboxd - Watchlist", "Multiboxd"), "Watchlist");
+        assert_eq!(catalog_title("Netflix", "Streaming Catalogs"), "Netflix");
+        assert_eq!(catalog_title("Multiboxd", "Multiboxd"), "Multiboxd");
+        assert_eq!(addon_name(&json!({ "manifest": { "name": "Watchly | ElfHosted" } })), "Watchly");
+        assert_eq!(ui::date("2008-01-28T05:00:00.000Z"), "Jan 28, 2008");
+        assert_eq!(ui::date(""), "");
         assert_eq!(ui::clock(3723.0), "1:02:03");
         assert_eq!(ui::clock(65.9), "1:05");
     }
