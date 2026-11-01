@@ -20,7 +20,9 @@ mod video;
 #[cfg(target_os = "macos")]
 #[path = "video_mac.rs"]
 mod video;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(target_os = "linux")]
+#[path = "video_linux.rs"]
+mod video;
 mod videotest;
 mod window;
 
@@ -249,6 +251,8 @@ struct State {
 fn auth_file() -> PathBuf {
     let dir = if cfg!(target_os = "macos") {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"))
+    } else if cfg!(target_os = "linux") {
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
     } else {
         std::env::var_os("APPDATA").or_else(|| std::env::var_os("HOME")).map(PathBuf::from)
     };
@@ -258,7 +262,7 @@ fn auth_file() -> PathBuf {
 /// The sessions found in the installed Stremio desktop app (stremio-web's `profile` in WebView2
 /// localStorage), likeliest first, so a signed-in Stremio needs no second login. Old keys linger
 /// in the storage files, so `setup` asks the API which one still works.
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 fn stremio_desktop_auth() -> Vec<String> {
     let Some(local) = std::env::var_os("LOCALAPPDATA") else { return vec![] };
     let dir = PathBuf::from(local)
@@ -275,7 +279,8 @@ fn stremio_desktop_auth() -> Vec<String> {
 /// `~/Library/WebKit/<bundle id>` (Stremio 6 keeps 5's), values in UTF-16, so the scan also
 /// drops the zero bytes. SQLite leaves replaced values in free pages: the last key in a file
 /// isn't always the current one.
-#[cfg(target_os = "macos")]
+/// Linux: stremio-linux-shell's WebKitGTK keeps it alike, under `~/.local/share/stremio/storage`.
+#[cfg(not(windows))]
 fn stremio_desktop_auth() -> Vec<String> {
     fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
         for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -285,7 +290,8 @@ fn stremio_desktop_auth() -> Vec<String> {
     }
     let mut files = Vec::new();
     let Some(home) = std::env::var_os("HOME") else { return vec![] };
-    walk(&PathBuf::from(home).join("Library/WebKit/com.westbridge.stremio5-mac"), &mut files);
+    let root = if cfg!(target_os = "macos") { "Library/WebKit/com.westbridge.stremio5-mac" } else { ".local/share/stremio/storage" };
+    walk(&PathBuf::from(home).join(root), &mut files);
     files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
     let mut keys = vec![];
     for b in files.iter().rev().filter_map(|p| std::fs::read(p).ok()) {
@@ -300,7 +306,7 @@ fn add_keys(keys: &mut Vec<String>, bytes: &[u8]) {
     let needle = br#""auth":{"key":""#;
     let mut end = bytes.len();
     while let Some(at) = bytes[..end].windows(needle.len()).rposition(|w| w == needle) {
-        let key: String = bytes[at + needle.len()..].iter().take_while(|b| b.is_ascii_alphanumeric()).map(|&b| b as char).collect();
+        let key: String = bytes[at + needle.len()..].iter().take_while(|b| b.is_ascii_alphanumeric() || b"-_+/=".contains(b)).map(|&b| b as char).collect();
         if key.len() >= 16 && !keys.contains(&key) { keys.push(key) }
         end = at;
     }
@@ -1388,7 +1394,6 @@ fn main() {
     // The video's frames are Direct3D textures (video.rs), which Rune imports on DX12 only.
     #[cfg(windows)]
     if std::env::var_os("WGPU_BACKEND").is_none() { unsafe { std::env::set_var("WGPU_BACKEND", "dx12") } }
-    #[cfg(any(windows, target_os = "macos"))]
     if videotest::run() { return }
     let app = rune::App::new(AppSpec {
         setup: Some(setup),

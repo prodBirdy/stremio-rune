@@ -38,6 +38,7 @@ fdeflate = { opt-level = 3 }
 # The app icon in the exe (build.rs).
 embed-resource = "3"
 
-# Rune with NativeSurface's Windows import (shared D3D textures), until it lands upstream.
+# Rune with NativeSurface's Windows import (shared D3D textures) and Linux import (dmabufs),
+# until they land upstream.
 [patch."https://github.com/anomalyco/rune"]
-rune = { git = "https://github.com/prodBirdy/rune", branch = "stremio-win-import" }
+rune = { git = "https://github.com/prodBirdy/rune", branch = "stremio-linux-import" }

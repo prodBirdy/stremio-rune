@@ -184,6 +184,7 @@ pub(super) fn player(s: &State) -> El {
             s.video_size = ((r[2] * k).round() as u32, (r[3] * k).round() as u32);
         })
         .cursor(if s.controls { Cursor::Default } else { Cursor::Hidden })
+        .on_pointer_move_local(|_: &mut State, p, tx: &mut Tx| { let p = p.window(); window::pointer_moved(p.x, p.y); tx.live_only() })
         .child(stage);
     if s.subs_open { root = root.child(subtitles(s)) } else if s.quality_open { root = root.child(quality(s)) } else if s.cast_open { root = root.child(tvs(s)) }
     root

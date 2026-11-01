@@ -60,6 +60,16 @@ fn cpu_seconds() -> f64 {
     t(&u.user) + t(&u.system)
 }
 
+/// Linux: user and system time from `/proc/self/stat`, in clock ticks of 1/100 s.
+#[cfg(target_os = "linux")]
+fn cpu_seconds() -> f64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    // Fields after the command's closing parenthesis; utime and stime are the 12th and 13th.
+    let rest = stat.rsplit_once(')').map_or("", |r| r.1);
+    let f: Vec<f64> = rest.split_whitespace().map(|v| v.parse().unwrap_or(0.0)).collect();
+    (f.get(11).unwrap_or(&0.0) + f.get(12).unwrap_or(&0.0)) / 100.0
+}
+
 fn log(line: &str) {
     use std::io::Write;
     eprintln!("{line}");

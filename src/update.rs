@@ -7,7 +7,7 @@ use serde_json::Value;
 
 const RELEASES: &str = "https://api.github.com/repos/prodBirdy/stremio-rune/releases?per_page=20";
 /// The release asset this platform updates from (the name's ending).
-const ASSET: &str = if cfg!(windows) { "-windows-setup.exe" } else { "-macos-arm64.zip" };
+const ASSET: &str = if cfg!(windows) { "-windows-setup.exe" } else if cfg!(target_os = "macos") { "-macos-arm64.zip" } else { "-linux-x86_64.tar.gz" };
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Release {
@@ -51,9 +51,11 @@ pub fn check() -> Result<Option<Release>, String> {
 /// How far an update has got: downloading (the share done, once the size is known), then
 /// installing.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub enum Progress { Downloading(Option<f32>), Installing }
 
 /// Download to `to`, telling `progress` at each whole percent.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn download(url: &str, to: &std::path::Path, progress: &dyn Fn(Progress)) -> Result<(), String> {
     use std::io::{Read, Write};
     let fail = |e: &dyn std::fmt::Display| format!("Couldn't download the update: {e}");
@@ -122,6 +124,12 @@ pub fn install(r: &Release, progress: &dyn Fn(Progress)) -> Result<(), String> {
     Command::new("/bin/sh").args(["-c", r#"while kill -0 "$1" 2>/dev/null; do sleep 0.2; done; open "$2"; rm -rf "$3""#, "sh"])
         .arg(std::process::id().to_string()).arg(&bundle).arg(&staging).process_group(0).spawn().map_err(|e| fail(&e))?;
     Ok(())
+}
+
+/// Linux: no self-update yet; the release page says where to get it.
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn install(_: &Release, _: &dyn Fn(Progress)) -> Result<(), String> {
+    Err("Updating in place isn't supported on Linux yet: rebuild from the repository".into())
 }
 
 #[cfg(test)]

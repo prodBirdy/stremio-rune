@@ -107,8 +107,20 @@ fn cloak(h: windows_sys::Win32::Foundation::HWND, on: bool) {
     unsafe { DwmSetWindowAttribute(h, DWMWA_CLOAK as _, (&raw const on).cast(), 4) };
 }
 
+/// Linux: Hyprland's own fullscreen on the focused window (this one: the key or double-click that
+/// asked came to it). Elsewhere on Linux there's no way through Rune yet.
 #[cfg(not(any(windows, target_os = "macos")))]
-pub fn toggle_fullscreen() -> bool { false }
+pub fn toggle_fullscreen() -> bool {
+    let pid = std::process::id();
+    // Hyprland 0.56+ dispatches Lua; older ones take the plain dispatcher (on the focused window).
+    let lua = format!(r#"hl.dsp.window.fullscreen({{ mode = "fullscreen", action = "toggle", window = "pid:{pid}" }})"#);
+    if linux::hyprctl(&["dispatch", &lua]).is_none() && linux::hyprctl(&["dispatch", "fullscreen", "0"]).is_none() { return false }
+    // What Hyprland says now, so a Super+F in between doesn't leave it the wrong way round.
+    let clients: Option<serde_json::Value> = linux::hyprctl(&["clients", "-j"]).and_then(|s| serde_json::from_str(&s).ok());
+    clients.as_ref().and_then(|c| c.as_array()).into_iter().flatten()
+        .find(|c| c["pid"].as_u64() == Some(pid as u64))
+        .is_some_and(|c| c["fullscreen"].as_u64().is_some_and(|f| f != 0))
+}
 
 /// Whether the window is fullscreen now, where the system can change that on its own (macOS:
 /// the green button, the menu bar); `None` where only `toggle_fullscreen` does.
@@ -245,7 +257,43 @@ pub fn cursor() -> (i32, i32) {
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-pub fn cursor() -> (i32, i32) { (0, 0) }
+pub fn cursor() -> (i32, i32) {
+    let v = linux::POINTER.load(std::sync::atomic::Ordering::Relaxed);
+    ((v >> 32) as i32, v as i32)
+}
+
+/// Linux: the pointer as the player view saw it move (the video is Rune's own surface here, so
+/// Rune sees the pointer over it); `cursor` reads it back.
+pub fn pointer_moved(_x: f32, _y: f32) {
+    #[cfg(not(any(windows, target_os = "macos")))]
+    linux::POINTER.store(((_x as i32 as u32 as u64) << 32) | _y as i32 as u32 as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+mod linux {
+    use std::sync::OnceLock;
+    use std::sync::atomic::AtomicU64;
+    pub static POINTER: AtomicU64 = AtomicU64::new(0);
+
+    pub fn hyprctl(args: &[&str]) -> Option<String> {
+        std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
+        let out = std::process::Command::new("hyprctl").args(args).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// The focused monitor's scale and width in points, from Hyprland; 1.0 and 1920 elsewhere.
+    pub fn monitor() -> (f32, f32) {
+        static M: OnceLock<(f32, f32)> = OnceLock::new();
+        *M.get_or_init(|| {
+            let mons: Option<serde_json::Value> = hyprctl(&["monitors", "-j"]).and_then(|s| serde_json::from_str(&s).ok());
+            let list = mons.as_ref().and_then(|m| m.as_array()).cloned().unwrap_or_default();
+            let m = list.iter().find(|m| m["focused"].as_bool() == Some(true)).or(list.first());
+            let scale = m.and_then(|m| m["scale"].as_f64()).unwrap_or(1.0) as f32;
+            let width = m.and_then(|m| m["width"].as_f64()).map_or(1920.0, |w| w as f32 / scale);
+            (scale, width)
+        })
+    }
+}
 
 /// Device pixels per point on the primary display, and its width in points (the widest the
 /// window gets), for sizing images.
@@ -259,10 +307,10 @@ pub fn screen_w() -> f32 {
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-pub fn scale() -> f32 { 2.0 }
+pub fn scale() -> f32 { linux::monitor().0 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-pub fn screen_w() -> f32 { 1920.0 }
+pub fn screen_w() -> f32 { linux::monitor().1 }
 
 /// Width of each caption button (minimize, maximize, close), in points, as Windows 11 draws them.
 pub const CAPTION_BUTTON_W: f32 = 46.0;
@@ -294,8 +342,9 @@ pub fn caption() -> Caption {
     }
 }
 
+/// Linux: the window manager draws the frame (Hyprland: none), so the app draws no strip.
 #[cfg(not(any(windows, target_os = "macos")))]
-pub fn caption() -> Caption { Caption { h: 32.0, ..Default::default() } }
+pub fn caption() -> Caption { Caption::default() }
 
 /// macOS: the strip is the transparent title bar's, 28 points as AppKit draws it, with the
 /// traffic lights at its left; AppKit drags and zooms from it.

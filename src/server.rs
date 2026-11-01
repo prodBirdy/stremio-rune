@@ -14,8 +14,11 @@ use std::time::Duration;
 pub fn stremio_dir() -> PathBuf {
     #[cfg(windows)]
     return PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_default()).join(r"Programs\Stremio");
-    #[cfg(not(windows))]
-    PathBuf::from("/Applications/Stremio.app/Contents/MacOS")
+    #[cfg(target_os = "macos")]
+    return PathBuf::from("/Applications/Stremio.app/Contents/MacOS");
+    // stremio-linux-shell (Arch) and the Flatpak-less packages put server.js here, and run it on the system node.
+    #[cfg(target_os = "linux")]
+    PathBuf::from("/usr/share/stremio")
 }
 
 pub fn running() -> bool {
@@ -36,7 +39,7 @@ pub fn ensure() -> Result<(), String> {
     // The server under a shell that stops it once this process is gone, however it ends.
     #[cfg(not(windows))]
     let mut cmd = {
-        let watch = r#""$1/node" "$1/server.js" & s=$!; while kill -0 "$2" 2>/dev/null && kill -0 $s 2>/dev/null; do sleep 1; done; kill $s 2>/dev/null"#;
+        let watch = r#"n="$1/node"; [ -x "$n" ] || n=node; "$n" "$1/server.js" & s=$!; while kill -0 "$2" 2>/dev/null && kill -0 $s 2>/dev/null; do sleep 1; done; kill $s 2>/dev/null"#;
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg(watch).arg("sh").arg(&dir).arg(std::process::id().to_string());
         cmd
