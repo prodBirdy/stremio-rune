@@ -216,12 +216,12 @@ fn player_card(s: &State) -> El {
         .child(line("Hardware decoding", toggle("hwdec", p.hwdec).on_press(|s: &mut State| set(s, |p| p.hwdec = !p.hwdec)))))
 }
 
-/// The hero's choices: the first row, the Watchlist, Up Next, then every catalog (a name two
-/// addons share carries the addon's).
-fn hero_choices(s: &State) -> Vec<(String, String)> {
+/// The hero's choices: the first row, the Watchlist, Up Next, then every Home catalog (a name
+/// two addons share carries the addon's).
+pub fn hero_choices(s: &State) -> Vec<(String, String)> {
     let fixed = [("", "First row"), ("watchlist", "Watchlist"), ("upnext", "Up Next")].map(|(k, n)| (k.to_string(), n.to_string()));
     let shared = |c: &Catalog| s.catalogs.iter().filter(|o| o.name == c.name).count() > 1;
-    fixed.into_iter().chain(s.catalogs.iter().map(|c| (catalog_key(c), if shared(c) { format!("{} · {}", c.name, c.addon) } else { c.name.clone() }))).collect()
+    fixed.into_iter().chain(s.catalogs.iter().filter(|c| !c.needs_genre).map(|c| (catalog_key(c), if shared(c) { format!("{} · {}", c.name, c.addon) } else { c.name.clone() }))).collect()
 }
 
 /// Pick any number of sections for the hero to cycle through; First row clears the rest. The

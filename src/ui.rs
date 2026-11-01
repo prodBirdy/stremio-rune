@@ -3,7 +3,7 @@
 
 use crate::*;
 use rune::tok::{TextStyle, motion};
-use rune::{Color, Cursor, Cx, Cycle, Drag, El, GrowthSpec, Phase, ScrollSpec, SurfaceFit, Transition, col, el, oklch, row, text, text_input};
+use rune::{Align, Color, Cursor, Cx, Cycle, Drag, El, GrowthSpec, Phase, ScrollSpec, Side, SurfaceFit, Transition, col, el, oklch, row, text, text_input};
 use std::f32::consts::PI;
 
 #[path = "search.rs"]
@@ -371,13 +371,39 @@ fn catalog_row(s: &State, i: usize) -> El {
     })
 }
 
+/// A catalog's Home row before its titles: the title over blank cards, which asks for the
+/// catalog once it nears the viewport; or, when it failed, the title over why.
+fn pending_row(s: &State, i: usize) -> El {
+    let head = row().w_full().h(36.0).center_y().child(label(&s.catalogs[i].name, 24.0, 600.0, Color::WHITE).truncate().grow(1.0).min_w(0.0));
+    let r = col().key(format!("row-{i}")).w_full().px(PAD).gap(16.0).child(head);
+    if let Some(e) = s.catalog_err.get(&i) { return r.child(label(format!("Couldn't load this catalog: {e}"), 15.0, 500.0, ink(0.5)).truncate()) }
+    let mut cards = row().w_full().equal_columns(ROW_CARDS).gap(GAP);
+    for _ in 0..ROW_CARDS {
+        cards = cards.child(col().gap(10.0).min_w(0.0)
+            .child(el().w_full().aspect_ratio(16.0 / 9.0).radius(14.0).fill(ink(0.05)))
+            .child(el().h(20.0).w_frac(0.6).radius(6.0).fill(ink(0.05)))
+            .child(el().h(17.0).w_frac(0.4).radius(6.0).fill(ink(0.05))))
+    }
+    r.child(cards).on_layout_tx(move |s: &mut State, [_, y, _, h], tx| {
+        tx.live_only();
+        if y < s.view_h * 2.0 && y + h > -s.view_h { fetch_catalog(s, i) }
+    })
+}
+
+/// Every catalog's row, as Stremio's board has them: addons in the account's order, catalogs in
+/// their manifest's; those that need an extra stay off (`catalogs`), as do those with no titles.
 fn home(s: &State) -> El {
     let mut page = col().w_full().gap(36.0).pb(56.0).child(hero(s));
     if !s.library.is_empty() { page = page.child(up_next(s)) }
     if !s.saved.is_empty() { page = page.child(watchlist(s)) }
     // The first catalog feeds the hero; its row starts after the hero's picks (`row_items`).
-    for i in 0..s.catalogs.len().min(HOME_ROWS) {
-        if s.items.contains_key(&i) { page = page.child(catalog_row(s, i)) }
+    for i in 0..s.catalogs.len() {
+        if s.catalogs[i].needs_genre { continue }
+        match s.items.get(&i) {
+            Some(items) if items.is_empty() => {}
+            Some(_) => page = page.child(catalog_row(s, i)),
+            None => page = page.child(pending_row(s, i)),
+        }
     }
     page
 }
@@ -421,16 +447,69 @@ fn browse(s: &State, ty: &str) -> El {
         }
         page = page.child(col().w_full().gap(0.0).child(tabs).child(el().h(1.0).w_full().fill(ink(0.08))));
     }
-    let mut chips = row().w_full().gap(8.0).flex_wrap();
+    let mut chips = row().grow(1.0).min_w(0.0).gap(8.0).flex_wrap();
     for (i, c) in cats.iter().filter(|(_, c)| open.is_none_or(|a| a == c.addon)) {
         let i = *i;
         chips = chips.child(chip(format!("cat-{i}"), c.title.clone(), i == s.selected).on_press(move |s: &mut State| open_catalog(s, i)));
     }
-    let mut grid = row().w_full().equal_columns(7).gap(GAP);
-    for m in s.items.get(&s.selected).into_iter().flatten() {
-        grid = grid.child(poster_card(s, m, format!("p-{}", s_(&m["id"]))));
+    // The genre filter sits at the chips' end, as a toolbar's would.
+    let mut bar = row().w_full().gap(24.0).child(chips);
+    if let Some(c) = s.catalogs.get(s.selected).filter(|c| c.ty == ty && !c.genres.is_empty()) { bar = bar.child(genre_button(s, c)) }
+    page = page.child(bar);
+    match browse_items(s) {
+        Some(Err(e)) => page.child(label(format!("Couldn't load this catalog: {e}"), 15.0, 500.0, ink(0.5))),
+        Some(Ok([])) => page.child(label("Nothing here yet.", 15.0, 500.0, ink(0.5))),
+        Some(Ok(items)) => {
+            let mut grid = row().w_full().equal_columns(7).gap(GAP);
+            for m in items { grid = grid.child(poster_card(s, m, format!("p-{}", s_(&m["id"])))) }
+            page.child(grid)
+        }
+        None => page,
     }
-    page.child(chips).child(grid)
+}
+
+/// The open catalog's genre as a pop-up button: an introductory "Genre", then the current one
+/// over up/down chevrons; a press opens `genre_menu` under it.
+fn genre_button(s: &State, c: &Catalog) -> El {
+    let chevron = |turn: f32| icon(s, |i| &i.next, 9.0).rotate(turn).opacity(0.7);
+    let button = tap(glass(row().key("genre").h(36.0).pl(16.0).pr(12.0).gap(10.0).radius(18.0).center_y())
+        .fill(if s.genre_open { ink(0.16) } else { ink(0.07) }).hover(ink(0.14))
+        .child(label(s.genre.clone().unwrap_or_else(|| "All Genres".into()), 15.0, 600.0, Color::WHITE))
+        .child(col().gap(-1.0).child(chevron(-PI / 2.0)).child(chevron(PI / 2.0))))
+        .on_press(|s: &mut State| { s.genre_open = !s.genre_open; s.genre_reveal = s.genre_open });
+    // Cinemeta's New takes years as its "genre": name what the choices are.
+    let years = c.genres.iter().all(|g| g.len() == 4 && g.bytes().all(|b| b.is_ascii_digit()));
+    row().gap(10.0).center_y().child(label(if years { "Year" } else { "Genre" }, 15.0, 500.0, ink(0.55))).child(button)
+}
+
+/// The genre pop-up's menu, under its button (above it when there's no room below), over a
+/// scrim that closes it: All Genres where the catalog allows it, then each genre; the current
+/// one checked. A long list scrolls, and opens on the current one.
+pub fn genre_menu(s: &State) -> Option<[El; 2]> {
+    let c = s.catalogs.get(s.selected).filter(|c| s.genre_open && !c.genres.is_empty())?;
+    let item = |key: String, words: String, on: bool, g: Option<String>| row().key(key).h(32.0).px(10.0).gap(6.0).radius(8.0).center_y().hover(ink(0.12))
+        .child(label(if on { "✓" } else { "" }, 13.0, 700.0, Color::WHITE).w(16.0))
+        .child(label(words, 14.0, 500.0, Color::WHITE).truncate().grow(1.0).min_w(0.0))
+        .on_press(move |s: &mut State| pick_genre(s, g.clone()));
+    let mut rows = col().w_full().padding(6.0);
+    if !c.needs_genre {
+        rows = rows.child(item("genre-all".into(), "All Genres".into(), s.genre.is_none(), None))
+            .child(el().h(1.0).mx(10.0).my(5.0).fill(ink(0.1)));
+    }
+    for (n, g) in c.genres.iter().enumerate() {
+        rows = rows.child(item(format!("genre-{n}"), g.clone(), s.genre.as_ref() == Some(g), Some(g.clone())));
+    }
+    let at = s.genre.as_ref().and_then(|g| c.genres.iter().position(|h| h == g)).map_or("genre-all".to_string(), |n| format!("genre-{n}"));
+    let list = col().key("genre-scroll").w_full().shrink().min_h(0.0).scroll(ScrollSpec { stick_bottom: false })
+        .scroll_edge_fade(16.0).scroll_margin(16.0).child(rows)
+        // Once laid out: a request made with the press would come before the list is there.
+        .on_layout_tx(move |s: &mut State, _, tx| if s.genre_reveal { s.genre_reveal = false; tx.scroll_center_instant(at.clone()) });
+    let menu = glass(col().key("genre-menu").w(220.0).max_h(440.0).radius(14.0).clip_rounded(14.0)).fill(bg().alpha(0.94))
+        .shadow(12.0, 32.0, Color::BLACK.alpha(0.45))
+        .transition(Transition::offset(0.0, -6.0).combined(Transition::opacity()))
+        .child(list)
+        .anchored_fit("genre", Side::Bottom, Align::End, 8.0);
+    Some([all(el()).key("genre-scrim").on_press(|s: &mut State| s.genre_open = false), menu])
 }
 
 fn detail(s: &State) -> El {
@@ -636,6 +715,7 @@ fn page(s: &State) -> El {
     // A click anywhere outside the open menu closes it.
     if s.menu { root = root.child(all(el()).key("menu-scrim").on_press(|s: &mut State| s.menu = false)) }
     root = root.child(nav(s));
+    if matches!(s.page, Page::Browse(_)) && let Some(m) = genre_menu(s) { for e in m { root = root.child(e) } }
     if s.sheet && s.page == Page::Detail { for e in sheet(s) { root = root.child(e) } }
     if !s.status.is_empty() { root = root.child(toast(s)) }
     root
