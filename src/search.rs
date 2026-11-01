@@ -59,10 +59,7 @@ pub fn typed(s: &mut State, _: &mut Tx) {
 /// Ask every search catalog. Answers for older text are dropped in `landed`.
 pub fn run(s: &mut State, q: String) {
     s.search.results.clear();
-    let enc: String = q.bytes().map(|b| match b {
-        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
-        _ => format!("%{b:02X}"),
-    }).collect();
+    let enc = url_enc(&q);
     for (i, c) in s.search.cats.iter().enumerate() {
         let (url, q) = (format!("{}/catalog/{}/{}/search={enc}.json", c.base, c.ty, c.id), q.clone());
         // Quiet on failure: one addon down shouldn't toast over the others' results.

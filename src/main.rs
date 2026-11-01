@@ -37,8 +37,7 @@ use std::time::{Duration, Instant};
 /// Height of the control bar, and width of the player's side panels, in points.
 const BAR: f32 = 64.0;
 const SUBS_W: f32 = 380.0;
-/// Catalogs shown as rows on Home, and cards per row (Rune has no horizontal scroll yet).
-const HOME_ROWS: usize = 6;
+/// Cards per Home row.
 const ROW_CARDS: usize = 5;
 /// Titles the Home hero cycles through, and how long each stays.
 const HERO_PICKS: usize = 5;
@@ -73,7 +72,10 @@ enum Msg {
     User(String),
     Addons(Vec<Value>),
     Library(Vec<Value>),
-    Catalog(usize, Vec<Value>),
+    /// A catalog's first page, or why it failed.
+    Catalog(usize, Result<Vec<Value>, String>),
+    /// A catalog's titles in one genre, for the Browse page.
+    Genre(usize, String, Result<Vec<Value>, String>),
     /// A further page of a catalog (empty when it has no more).
     More(usize, Vec<Value>),
     Image(String, image::RgbaImage),
@@ -114,9 +116,10 @@ struct Stream { name: String, title: String, url: String }
 
 /// `name`: the catalog's name with its type, for Home rows; `title`: without the type or a
 /// repeat of the addon's name, for the Browse chips under the addon's tab (`addon`).
-/// `skip`: the catalog pages with the `skip` extra.
+/// `skip`: the catalog pages with the `skip` extra. `genres`: the choices of its `genre` extra,
+/// and `needs_genre` when it answers only with one (Cinemeta's New); those stay off Home.
 #[derive(Default)]
-struct Catalog { base: String, ty: String, id: String, name: String, addon: String, title: String, skip: bool }
+struct Catalog { base: String, ty: String, id: String, name: String, addon: String, title: String, skip: bool, genres: Vec<String>, needs_genre: bool }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page { Login, Home, Browse(&'static str), Detail, Player, Search, Settings, Addons }
@@ -139,6 +142,16 @@ struct State {
     /// Catalog shown on a Browse page.
     selected: usize,
     items: HashMap<usize, Vec<Value>>,
+    /// Catalogs whose first page is on the way, and those that failed with why.
+    catalog_loading: HashSet<usize>,
+    catalog_err: HashMap<usize, String>,
+    /// The Browse page's genre (`None`: all, where the catalog allows it), its choices unfolded,
+    /// and the open catalog's titles in it once they land (catalog, genre, answer).
+    genre: Option<String>,
+    genre_open: bool,
+    /// The genre menu just opened: scroll it to the current genre once laid out.
+    genre_reveal: bool,
+    by_genre: Option<(usize, String, Result<Vec<Value>, String>)>,
     /// Continue watching, newest first.
     library: Vec<Value>,
     /// The Watchlist: the account's library proper (`library::listed`).
@@ -319,6 +332,12 @@ fn state() -> State {
         catalogs: vec![],
         selected: 0,
         items: HashMap::new(),
+        catalog_loading: HashSet::new(),
+        catalog_err: HashMap::new(),
+        genre: None,
+        genre_open: false,
+        genre_reveal: false,
+        by_genre: None,
         library: vec![],
         saved: vec![],
         people: vec![],
@@ -392,6 +411,14 @@ fn state() -> State {
 
 // ---- data ----
 
+/// `v` for a URL path segment, as JavaScript's `encodeURIComponent` (Stremio's extras).
+fn url_enc(v: &str) -> String {
+    v.bytes().map(|b| match b {
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+        _ => format!("%{b:02X}"),
+    }).collect()
+}
+
 fn get(url: &str) -> Result<Value, String> {
     ureq::get(url).call().map_err(|e| e.to_string())?.body_mut().read_json().map_err(|e| e.to_string())
 }
@@ -459,7 +486,7 @@ fn hero_sources(s: &State) -> Vec<HeroSource> {
         "upnext" => (!s.library.is_empty()).then_some(HeroSource::UpNext),
         k => s.catalogs.iter().position(|c| catalog_key(c) == k).map(HeroSource::Catalog),
     }).collect();
-    if v.is_empty() && !s.catalogs.is_empty() { vec![HeroSource::Catalog(0)] } else { v }
+    if v.is_empty() { s.catalogs.iter().position(|c| !c.needs_genre).map(HeroSource::Catalog).into_iter().collect() } else { v }
 }
 
 /// The hero's titles with each one's label and source, taken from its sources in turn: five
@@ -524,21 +551,28 @@ fn catalog_title(name: &str, addon: &str) -> String {
     rest.filter(|r| !r.is_empty()).unwrap_or(name).to_string()
 }
 
+/// The catalogs to browse, as Stremio's Discover has them: those that need no extra, or only a
+/// genre with choices to pick from (`needs_genre`); search, calendar and the like are left out.
 fn catalogs(addons: &[Value]) -> Vec<Catalog> {
     addons.iter().flat_map(|a| {
         let b = base(a);
         let addon = addon_name(a);
-        a["manifest"]["catalogs"].as_array().cloned().unwrap_or_default().into_iter()
-            .filter(|c| !c["extra"].as_array().into_iter().flatten().any(|e| e["isRequired"] == true)
-                && c["extraRequired"].as_array().is_none_or(|r| r.is_empty()))
-            .map(move |c| {
-                let ty = c["type"].as_str().unwrap_or("").to_string();
-                let raw = c["name"].as_str().unwrap_or("?");
-                let (name, title) = (format!("{raw} {}", type_label(&ty)), catalog_title(raw, &addon));
-                let skip = c["extra"].as_array().into_iter().flatten().any(|e| e["name"] == "skip")
-                    || c["extraSupported"].as_array().is_some_and(|x| x.iter().any(|e| e == "skip"));
-                Catalog { base: b.clone(), id: c["id"].as_str().unwrap_or("").into(), ty, name, addon: addon.clone(), title, skip }
-            })
+        a["manifest"]["catalogs"].as_array().cloned().unwrap_or_default().into_iter().filter_map(move |c| {
+            let extra: Vec<&Value> = c["extra"].as_array().into_iter().flatten().collect();
+            let required: Vec<&str> = extra.iter().filter(|e| e["isRequired"] == true).map(|e| ui::s_(&e["name"]))
+                .chain(c["extraRequired"].as_array().into_iter().flatten().map(ui::s_)).collect();
+            // Choices from the extra, or the older manifests' `genres`.
+            let genres: Vec<String> = extra.iter().find(|e| e["name"] == "genre").and_then(|e| e["options"].as_array())
+                .or(c["genres"].as_array()).into_iter().flatten().filter_map(|g| g.as_str().map(String::from)).collect();
+            let needs_genre = !required.is_empty();
+            if required.iter().any(|r| *r != "genre") || needs_genre && genres.is_empty() { return None }
+            let ty = c["type"].as_str().unwrap_or("").to_string();
+            let raw = c["name"].as_str().unwrap_or("?");
+            let (name, title) = (format!("{raw} {}", type_label(&ty)), catalog_title(raw, &addon));
+            let skip = extra.iter().any(|e| e["name"] == "skip")
+                || c["extraSupported"].as_array().is_some_and(|x| x.iter().any(|e| e == "skip"));
+            Some(Catalog { base: b.clone(), id: c["id"].as_str().unwrap_or("").into(), ty, name, addon: addon.clone(), title, skip, genres, needs_genre })
+        })
     }).collect()
 }
 
@@ -722,11 +756,13 @@ fn load_account(s: &mut State) {
     });
 }
 
+/// Fetch catalog `i`'s first page, unless it's loaded, on the way or failed.
 fn fetch_catalog(s: &mut State, i: usize) {
     let Some(c) = s.catalogs.get(i) else { return };
-    if s.items.contains_key(&i) { return }
+    if s.items.contains_key(&i) || s.catalog_loading.contains(&i) || s.catalog_err.contains_key(&i) { return }
     let url = format!("{}/catalog/{}/{}.json", c.base, c.ty, c.id);
-    spawn(s, move || Ok(Msg::Catalog(i, get(&url)?["metas"].as_array().cloned().unwrap_or_default())));
+    s.catalog_loading.insert(i);
+    spawn(s, move || Ok(Msg::Catalog(i, get(&url).map(|v| v["metas"].as_array().cloned().unwrap_or_default()))));
 }
 
 /// The titles a Home row pages through: the library, or a catalog's (the first one's after the
@@ -792,13 +828,40 @@ fn wheel_row(s: &mut State, r: usize, e: rune::WheelEvent) -> bool {
     true
 }
 
+/// Open catalog `i` on the Browse page: all its titles, or those of its first genre when it
+/// needs one.
 fn open_catalog(s: &mut State, i: usize) {
     s.selected = i;
-    fetch_catalog(s, i);
+    let first = s.catalogs.get(i).filter(|c| c.needs_genre).and_then(|c| c.genres.first().cloned());
+    pick_genre(s, first);
+}
+
+/// Show the open catalog's titles in genre `g`, or all of them (`None`).
+fn pick_genre(s: &mut State, g: Option<String>) {
+    s.genre_open = false;
+    s.genre = g.clone();
+    let i = s.selected;
+    let Some(g) = g else { return fetch_catalog(s, i) };
+    if s.by_genre.as_ref().is_some_and(|(j, h, _)| *j == i && *h == g) { return }
+    s.by_genre = None;
+    let Some(c) = s.catalogs.get(i) else { return };
+    let url = format!("{}/catalog/{}/{}/genre={}.json", c.base, c.ty, c.id, url_enc(&g));
+    spawn(s, move || Ok(Msg::Genre(i, g, get(&url).map(|v| v["metas"].as_array().cloned().unwrap_or_default()))));
+}
+
+/// The Browse page's titles: the open catalog's in its genre, or why they didn't come (`None`
+/// while on the way).
+fn browse_items(s: &State) -> Option<Result<&[Value], &str>> {
+    match &s.genre {
+        Some(g) => s.by_genre.as_ref().filter(|(i, h, _)| *i == s.selected && h == g)
+            .map(|(_, _, r)| r.as_ref().map(|v| &v[..]).map_err(String::as_str)),
+        None => s.items.get(&s.selected).map(|v| Ok(&v[..])).or_else(|| s.catalog_err.get(&s.selected).map(|e| Err(e.as_str()))),
+    }
 }
 
 fn go(s: &mut State, page: Page) {
     s.page = page;
+    s.genre_open = false;
     if page == Page::Addons { addons::open(s) }
     if let Page::Browse(ty) = page {
         if let Some(i) = s.catalogs.iter().position(|c| c.ty == ty) { open_catalog(s, i) }
@@ -992,6 +1055,7 @@ fn on_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
 /// Esc peels one layer: menu, sheet, fullscreen, playback, then the detail page.
 fn escape(s: &mut State) {
     if s.menu { s.menu = false }
+    else if s.genre_open { s.genre_open = false }
     else if s.sheet && s.page == Page::Detail { s.sheet = false }
     else if s.fullscreen { toggle_fullscreen(s) }
     else if s.page == Page::Player { stop(s) }
@@ -1129,26 +1193,35 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
                 s.catalogs = catalogs(&s.addons);
                 s.search.cats = search::catalogs(&s.addons);
                 s.items.clear();
+                s.catalog_loading.clear();
+                s.catalog_err.clear();
+                (s.genre, s.genre_open, s.by_genre) = (None, false, None);
                 s.row_at.clear();
                 s.more_loading.clear();
                 s.more_done.clear();
                 s.status.clear();
-                for i in 0..s.catalogs.len().min(HOME_ROWS) { fetch_catalog(s, i) }
-                // Hero sources further down than Home's rows.
-                for src in hero_sources(s) { if let HeroSource::Catalog(i) = src && i >= HOME_ROWS { fetch_catalog(s, i) } }
+                // The hero's sources now; Home's rows as they near the viewport (`ui::home`).
+                for src in hero_sources(s) { if let HeroSource::Catalog(i) = src { fetch_catalog(s, i) } }
             }
             Msg::Library(items) => {
                 s.saved = library::listed(&items);
                 s.library = continue_watching(items);
             }
             // Pictures ask for their images when laid out near the viewport (`ui::picture`).
-            Msg::Catalog(i, items) => {
+            Msg::Catalog(i, Err(e)) => {
+                s.catalog_loading.remove(&i);
+                s.catalog_err.insert(i, e);
+            }
+            Msg::Catalog(i, Ok(items)) => {
+                s.catalog_loading.remove(&i);
                 // The hero cycles through its sources' first titles: fetch all their backdrops now,
                 // so each turn shows its image at once instead of starting a download.
                 let feeds = hero_sources(s).contains(&HeroSource::Catalog(i));
                 s.items.insert(i, items);
                 if feeds { let heroes: Vec<String> = hero_picks(s).iter().filter_map(|(m, _, _)| ui::hero_img(backdrop(m))).collect(); want(s, heroes) }
             }
+            // Only for the genre still picked; an older pick's answer is dropped.
+            Msg::Genre(i, g, r) => if i == s.selected && s.genre.as_ref() == Some(&g) { s.by_genre = Some((i, g, r)) },
             Msg::More(r, metas) => more_landed(s, r, metas),
             Msg::Image(url, img) => if let Some(c) = &s.cache {
                 s.tick += 1;
@@ -1411,6 +1484,34 @@ fn main() {
                 for n in ["Netflix", "Disney+", "Prime Video", "Apple TV+", "HBO Max", "Sky Go"] { s.catalogs.push(cat("Streaming Catalogs", n)) }
                 for n in ["Trending This Week", "Now Playing", "Sci-Fi Gems", "90s Classics"] { s.catalogs.push(cat("TMDB Discover+", n)) }
                 for n in ["Multiboxd - Watchlist", "Multiboxd - Recommended for You"] { s.catalogs.push(cat("Multiboxd", n)) }
+            }),
+            ("browse-genre", |s| {
+                demo(s);
+                s.page = Page::Browse("movie");
+                s.catalogs.push(Catalog { ty: "movie".into(), id: "year".into(), name: "New Movies".into(), addon: "Cinemeta".into(), title: "New".into(),
+                    genres: (2010..=2026).rev().map(|y| y.to_string()).collect(), needs_genre: true, ..Default::default() });
+                (s.selected, s.genre, s.genre_open) = (2, Some("2025".into()), true);
+                s.by_genre = Some((2, "2025".into(), Ok(s.items[&1].clone())));
+            }),
+            ("browse-genre-all", |s| {
+                demo(s);
+                s.page = Page::Browse("movie");
+                s.catalogs[0].genres = ["Action", "Adventure", "Animation", "Biography", "Comedy", "Crime", "Documentary", "Drama", "Family", "Fantasy",
+                    "History", "Horror", "Mystery", "Romance", "Sci-Fi", "Sport", "Thriller", "War", "Western"].map(String::from).to_vec();
+                (s.genre, s.genre_open) = (Some("Drama".into()), true);
+                s.by_genre = Some((0, "Drama".into(), Ok(s.items[&0].clone())));
+            }),
+            ("home-rows", |s| {
+                demo(s);
+                s.page = Page::Home;
+                s.library.clear();
+                for (i, n) in ["Disney+ Movies", "Watchlist Movies", "Trending This Week Movies"].into_iter().enumerate() {
+                    s.catalogs.push(Catalog { ty: "movie".into(), id: format!("c{i}"), name: n.into(), ..Default::default() })
+                }
+                s.items.insert(3, vec![]);
+                s.catalog_err.insert(2, "http status: 503".into());
+                // Rows that would ask for their catalog stay blank: there's no addon behind them.
+                s.catalog_loading.insert(4);
             }),
             ("detail", |s| {
                 demo(s);
@@ -2176,7 +2277,7 @@ mod tests {
     fn home_queues_the_hero_first_then_rows_near_the_viewport_and_drops_them_on_leaving() {
         let mut rt = runtime(|s| {
             demo(s);
-            for i in 2..HOME_ROWS {
+            for i in 2..6 {
                 s.catalogs.push(Catalog { ty: "movie".into(), id: format!("c{i}"), name: format!("Row {i}"), ..Default::default() });
                 s.items.insert(i, (i * 10..i * 10 + 5).map(|n| json!({ "id": format!("tt{n}"), "name": "x",
                     "poster": format!("https://images.metahub.space/poster/small/tt{n}/img") })).collect());
@@ -2195,6 +2296,90 @@ mod tests {
         let queued: Vec<String> = rt.state.queue.0.lock().unwrap().iter().cloned().collect();
         assert!(!queued.is_empty() && queued.iter().all(|k| k.contains("/poster/")), "Home's queue dropped for Browse's posters");
         assert!(!rt.state.requested.contains(&card(6)), "and asked for again on return");
+    }
+
+    #[test]
+    fn home_has_a_row_per_catalog_loads_them_near_the_viewport_and_leaves_out_empty_ones() {
+        let mut rt = runtime(|s| {
+            demo(s);
+            for i in 2..40 { s.catalogs.push(Catalog { ty: "movie".into(), id: format!("c{i}"), name: format!("Row {i}"), ..Default::default() }) }
+            s.items.insert(2, vec![]);
+            s.catalog_err.insert(3, "timeout".into());
+            s.page = Page::Home;
+        });
+        for _ in 0..3 { rt.frame(1.0 / 60.0); }
+        assert!(rt.find("row-1").is_some() && rt.find("row-2").is_none(), "a catalog with no titles gets no row");
+        assert!(rt.find("row-3").is_some() && !rt.state.catalog_loading.contains(&3), "a failed one shows why, not asked again");
+        assert!(rt.state.catalog_loading.contains(&4), "a row near the viewport asks for its catalog");
+        assert!(rt.find("row-39").is_some() && !rt.state.catalog_loading.contains(&39), "every catalog has a row; far ones wait");
+    }
+
+    #[test]
+    fn catalogs_keep_those_that_need_only_a_genre_with_its_choices() {
+        let addon = json!({ "transportUrl": "https://cinemeta/manifest.json", "manifest": { "name": "Cinemeta", "catalogs": [
+            { "type": "movie", "id": "top", "name": "Popular", "extra": [{ "name": "genre", "options": ["Action", "Drama"] }, { "name": "skip" }] },
+            { "type": "movie", "id": "year", "name": "New", "extra": [{ "name": "genre", "options": ["2026", "2025"], "isRequired": true }] },
+            { "type": "movie", "id": "x", "name": "No choices", "extra": [{ "name": "genre", "isRequired": true }] },
+            { "type": "movie", "id": "last-videos", "name": "Last videos", "extra": [{ "name": "lastVideosIds", "isRequired": true }] },
+            { "type": "series", "id": "old", "name": "Old style", "genres": ["Anime"], "extraSupported": ["genre"], "extraRequired": ["genre"] },
+        ] } });
+        let got: Vec<_> = catalogs(&[addon]).into_iter().map(|c| (c.id, c.genres.join(","), c.needs_genre)).collect();
+        assert_eq!(got, [("top".into(), "Action,Drama".into(), false), ("year".into(), "2026,2025".into(), true), ("old".to_string(), "Anime".to_string(), true)]);
+        assert_eq!(url_enc("Sci-Fi & Fantasy"), "Sci-Fi%20%26%20Fantasy");
+    }
+
+    #[test]
+    fn browse_filters_by_genre_starting_on_the_first_where_the_catalog_needs_one() {
+        let mut rt = runtime(|s| {
+            demo(s);
+            s.catalogs[0].genres = vec!["Action".into(), "Drama".into()];
+            s.catalogs.push(Catalog { ty: "movie".into(), id: "year".into(), name: "New Movies".into(), addon: "Cinemeta".into(), title: "New".into(),
+                genres: vec!["2026".into(), "2025".into()], needs_genre: true, ..Default::default() });
+            s.page = Page::Home;
+        });
+        for _ in 0..3 { rt.frame(1.0 / 60.0); }
+        assert!(rt.find("row-2").is_none() && !rt.state.catalog_loading.contains(&2), "a catalog that needs a genre stays off Home");
+        assert!(!settings::hero_choices(&rt.state).iter().any(|c| c.1 == "New Movies"), "and off the hero's choices");
+        click(&mut rt, "nav-Movies");
+        assert!(rt.state.genre.is_none() && rt.find("p-tt1").is_some(), "Popular opens on all its titles");
+        click(&mut rt, "genre");
+        click(&mut rt, "genre-1");
+        assert_eq!(rt.state.genre.as_deref(), Some("Drama"));
+        assert!(rt.find("p-tt1").is_none() && rt.state.items[&0].len() == 8, "the genre's titles replace the grid, not Home's row");
+        click(&mut rt, "genre");
+        click(&mut rt, "genre-all");
+        assert!(rt.state.genre.is_none() && rt.find("p-tt1").is_some(), "All brings them back");
+
+        rt.key(KeyEvent { key: Key::Escape, mods: Default::default() });
+        assert!(!rt.state.genre_open, "Esc closes the genre menu");
+        // A long list opens scrolled to the current genre.
+        rt.state.catalogs[0].genres = (0..60).map(|n| format!("G{n}")).collect();
+        rt.state.genre = Some("G50".into());
+        click(&mut rt, "genre");
+        let (menu, item) = (rt.presented("genre-menu").unwrap().0, rt.presented("genre-50").unwrap().0);
+        assert!(item[1] >= menu[1] && item[1] + item[3] <= menu[1] + menu[3], "current genre in view: {item:?} in {menu:?}");
+        click(&mut rt, "genre-scrim");
+        assert!(!rt.state.genre_open, "a click beside it closes it");
+
+        click(&mut rt, "cat-2");
+        assert_eq!(rt.state.genre.as_deref(), Some("2026"), "New opens on its first genre");
+        click(&mut rt, "genre");
+        assert!(rt.find("genre-all").is_none(), "with no All to pick");
+        click(&mut rt, "genre-1");
+        // The real request has no host: it fails, and the page says so.
+        let t = Instant::now();
+        while !rt.state.by_genre.as_ref().is_some_and(|(_, g, _)| g == "2025") {
+            assert!(t.elapsed().as_secs() < 5, "no answer");
+            std::thread::sleep(Duration::from_millis(10));
+            rt.update(|s, tx| { poll(s, 0.0, tx); });
+        }
+        assert!(matches!(rt.state.by_genre, Some((2, _, Err(_)))));
+        let metas: Vec<Value> = rt.state.items[&1].clone();
+        rt.state.tx.send(Msg::Genre(2, "2026".into(), Ok(metas[..2].to_vec()))).unwrap();
+        rt.state.tx.send(Msg::Genre(2, "2025".into(), Ok(metas[2..].to_vec()))).unwrap();
+        rt.update(|s, tx| { poll(s, 0.0, tx); });
+        for _ in 0..5 { rt.frame(1.0 / 60.0); }
+        assert!(rt.find("p-tt9").is_none() && rt.find("p-tt11").is_some(), "only the picked genre's answer shows");
     }
 
     #[test]
@@ -2258,7 +2443,7 @@ mod tests {
     fn every_hero_backdrop_is_fetched_when_the_hero_titles_arrive() {
         let mut rt = runtime(|s| { demo(s); s.page = Page::Home; s.items.clear() });
         let titles: Vec<Value> = (1..9).map(|n| json!({ "id": format!("tt{n}"), "type": "movie", "name": "x" })).collect();
-        rt.state.tx.send(Msg::Catalog(0, titles.clone())).unwrap();
+        rt.state.tx.send(Msg::Catalog(0, Ok(titles.clone()))).unwrap();
         rt.update(|s, tx| { poll(s, 0.0, tx); });
         let queued: Vec<String> = rt.state.queue.0.lock().unwrap().iter().cloned().collect();
         for m in titles.iter().take(HERO_PICKS) {
