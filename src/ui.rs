@@ -146,6 +146,18 @@ fn nav(s: &State) -> El {
             .child(label(format!("Update to {version}"), 15.0, 600.0, Color::WHITE)))
             .on_press_tx(update_now));
     }
+    // An update on its way: how far, in place of the offer.
+    if let Some((r, p)) = &s.updating {
+        let version = r.version.split('-').next().unwrap_or(&r.version);
+        let (words, frac) = match p {
+            update::Progress::Downloading(Some(f)) => (format!("Updating to {version} · {}%", (f * 100.0) as u32), *f),
+            update::Progress::Downloading(None) => (format!("Updating to {version}…"), 0.0),
+            update::Progress::Installing => (format!("Installing {version}…"), 1.0),
+        };
+        pill = pill.child(row().key("nav-updating").h(38.0).pl(14.0).pr(16.0).gap(10.0).radius(19.0).center().fill(ink(0.1))
+            .child(label(words, 15.0, 600.0, Color::WHITE).font(TextStyle::new(15.0, 600.0).features("'tnum' 1")))
+            .child(progress(frac, 4.0).w(56.0)));
+    }
     let pill = pill.child(avatar);
     // The menu hangs off a plain wrapper so the pill's blur layer doesn't clip it.
     let mut anchor = el().child(pill);

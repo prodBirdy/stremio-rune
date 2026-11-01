@@ -104,6 +104,9 @@ enum Msg {
     Update(Option<update::Release>),
     /// The update is installed (macOS) or its Setup is running (Windows; it closes the app).
     Updating,
+    UpdateProgress(update::Progress),
+    /// The update didn't install: the offer comes back.
+    UpdateFailed(String),
 }
 
 #[derive(Clone, PartialEq)]
@@ -183,8 +186,9 @@ struct State {
     /// (video id, seconds) to start at when that video plays, from Continue Watching.
     resume: Option<(String, f64)>,
     status: String,
-    /// A newer release to offer.
+    /// A newer release to offer, and the one being installed with how far it has got.
     update: Option<update::Release>,
+    updating: Option<(update::Release, update::Progress)>,
     /// The streams side sheet on the detail page.
     sheet: bool,
     /// The profile menu under the avatar.
@@ -345,6 +349,7 @@ fn state() -> State {
         resume: None,
         status: String::new(),
         update: None,
+        updating: None,
         sheet: false,
         menu: false,
         fullscreen: false,
@@ -1056,8 +1061,12 @@ fn setup(s: &mut State, waker: Waker) {
 fn update_now(s: &mut State, tx: &mut Tx) {
     let Some(r) = s.update.take() else { return };
     if r.asset.is_some() {
-        s.status = format!("Updating to {}…", r.version);
-        spawn(s, move || update::install(&r).map(|()| Msg::Updating));
+        s.updating = Some((r.clone(), update::Progress::Downloading(None)));
+        let (tx, wake) = (s.tx.clone(), s.waker.clone());
+        spawn(s, move || {
+            let report = |p| { let _ = tx.send(Msg::UpdateProgress(p)); if let Some(w) = &wake { w() } };
+            Ok(update::install(&r, &report).map_or_else(Msg::UpdateFailed, |()| Msg::Updating))
+        });
     } else if let Err(e) = tx.open_url(&r.page) {
         s.status = format!("Couldn't open the release page ({e:?})");
     }
@@ -1186,6 +1195,11 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
             Msg::Update(Some(r)) => s.update = Some(r),
             // macOS: quit, and the new app opens (`update::install`).
             Msg::Updating => if cfg!(target_os = "macos") { tx.quit() },
+            Msg::UpdateProgress(p) => if let Some(u) = s.updating.as_mut() { u.1 = p },
+            Msg::UpdateFailed(e) => {
+                s.update = s.updating.take().map(|u| u.0);
+                s.status = e;
+            }
             Msg::Streams(vid, list) if vid == s.stream_for => {
                 s.streams.extend(list);
                 s.status.clear();
@@ -1383,6 +1397,11 @@ fn main() {
         scenes: &[
             ("home", |s| { demo(s); s.page = Page::Home }),
             ("update", |s| { demo(s); s.page = Page::Home; s.update = Some(update::Release { version: "0.3.0-alpha".into(), page: String::new(), asset: None }) }),
+            ("updating", |s| {
+                demo(s);
+                s.page = Page::Home;
+                s.updating = Some((update::Release { version: "0.3.0-alpha".into(), page: String::new(), asset: None }, update::Progress::Downloading(Some(0.42))));
+            }),
             ("browse", |s| {
                 demo(s);
                 s.page = Page::Browse("movie");

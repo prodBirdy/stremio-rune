@@ -39,28 +39,51 @@ fn newest(list: &Value, current: &str, suffix: &str) -> Option<Release> {
     Some(Release { version: tag(r).trim_start_matches('v').into(), page: r["html_url"].as_str().unwrap_or_default().into(), asset })
 }
 
-/// The newest release, if it's newer than this build.
+/// The newest release, if it's newer than this build. `STREMIO_RUNE_RELEASES=<url>` asks a
+/// release list there instead (GitHub's shape), to try updating without publishing one.
 pub fn check() -> Result<Option<Release>, String> {
-    let list: Value = ureq::get(RELEASES).header("Accept", "application/vnd.github+json").call().map_err(|e| e.to_string())?
+    let url = std::env::var("STREMIO_RUNE_RELEASES").unwrap_or_else(|_| RELEASES.into());
+    let list: Value = ureq::get(&url).header("Accept", "application/vnd.github+json").call().map_err(|e| e.to_string())?
         .body_mut().read_json().map_err(|e| e.to_string())?;
     Ok(newest(&list, env!("CARGO_PKG_VERSION"), ASSET))
 }
 
-fn download(url: &str, to: &std::path::Path) -> Result<(), String> {
+/// How far an update has got: downloading (the share done, once the size is known), then
+/// installing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Progress { Downloading(Option<f32>), Installing }
+
+/// Download to `to`, telling `progress` at each whole percent.
+fn download(url: &str, to: &std::path::Path, progress: &dyn Fn(Progress)) -> Result<(), String> {
+    use std::io::{Read, Write};
     let fail = |e: &dyn std::fmt::Display| format!("Couldn't download the update: {e}");
     let mut res = ureq::get(url).call().map_err(|e| fail(&e))?;
+    let total = res.headers().get("content-length").and_then(|v| v.to_str().ok()?.parse::<u64>().ok()).filter(|&n| n > 0);
     let mut file = std::fs::File::create(to).map_err(|e| fail(&e))?;
-    std::io::copy(&mut res.body_mut().as_reader(), &mut file).map_err(|e| fail(&e))?;
+    let (mut body, mut buf, mut done, mut shown) = (res.body_mut().as_reader(), vec![0u8; 1 << 16], 0u64, None);
+    progress(Progress::Downloading(None));
+    loop {
+        let n = body.read(&mut buf).map_err(|e| fail(&e))?;
+        if n == 0 { break }
+        file.write_all(&buf[..n]).map_err(|e| fail(&e))?;
+        done += n as u64;
+        let pct = total.map(|t| (done * 100 / t).min(100));
+        if pct.is_some() && pct != shown {
+            shown = pct;
+            progress(Progress::Downloading(total.map(|t| done as f32 / t as f32)));
+        }
+    }
     Ok(())
 }
 
 /// Download the release's Setup and start it with `--update`: it closes this app, installs over
 /// it and starts the new version.
 #[cfg(windows)]
-pub fn install(r: &Release) -> Result<(), String> {
+pub fn install(r: &Release, progress: &dyn Fn(Progress)) -> Result<(), String> {
     let url = r.asset.as_deref().ok_or("This release has no Windows Setup")?;
     let path = std::env::temp_dir().join(format!("stremio-rune-{}-setup.exe", r.version));
-    download(url, &path)?;
+    download(url, &path, progress)?;
+    progress(Progress::Installing);
     std::process::Command::new(&path).arg("--update").spawn().map_err(|e| format!("Couldn't start the update: {e}"))?;
     Ok(())
 }
@@ -69,7 +92,7 @@ pub fn install(r: &Release) -> Result<(), String> {
 /// (the caller quits). The new bundle is unpacked beside the old one, so the swap is two renames
 /// on one volume, and the old bundle comes back if the second fails.
 #[cfg(target_os = "macos")]
-pub fn install(r: &Release) -> Result<(), String> {
+pub fn install(r: &Release, progress: &dyn Fn(Progress)) -> Result<(), String> {
     use std::process::Command;
     let url = r.asset.as_deref().ok_or("This release has no macOS app")?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -81,7 +104,8 @@ pub fn install(r: &Release) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).map_err(|e| fail(&e))?;
     let zip = staging.join("update.zip");
-    download(url, &zip)?;
+    download(url, &zip, progress)?;
+    progress(Progress::Installing);
     let unzip = Command::new("ditto").args(["-x", "-k"]).arg(&zip).arg(&staging).status().map_err(|e| fail(&e))?;
     let new = std::fs::read_dir(&staging).map_err(|e| fail(&e))?.flatten().map(|e| e.path())
         .find(|p| p.extension().is_some_and(|e| e == "app"));
@@ -92,9 +116,11 @@ pub fn install(r: &Release) -> Result<(), String> {
         let _ = std::fs::rename(&old, &bundle);
         return Err(fail(&e));
     }
-    // Reopen once this process is gone, then clear the old bundle away.
+    // Reopen once this process is gone, then clear the old bundle away. In a process group of
+    // its own, so whatever started this app (a terminal) doesn't end it along with the app.
+    use std::os::unix::process::CommandExt;
     Command::new("/bin/sh").args(["-c", r#"while kill -0 "$1" 2>/dev/null; do sleep 0.2; done; open "$2"; rm -rf "$3""#, "sh"])
-        .arg(std::process::id().to_string()).arg(&bundle).arg(&staging).spawn().map_err(|e| fail(&e))?;
+        .arg(std::process::id().to_string()).arg(&bundle).arg(&staging).process_group(0).spawn().map_err(|e| fail(&e))?;
     Ok(())
 }
 
@@ -102,6 +128,33 @@ pub fn install(r: &Release) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn download_reports_each_percent_then_the_whole() {
+        use std::io::{Read, Write};
+        let body: Vec<u8> = (0..1_000_000u32).map(|i| i as u8).collect();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/update.zip", listener.local_addr().unwrap());
+        let served = body.clone();
+        std::thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            let mut head = [0u8; 1024];
+            let _ = c.read(&mut head);
+            let _ = c.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", served.len()).as_bytes());
+            let _ = c.write_all(&served);
+        });
+        let to = std::env::temp_dir().join(format!("stremio-rune-update-test-{}", std::process::id()));
+        let seen = std::cell::RefCell::new(vec![]);
+        download(&url, &to, &|p| seen.borrow_mut().push(p)).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), body);
+        let _ = std::fs::remove_file(&to);
+        let seen = seen.into_inner();
+        assert_eq!(seen.first(), Some(&Progress::Downloading(None)), "started, size not yet shown");
+        assert_eq!(seen.last(), Some(&Progress::Downloading(Some(1.0))), "ends whole");
+        let shares: Vec<f32> = seen.iter().filter_map(|p| match p { Progress::Downloading(Some(f)) => Some(*f), _ => None }).collect();
+        assert!(shares.windows(2).all(|w| w[0] < w[1]), "only forward");
+        assert!(shares.len() <= 101, "at most once a percent: {}", shares.len());
+    }
 
     #[test]
     fn offers_only_a_newer_release_with_this_platforms_asset() {
