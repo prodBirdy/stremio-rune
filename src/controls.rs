@@ -222,7 +222,6 @@ fn bar(s: &State) -> El {
             })
             .child(progress(if p.muted { 0.0 } else { (vol / 100.0) as f32 }, if s.vol_drag.is_some() { 6.0 } else { 4.0 }).w_full()))
         .child(el().w(8.0));
-    if p.started && p.buffering { bar = bar.child(label(format!("Buffering {}%", p.cache_pct as u32), 13.0, 500.0, ink(0.7))) }
     bar = bar.child(time(at)).child(track).child(time(p.dur));
     if !s.streams.is_empty() {
         let now = s.streams.iter().find(|st| st.url == s.playing).map_or("Quality", resolution);
