@@ -132,7 +132,7 @@ struct Catalog { base: String, ty: String, id: String, name: String, addon: Stri
 enum Page { Login, Home, Browse(&'static str), Detail, Player, Search, Settings, Addons }
 
 struct Icons {
-    play: Image, pause: Image, back: Image, close: Image, expand: Image, shrink: Image, subs: Image, search: Image, next: Image, cast: Image,
+    play: Image, pause: Image, rewind: Image, forward: Image, back: Image, close: Image, expand: Image, shrink: Image, subs: Image, search: Image, next: Image, cast: Image,
     // The caption buttons' glyphs, thin as Windows draws them.
     minimize: Image, maximize: Image, restore: Image, quit: Image,
     volume: Image, muted: Image,
@@ -216,6 +216,8 @@ struct State {
     /// The profile menu under the avatar.
     menu: bool,
     fullscreen: bool,
+    /// Picture-in-picture: the window small in a corner, video only (`window::pip`).
+    pip: bool,
     /// The app's title strip, where the system's title bar was.
     caption: window::Caption,
     /// Playback controls: shown while the mouse moves (see `poll`).
@@ -382,6 +384,7 @@ fn state() -> State {
         sheet: false,
         menu: false,
         fullscreen: false,
+        pip: false,
         caption: window::caption(),
         controls: true,
         volume_moved: None,
@@ -1057,6 +1060,7 @@ fn stop(s: &mut State) {
     cast::stop(s);
     s.cast_open = false;
     if s.player.is_some() { library::finish(s) }
+    window::pip::exit();
     if s.fullscreen { toggle_fullscreen(s) }
     s.subs_open = false;
     s.quality_open = false;
@@ -1071,6 +1075,7 @@ fn stop(s: &mut State) {
 }
 
 fn toggle_fullscreen(s: &mut State) {
+    window::pip::exit(); // from its saved size, not PiP's
     s.fullscreen = window::toggle_fullscreen();
 }
 
@@ -1136,6 +1141,8 @@ fn icons(cache: &ImageCache) -> Icons {
     Icons {
         play: icon("M7 5v14l12-7z"),
         pause: icon("M8 5v14M16 5v14"),
+        rewind: icon("M4 12a8 8 0 1 0 2.4-5.7M4 4v4h4"),
+        forward: icon("M20 12a8 8 0 1 1-2.4-5.7M20 4v4h-4"),
         back: icon("M15 18l-6-6 6-6"),
         close: icon("M6 6l12 12M18 6L6 18"),
         expand: icon("M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"),
@@ -1209,6 +1216,7 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
         changed |= controls != s.controls;
         s.controls = controls;
         player.set_video_size(s.video_size.0, s.video_size.1);
+        if let Some(a) = player.property("video-params/aspect").and_then(|a| a.parse().ok()) { window::set_pip_aspect(a) }
         remember_volume(s);
         library::tick(s);
         cast::tick(s);
@@ -1339,6 +1347,10 @@ fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
     if caption != s.caption { s.caption = caption; changed = true }
     // macOS: the window also leaves fullscreen by its green button or the menu bar's.
     if let Some(on) = window::fullscreen_now() && on != s.fullscreen { s.fullscreen = on; changed = true }
+    window::pip::arm(s.page == Page::Player && !s.fullscreen && s.cast.is_none());
+    window::pip::poll();
+    let pip = window::pip::on();
+    if pip != s.pip { s.pip = pip; changed = true }
     changed
 }
 

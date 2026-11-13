@@ -686,7 +686,7 @@ pub fn view(s: &State, _: &mut Cx<State>) -> El {
 }
 
 /// Height of the title strip over the page: where content starts.
-fn top(s: &State) -> f32 { if s.fullscreen { 0.0 } else { s.caption.h } }
+fn top(s: &State) -> f32 { if s.fullscreen || s.pip { 0.0 } else { s.caption.h } }
 
 fn title_bar(s: &State) -> El {
     let c = &s.caption;

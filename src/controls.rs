@@ -156,7 +156,9 @@ pub(super) fn player(s: &State) -> El {
     let mut stage = col().grow(1.0).min_w(0.0).h_full()
         .child(el().key("video").w_full().grow(1.0).on_press(click_video).on_double_press_tx(fullscreen));
     if let Some(c) = &s.cast { stage = stage.child(casting(s, c)) } else if p.loading() { stage = stage.child(loader(s)) }
-    if s.controls {
+    if s.pip {
+        stage = stage.child(pip(s));
+    } else if s.controls {
         // Back and the title along the top, below the title strip, on a scrim of their own.
         stage = stage.child(row().key("top-bar").pin(Some(0.0), Some(0.0), Some(0.0), None).h(BAR + 48.0 + top(s))
             .pt(top(s)).px(14.0).pb(48.0).gap(12.0).center_y()
@@ -285,6 +287,32 @@ fn bar(s: &State) -> El {
             .on_press(|s: &mut State| { s.subs_open = !s.subs_open; s.quality_open = false; s.cast_open = false }))
         .child(round("fullscreen", false).child(icon(s, |i| if s.fullscreen { &i.shrink } else { &i.expand }, 18.0))
             .on_press_tx(fullscreen))
+}
+
+/// PiP's overlay, as Arc's: it drags the window from anywhere, and on hover shows close at the
+/// top left, back to the full window at the top right, ±10 s and play/pause in the middle, and
+/// a seek bar along the bottom.
+fn pip(s: &State) -> El {
+    let o = all(el()).key("pip").window_drag().on_hover_change(|s: &mut State, inside, _| s.bar_hover = inside);
+    if !s.controls { return o }
+    let p = &s.playback;
+    let at = s.scrub.map_or(p.pos, |f| f as f64 * p.dur);
+    let frac = if p.dur > 0.0 { (at / p.dur) as f32 } else { 0.0 };
+    let round = |key: &str, size: f32| tap(row().key(key.to_string()).size(size, size).radius(size / 2.0).center()
+        .fill(Color::BLACK.alpha(0.4)).hover(ink(0.22)));
+    o.fill(Color::BLACK.alpha(0.3))
+        .child(row().key("pip-middle").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).center().gap(16.0)
+            .child(round("pip-back", 36.0).child(icon(s, |i| &i.rewind, 18.0)).on_press(|s: &mut State| mpv(s, &["seek", "-10"])))
+            .child(round("pip-toggle", 48.0).child(icon(s, |i| if p.paused { &i.play } else { &i.pause }, 22.0))
+                .on_press(|s: &mut State| mpv(s, &["cycle", "pause"])))
+            .child(round("pip-fwd", 36.0).child(icon(s, |i| &i.forward, 18.0)).on_press(|s: &mut State| mpv(s, &["seek", "10"]))))
+        .child(round("pip-close", 28.0).pin(Some(8.0), Some(8.0), None, None).child(icon(s, |i| &i.close, 12.0)).on_press(stop))
+        .child(round("pip-full", 28.0).pin(None, Some(8.0), Some(8.0), None).child(icon(s, |i| &i.expand, 12.0))
+            .on_press(|_: &mut State| window::pip::exit()))
+        .child(row().key("pip-seek").pin(Some(12.0), None, Some(12.0), Some(4.0)).h(16.0).center_y().cursor(Cursor::Pointer)
+            .on_layout(|s: &mut State, r| s.seek_w = r[2])
+            .on_drag(seek)
+            .child(progress(frac, if s.scrub.is_some() { 5.0 } else { 3.0 }).w_full()))
 }
 
 /// A choice in a side panel: a dot when it's the current one, and an optional second line.
