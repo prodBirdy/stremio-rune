@@ -58,6 +58,150 @@ pub fn toggle_fullscreen() -> bool {
     }
 }
 
+/// Picture-in-picture: minimizing while a video plays shrinks the window instead to a small
+/// always-on-top one in the screen's bottom-right corner, shaped like the video. The app draws
+/// its controls and drags it (`controls::pip`); the window resizes from its edges, keeping the
+/// shape. Windows: the minimize from the caption button, taskbar or Win+Down is caught before
+/// it happens; macOS: the window comes straight back from the Dock (`mac::pip`).
+static PIP_ASPECT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The playing video's width over height, for PiP's shape. Set by the app as mpv reports it.
+pub fn set_pip_aspect(a: f32) {
+    if a.is_finite() && (0.3..5.0).contains(&a) { PIP_ASPECT.store(a.to_bits(), std::sync::atomic::Ordering::Relaxed) }
+}
+
+/// The video's shape, 16:9 until mpv says.
+#[cfg(any(windows, target_os = "macos"))]
+fn pip_aspect() -> f32 {
+    Some(f32::from_bits(PIP_ASPECT.load(std::sync::atomic::Ordering::Relaxed))).filter(|a| *a > 0.0).unwrap_or(16.0 / 9.0)
+}
+
+/// PiP's size for a work area `w` points wide: a quarter of it, at least 320.
+#[cfg(any(windows, target_os = "macos"))]
+fn pip_size(w: f64) -> (f64, f64) {
+    let pw = (w / 4.0).max(320.0);
+    (pw, pw / pip_aspect() as f64)
+}
+
+#[cfg(windows)]
+pub mod pip {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows_sys::Win32::Foundation::{HWND, RECT};
+    use windows_sys::Win32::Graphics::Dwm::{DWM_WINDOW_CORNER_PREFERENCE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_ROUND, DwmSetWindowAttribute};
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
+    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+    /// Whether a minimize goes to PiP now: set by the app each `poll`.
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    /// The style and placement to go back to, while in PiP.
+    static SAVED: Mutex<Option<(isize, WINDOWPLACEMENT)>> = Mutex::new(None);
+
+    pub fn arm(on: bool) { ARMED.store(on, Ordering::Relaxed) }
+
+    pub fn on() -> bool { SAVED.lock().unwrap_or_else(|e| e.into_inner()).is_some() }
+
+    /// macOS catches its minimize here; Windows in the window proc (`enter`).
+    pub fn poll() {}
+
+    /// For the window's `SC_MINIMIZE`: whether it went to PiP instead. Already in PiP, it
+    /// minimizes for real.
+    pub(crate) fn enter(hwnd: HWND) -> bool {
+        if !ARMED.load(Ordering::Relaxed) || on() { return false }
+        unsafe {
+            let mut place: WINDOWPLACEMENT = std::mem::zeroed();
+            place.length = size_of::<WINDOWPLACEMENT>() as u32;
+            let mut mi: MONITORINFO = std::mem::zeroed();
+            mi.cbSize = size_of::<MONITORINFO>() as u32;
+            if GetWindowPlacement(hwnd, &mut place) == 0 || GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi) == 0 {
+                return false;
+            }
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            // Saved before the style changes: those re-enter the window proc, which asks `on`.
+            *SAVED.lock().unwrap_or_else(|e| e.into_inner()) = Some((style, place));
+            let r = mi.rcWork;
+            let k = GetDpiForWindow(hwnd) as f64 / 96.0;
+            let (w, h) = super::pip_size((r.right - r.left) as f64 / k);
+            let (w, h, m) = ((w * k) as i32, (h * k) as i32, (16.0 * k) as i32);
+            super::cloak(hwnd, true);
+            if IsZoomed(hwnd) != 0 { ShowWindow(hwnd, SW_RESTORE); }
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_OVERLAPPEDWINDOW as isize));
+            SetWindowPos(hwnd, HWND_TOPMOST, r.right - w - m, r.bottom - h - m, w, h, SWP_FRAMECHANGED);
+            corners(hwnd, DWMWCP_ROUND);
+            super::cloak(hwnd, false);
+        }
+        true
+    }
+
+    /// Windows 11 rounds a window without a caption only when asked; Windows 10 ignores it.
+    fn corners(hwnd: HWND, c: DWM_WINDOW_CORNER_PREFERENCE) {
+        unsafe { DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE as _, (&raw const c).cast(), 4) };
+    }
+
+    /// What the system does at client point (x, y) of a `w`×`h` PiP window: resize at the
+    /// edges; inside, it's the app's (its controls, and a drag anywhere else).
+    pub(crate) fn hit(x: i32, y: i32, w: i32, h: i32, dpi: u32) -> u32 {
+        let edge = 6 * dpi as i32 / 96;
+        let (l, r, t, b) = (x < edge, x >= w - edge, y < edge, y >= h - edge);
+        match (t, b, l, r) {
+            (true, _, true, _) => HTTOPLEFT, (true, _, _, true) => HTTOPRIGHT,
+            (_, true, true, _) => HTBOTTOMLEFT, (_, true, _, true) => HTBOTTOMRIGHT,
+            (true, ..) => HTTOP, (_, true, ..) => HTBOTTOM, (_, _, true, _) => HTLEFT, (.., true) => HTRIGHT,
+            _ => HTCLIENT,
+        }
+    }
+
+    /// `WM_SIZING`: keep the video's shape, and at least 240 points wide, from the edge or
+    /// corner (`WMSZ_*`) being dragged; the opposite side stays put.
+    pub(crate) fn sizing(edge: u32, r: &mut RECT, dpi: u32, aspect: f32) {
+        let min_w = 240 * dpi as i32 / 96;
+        let w = if matches!(edge, WMSZ_TOP | WMSZ_BOTTOM) { ((r.bottom - r.top) as f32 * aspect) as i32 } else { r.right - r.left }.max(min_w);
+        let h = (w as f32 / aspect) as i32;
+        if matches!(edge, WMSZ_LEFT | WMSZ_TOPLEFT | WMSZ_BOTTOMLEFT) { r.left = r.right - w } else { r.right = r.left + w }
+        if matches!(edge, WMSZ_TOP | WMSZ_TOPLEFT | WMSZ_TOPRIGHT) { r.top = r.bottom - h } else { r.bottom = r.top + h }
+    }
+
+    #[test]
+    fn edges_resize_keeping_the_shape() {
+        let at = |x, y| hit(x, y, 400, 225, 96);
+        assert_eq!((at(0, 0), at(399, 224), at(200, 0), at(0, 100), at(200, 100)), (HTTOPLEFT, HTBOTTOMRIGHT, HTTOP, HTLEFT, HTCLIENT));
+        let mut r = RECT { left: 100, top: 100, right: 600, bottom: 300 };
+        sizing(WMSZ_BOTTOMRIGHT, &mut r, 96, 2.0);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (100, 100, 600, 350), "width leads, height follows");
+        sizing(WMSZ_TOP, &mut r, 96, 2.0);
+        assert_eq!((r.left, r.right, r.bottom - r.top), (100, 600, 250), "the top edge: width follows the height");
+        sizing(WMSZ_TOPLEFT, &mut r, 96, 2.0);
+        assert_eq!((r.right, r.bottom), (600, 350), "the opposite corner stays put");
+        r.left = r.right - 50;
+        sizing(WMSZ_LEFT, &mut r, 96, 2.0);
+        assert_eq!(r.right - r.left, 240, "not smaller than its controls");
+    }
+
+    /// Back to the window as it was before PiP; nothing if not in PiP.
+    pub fn exit() {
+        let Some((style, place)) = SAVED.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+        let hwnd = super::chrome::main();
+        if hwnd.is_null() { return }
+        unsafe {
+            super::cloak(hwnd, true);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+            corners(hwnd, DWMWCP_DEFAULT);
+            SetWindowPlacement(hwnd, &place);
+            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED);
+            super::cloak(hwnd, false);
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub mod pip {
+    pub fn arm(_: bool) {}
+    pub fn on() -> bool { false }
+    pub fn poll() {}
+    pub fn exit() {}
+}
+
 /// The taskbar, through `ITaskbarList2`'s vtable (windows-sys has no COM wrappers).
 #[cfg(windows)]
 mod taskbar {
@@ -335,7 +479,7 @@ pub mod chrome {
         GWL_STYLE, GetClientRect, GetWindowLongPtrW, HTCAPTION, HTCLIENT, HTMAXBUTTON, HTTOP, HTTOPLEFT, HTTOPRIGHT,
         IsZoomed, NCCALCSIZE_PARAMS, SM_CXPADDEDBORDER, SM_CYCAPTION, SM_CYSIZEFRAME, SWP_FRAMECHANGED, SWP_NOACTIVATE,
         SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK,
-        WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_SIZE, WM_SYSCOMMAND, WS_CAPTION,
+        WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_SIZE, WM_SIZING, WM_SYSCOMMAND, WS_CAPTION,
     };
 
     /// The app window, from `App::on_window`.
@@ -421,6 +565,18 @@ pub mod chrome {
         let custom = captioned(hwnd);
         match msg {
             WM_SIZE => wake(), // maximized or restored: the strip's height and icon change
+            WM_SYSCOMMAND if (wp & 0xFFF0) as u32 == super::SC_MINIMIZE && super::pip::enter(hwnd) => return 0,
+            WM_NCHITTEST if !custom && super::pip::on() => unsafe {
+                let mut pt = POINT { x: (lp & 0xFFFF) as i16 as i32, y: ((lp >> 16) & 0xFFFF) as i16 as i32 };
+                let mut r: RECT = std::mem::zeroed();
+                ScreenToClient(hwnd, &mut pt);
+                GetClientRect(hwnd, &mut r);
+                return super::pip::hit(pt.x, pt.y, r.right, r.bottom, GetDpiForWindow(hwnd)) as LRESULT;
+            },
+            WM_SIZING if super::pip::on() => unsafe {
+                super::pip::sizing(wp as u32, &mut *(lp as *mut RECT), GetDpiForWindow(hwnd), super::pip_aspect());
+                return 1;
+            },
             WM_NCCALCSIZE if custom && wp != 0 => unsafe {
                 let p = lp as *mut NCCALCSIZE_PARAMS;
                 let top = (*p).rgrc[0].top;
@@ -474,7 +630,7 @@ pub mod chrome {
 }
 
 #[cfg(target_os = "macos")]
-pub use mac::{chrome, cursor, fullscreen_now, scale, screen_w, toggle_fullscreen};
+pub use mac::{chrome, cursor, fullscreen_now, pip, scale, screen_w, toggle_fullscreen};
 
 /// macOS: Rune's window is an AppKit `NSWindow` with full-size content under a transparent title
 /// bar; fullscreen is AppKit's own (its own Space, the menu bar on hover), and the pointer and
@@ -565,6 +721,89 @@ mod mac {
     pub fn scale() -> f32 { display().map_or(2.0, |(w, px)| px / w) }
 
     pub fn screen_w() -> f32 { display().map_or(1920.0, |(w, _)| w) }
+
+    /// PiP on macOS. AppKit minimizes on its own (the yellow button, ⌘M, the Window menu), so
+    /// `poll` notices the window in the Dock while armed and brings it straight back, small,
+    /// floating over other apps on every Space, its traffic lights hidden.
+    pub mod pip {
+        use super::*;
+        use objc2::{Encode, Encoding, class};
+        use std::sync::atomic::AtomicBool;
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Point { x: f64, y: f64 }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Size { w: f64, h: f64 }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Rect { o: Point, s: Size }
+        unsafe impl Encode for Point { const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]); }
+        unsafe impl Encode for Size { const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]); }
+        unsafe impl Encode for Rect { const ENCODING: Encoding = Encoding::Struct("CGRect", &[Point::ENCODING, Size::ENCODING]); }
+
+        /// `NSFloatingWindowLevel`, and `NSWindowCollectionBehaviorCanJoinAllSpaces`.
+        const FLOATING: isize = 3;
+        const ALL_SPACES: usize = 1;
+
+        static ARMED: AtomicBool = AtomicBool::new(false);
+        /// The frame, level and Spaces behavior to go back to, while in PiP.
+        static SAVED: Mutex<Option<(Rect, isize, usize)>> = Mutex::new(None);
+
+        pub fn arm(on: bool) { ARMED.store(on, Ordering::Relaxed) }
+
+        pub fn on() -> bool { SAVED.lock().unwrap_or_else(|e| e.into_inner()).is_some() }
+
+        /// The close, minimize and zoom buttons.
+        fn traffic_lights(w: *mut AnyObject, hidden: bool) {
+            for b in 0usize..3 {
+                let button: *mut AnyObject = unsafe { msg_send![w, standardWindowButton: b] };
+                if !button.is_null() { let _: () = unsafe { msg_send![button, setHidden: hidden] }; }
+            }
+        }
+
+        /// From the app's `poll`: the window went to the Dock while a video plays.
+        pub fn poll() {
+            let Some(w) = window() else { return };
+            if !ARMED.load(Ordering::Relaxed) || on() { return }
+            let mini: bool = unsafe { msg_send![w, isMiniaturized] };
+            if !mini { return }
+            unsafe {
+                let mut screen: *mut AnyObject = msg_send![w, screen];
+                if screen.is_null() { screen = msg_send![class!(NSScreen), mainScreen] }
+                if screen.is_null() { return }
+                let area: Rect = msg_send![screen, visibleFrame];
+                let frame: Rect = msg_send![w, frame];
+                let level: isize = msg_send![w, level];
+                let spaces: usize = msg_send![w, collectionBehavior];
+                *SAVED.lock().unwrap_or_else(|e| e.into_inner()) = Some((frame, level, spaces));
+                let (pw, ph) = super::super::pip_size(area.s.w);
+                // AppKit's origin is the bottom-left: the bottom-right corner, 16 points in.
+                let to = Rect { o: Point { x: area.o.x + area.s.w - pw - 16.0, y: area.o.y + 16.0 }, s: Size { w: pw, h: ph } };
+                let _: () = msg_send![w, setFrame: to, display: false];
+                let _: () = msg_send![w, setContentAspectRatio: Size { w: pw, h: ph }];
+                let _: () = msg_send![w, setLevel: FLOATING];
+                let _: () = msg_send![w, setCollectionBehavior: spaces | ALL_SPACES];
+                traffic_lights(w, true);
+                let _: () = msg_send![w, deminiaturize: std::ptr::null_mut::<AnyObject>()];
+            }
+        }
+
+        /// Back to the window as it was before PiP; nothing if not in PiP.
+        pub fn exit() {
+            let Some((frame, level, spaces)) = SAVED.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+            let Some(w) = window() else { return };
+            unsafe {
+                // Resize increments replace the aspect ratio: free resizing again.
+                let _: () = msg_send![w, setContentResizeIncrements: Size { w: 1.0, h: 1.0 }];
+                let _: () = msg_send![w, setLevel: level];
+                let _: () = msg_send![w, setCollectionBehavior: spaces];
+                traffic_lights(w, false);
+                let _: () = msg_send![w, setFrame: frame, display: true, animate: true];
+            }
+        }
+    }
 
     pub mod chrome {
         use super::*;
